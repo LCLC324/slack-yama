@@ -1,0 +1,15 @@
+[Unit]
+Description=Yama Slack Socket Mode Listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/slack-yama
+EnvironmentFile=/home/hatch/workspace/slack-yama/config/.env
+ExecStart=/home/hatch/workspace/slack-yama/venv/bin/python /home/hatch/workspace/slack-yama/listener.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

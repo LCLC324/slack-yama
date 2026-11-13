@@ -1,0 +1,24 @@
+# /etc/sudoers.d/yama-watchdog (EXAMPLE ONLY - do not install automatically)
+#
+# Purpose:
+#   Allow the Yama watchdog (running as user 'hatch' from cron) to recover
+#   solely the yama-listener.service unit if it goes missing, reload systemd,
+#   and restart yama-listener without interactive password prompts.
+#
+# Installation (by system administrator):
+#   sudo install -m 0440 deploy/sudoers-yama-watchdog.example /etc/sudoers.d/yama-watchdog
+#   sudo visudo -cf /etc/sudoers.d/yama-watchdog
+
+Defaults:hatch !requiretty
+
+Cmnd_Alias YAMA_WATCHDOG_UNIT_INSTALL = \
+    /usr/bin/install -m 0644 /home/hatch/workspace/slack-yama/yama-listener.service /etc/systemd/system/yama-listener.service
+
+Cmnd_Alias YAMA_WATCHDOG_SYSTEMCTL = \
+    /usr/bin/systemctl daemon-reload, \
+    /usr/bin/systemctl restart yama-listener, \
+    /usr/bin/systemctl restart yama-listener.service, \
+    /usr/bin/systemctl status yama-listener, \
+    /usr/bin/systemctl status yama-listener.service
+
+hatch ALL=(root) NOPASSWD: YAMA_WATCHDOG_UNIT_INSTALL, YAMA_WATCHDOG_SYSTEMCTL
