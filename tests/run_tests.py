@@ -5532,6 +5532,375 @@ def test_delayed_retry_legacy_and_new_header_dedup() -> str:
     return "新形式（遅れての再送（元の失敗時刻：YYYY-MM-DD HH:MM JST））整形・新旧2形式の正規表現判定（別時刻・CRLF対応）による二重付加防止を確認"
 
 
+def test_ambiguous_saves_intended_text() -> str:
+    """38. ambiguous時の送信文面(intended_text)保存: ambiguous_post_outcome時のみchat.postMessageへ渡した最終文字列(再送ヘッダー含む)をevents.intended_textへ保存し、通常の成功・失敗・即時回復では保存しない＆既存DBへのALTER TABLE移行が冪等であることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        # Initialize with listener.init_db first (simulating an existing DB before migration)
+        init_db(db_path)
+        # Verify agent_tools.init_db idempotently adds intended_text column
+        agent_tools.init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        with get_db_connection(db_path) as conn:
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(events);").fetchall()
+            }
+        assert "intended_text" in cols, f"intended_text column missing from events: {cols}"
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1796000000.000100"
+        first_unv_utc = "2026-11-13 23:05:00"  # -> 2026-11-14 08:05 JST
+        expected_mark = "遅れての再送（元の失敗時刻：2026-11-14 08:05 JST）"
+
+        ev_ambig_normal = "Ev_AMBIG_NORMAL_1"
+        ev_ambig_delayed = "Ev_AMBIG_DELAYED_1"
+        ev_success = "Ev_POST_SUCCESS_1"
+        ev_api_fail = "Ev_POST_API_FAIL_1"
+        ev_recovered = "Ev_POST_RECOVERED_1"
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, retry_count, error_message, next_retry_at, first_unverifiable_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_ambig_normal, channel_id, "U_ASKER", "Q1", "1796000001.000100", thread_ts, "PROCESSING", 0, None, None, None),
+                    (ev_ambig_delayed, channel_id, "U_ASKER", "Q2", "1796000002.000100", thread_ts, "PROCESSING", 0, "pre_post_check_unverifiable", None, first_unv_utc),
+                    (ev_success, channel_id, "U_ASKER", "Q3", "1796000003.000100", thread_ts, "PROCESSING", 0, None, None, None),
+                    (ev_api_fail, channel_id, "U_ASKER", "Q4", "1796000004.000100", thread_ts, "PROCESSING", 0, None, None, None),
+                    (ev_recovered, channel_id, "U_ASKER", "Q5", "1796000005.000100", thread_ts, "PROCESSING", 0, None, None, None),
+                ],
+            )
+            conn.commit()
+
+        raw_body = "ambiguous保存テストの本文です（A & B < C > D）。"
+        text_file = Path(tmp) / "reply_ambig.txt"
+        text_file.write_text(raw_body + "\n", encoding="utf-8")
+
+        # 1) Normal ambiguous_post_outcome -> intended_text saved as raw_body
+        class AmbiguousClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                return {
+                    "ok": True,
+                    "messages": [{"user": "U_ASKER", "text": "parent", "ts": thread_ts}],
+                    "has_more": False,
+                }
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                raise http.client.RemoteDisconnected("Lost connection after POST")
+
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=AmbiguousClient()), patch.object(
+            agent_tools.time, "sleep", side_effect=lambda s: None
+        ), redirect_stdout(stdout1), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_ambig_normal,
+                ]
+            )
+        assert rc1 == 1
+        err1 = json.loads(stderr1.getvalue())
+        assert err1["error"] == "ambiguous_post_outcome"
+        row_ambig_normal = agent_tools.get_event_by_id(ev_ambig_normal, db_path=db_path)
+        assert row_ambig_normal is not None
+        assert row_ambig_normal["intended_text"] == raw_body, (
+            f"Expected intended_text={raw_body!r}, got {row_ambig_normal['intended_text']!r}"
+        )
+
+        # 2) Delayed retry ambiguous_post_outcome -> intended_text saved WITH delayed retry header prepended
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=AmbiguousClient()), patch.object(
+            agent_tools.time, "sleep", side_effect=lambda s: None
+        ), redirect_stdout(stdout2), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_ambig_delayed,
+                ]
+            )
+        assert rc2 == 1
+        err2 = json.loads(stderr2.getvalue())
+        assert err2["error"] == "ambiguous_post_outcome"
+        row_ambig_delayed = agent_tools.get_event_by_id(ev_ambig_delayed, db_path=db_path)
+        assert row_ambig_delayed is not None
+        expected_final_delayed_text = f"{expected_mark}\n{raw_body}"
+        assert row_ambig_delayed["intended_text"] == expected_final_delayed_text, (
+            f"Expected intended_text with retry header {expected_final_delayed_text!r}, got {row_ambig_delayed['intended_text']!r}"
+        )
+
+        # 3) Normal success -> intended_text remains None
+        class SuccessClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "messages": [], "has_more": False}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "channel": channel_id, "ts": "1796000099.000100", "message": {"text": kwargs["text"]}}
+
+        stdout3, stderr3 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=SuccessClient()), redirect_stdout(
+            stdout3
+        ), redirect_stderr(stderr3):
+            rc3 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_success,
+                ]
+            )
+        assert rc3 == 0
+        row_success = agent_tools.get_event_by_id(ev_success, db_path=db_path)
+        assert row_success is not None and row_success["intended_text"] is None
+
+        # 4) SlackApiError failure -> intended_text remains None
+        class ApiFailClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "messages": [], "has_more": False}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                raise SlackApiError(message="channel_not_found", response={"ok": False, "error": "channel_not_found"})
+
+        stdout4, stderr4 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=ApiFailClient()), redirect_stdout(
+            stdout4
+        ), redirect_stderr(stderr4):
+            rc4 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_api_fail,
+                ]
+            )
+        assert rc4 == 1
+        row_api_fail = agent_tools.get_event_by_id(ev_api_fail, db_path=db_path)
+        assert row_api_fail is not None and row_api_fail["intended_text"] is None
+
+        # 5) Connection error on post, but immediately recovered by _find_own_recent_message -> intended_text remains None
+        reply_calls = {"count": 0}
+
+        class ImmediateRecoveryClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                reply_calls["count"] += 1
+                if reply_calls["count"] == 1:
+                    return {"ok": True, "messages": [], "has_more": False}
+                return {
+                    "ok": True,
+                    "messages": [{"user": bot_uid, "text": raw_body, "ts": "1796000199.000100", "thread_ts": thread_ts}],
+                    "has_more": False,
+                }
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                raise http.client.RemoteDisconnected("Lost connection but message landed")
+
+        stdout5, stderr5 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=ImmediateRecoveryClient()), redirect_stdout(
+            stdout5
+        ), redirect_stderr(stderr5):
+            rc5 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_recovered,
+                ]
+            )
+        assert rc5 == 0
+        row_recovered = agent_tools.get_event_by_id(ev_recovered, db_path=db_path)
+        assert row_recovered is not None and row_recovered["intended_text"] is None
+
+        return "ambiguous発生時のみ最終送信文字列(遅延再送ヘッダー付き含む)をevents.intended_textへ保存し、通常成功・API失敗・即時回復ではNULL維持、ALTER TABLE移行の冪等性を確認"
+
+
+def test_reconcile_intended_text_matching_and_fallback() -> str:
+    """39. reconcileのintended_text文面一致優先＆正規化＆フォールバック: (1)スレッド内Yama投稿2件で遅い方がintended_textと一致→一致側を割当、(2)HTMLエスケープ(&amp;/&lt;/&gt;)・CRLF・前後空白違いでも正規化一致、(3)不一致時は最も早い未割当投稿へフォールバック（phase1/phase2両方）を確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        now_dt = datetime.now(timezone.utc)
+        recent_ts_str = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Thread 1 (phase1): 2 Yama posts after event; earlier is different text, later matches intended_text
+        th_1 = "1796100100.000100"
+        ev_p1_match = "Ev_P1_LATER_MATCH"
+        ts_p1_early_other = "1796100110.000100"
+        ts_p1_late_match = "1796100120.000200"
+        intended_p1 = "質問Aへの回答です。設定ファイルを確認してください。"
+
+        # Thread 2 (phase1): HTML escape (&amp; &lt; &gt;), CRLF (\r\n), and leading/trailing whitespace differences
+        th_2 = "1796100200.000100"
+        ev_p1_escape = "Ev_P1_ESCAPE_NORM"
+        ts_p1_esc_early = "1796100210.000100"
+        ts_p1_esc_match = "1796100220.000200"
+        intended_p2 = "  条件: a < b && c > d\r\n2行目のテキスト  "
+        slack_escaped_p2 = "\n条件: a &lt; b &amp;&amp; c &gt; d\n2行目のテキスト\t"
+
+        # Thread 3 (phase1): intended_text is present, but neither Yama post matches -> falls back to earliest unassigned post
+        th_3 = "1796100300.000100"
+        ev_p1_fallback = "Ev_P1_FALLBACK_EARLIEST"
+        ts_p1_fb_early = "1796100310.000100"
+        ts_p1_fb_late = "1796100320.000200"
+        intended_p3 = "どの投稿とも一致しない送信予定文面"
+
+        # Thread 4 (phase2 - DONE with residual error_message not matching phase1 filter):
+        # 2 Yama posts after event; earlier is different, later matches intended_text (with HTML escape)
+        th_4 = "1796100400.000100"
+        ev_p2_match = "Ev_P2_LATER_MATCH"
+        ts_p2_early_other = "1796100410.000100"
+        ts_p2_late_match = "1796100420.000200"
+        intended_p4 = "Phase2の回答: X & Y < Z > W"
+        slack_escaped_p4 = "Phase2の回答: X &amp; Y &lt; Z &gt; W"
+
+        # Thread 5 (phase2 - DONE with residual error_message, non-matching intended_text -> fallback to earliest)
+        th_5 = "1796100500.000100"
+        ev_p2_fallback = "Ev_P2_FALLBACK_EARLIEST"
+        ts_p2_fb_early = "1796100510.000100"
+        ts_p2_fb_late = "1796100520.000200"
+        intended_p5 = "Phase2で一致しない文面"
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, error_message, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_p1_match, channel_id, "U_1", "Q1", th_1, None, "FAILED", "ambiguous_post_outcome", intended_p1, recent_ts_str, recent_ts_str),
+                    (ev_p1_escape, channel_id, "U_2", "Q2", th_2, None, "FAILED", "ambiguous_post_outcome", intended_p2, recent_ts_str, recent_ts_str),
+                    (ev_p1_fallback, channel_id, "U_3", "Q3", th_3, None, "FAILED", "ambiguous_post_outcome", intended_p3, recent_ts_str, recent_ts_str),
+                    (ev_p2_match, channel_id, "U_4", "Q4", th_4, None, "DONE", "transient_socket_warning", intended_p4, recent_ts_str, recent_ts_str),
+                    (ev_p2_fallback, channel_id, "U_5", "Q5", th_5, None, "DONE", "transient_socket_warning", intended_p5, recent_ts_str, recent_ts_str),
+                ],
+            )
+            conn.commit()
+
+        threads_data = {
+            th_1: [
+                {"user": "U_1", "text": "Q1", "ts": th_1},
+                {"user": bot_uid, "text": "別イベントへの先行返信（早い方）", "ts": ts_p1_early_other, "thread_ts": th_1},
+                {"user": bot_uid, "text": intended_p1, "ts": ts_p1_late_match, "thread_ts": th_1},
+            ],
+            th_2: [
+                {"user": "U_2", "text": "Q2", "ts": th_2},
+                {"user": bot_uid, "text": "無関係な早い投稿", "ts": ts_p1_esc_early, "thread_ts": th_2},
+                {"user": bot_uid, "text": slack_escaped_p2, "ts": ts_p1_esc_match, "thread_ts": th_2},
+            ],
+            th_3: [
+                {"user": "U_3", "text": "Q3", "ts": th_3},
+                {"user": bot_uid, "text": "手動編集された早い方の返信", "ts": ts_p1_fb_early, "thread_ts": th_3},
+                {"user": bot_uid, "text": "別の遅い返信", "ts": ts_p1_fb_late, "thread_ts": th_3},
+            ],
+            th_4: [
+                {"user": "U_4", "text": "Q4", "ts": th_4},
+                {"user": bot_uid, "text": "Phase2の別投稿（早い方）", "ts": ts_p2_early_other, "thread_ts": th_4},
+                {"user": bot_uid, "text": slack_escaped_p4, "ts": ts_p2_late_match, "thread_ts": th_4},
+            ],
+            th_5: [
+                {"user": "U_5", "text": "Q5", "ts": th_5},
+                {"user": bot_uid, "text": "Phase2フォールバック早い方", "ts": ts_p2_fb_early, "thread_ts": th_5},
+                {"user": bot_uid, "text": "Phase2フォールバック遅い方", "ts": ts_p2_fb_late, "thread_ts": th_5},
+            ],
+        }
+
+        class ReconcileMatchClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                ts = str(kwargs.get("ts"))
+                return {
+                    "ok": True,
+                    "messages": threads_data.get(ts, []),
+                    "has_more": False,
+                }
+
+        res = agent_tools.reconcile_replies(
+            days=7,
+            dry_run=False,
+            db_path=db_path,
+            client=ReconcileMatchClient(),
+            now=now_dt,
+        )
+        assert res["ok"] is True
+        assert res["errors"] == 0
+
+        rec_map = {item["event_id"]: item["reply_ts"] for item in res["recorded"]}
+        # (1) Phase 1: picks later matching post instead of earlier non-matching post
+        assert rec_map[ev_p1_match] == ts_p1_late_match, (
+            f"Expected {ts_p1_late_match} (matching text), got {rec_map.get(ev_p1_match)}"
+        )
+        # (2) Phase 1: matches despite HTML entities (&amp; &lt; &gt;), CRLF, and surrounding whitespace
+        assert rec_map[ev_p1_escape] == ts_p1_esc_match, (
+            f"Expected {ts_p1_esc_match} (normalized escape match), got {rec_map.get(ev_p1_escape)}"
+        )
+        # (3) Phase 1: falls back to earliest unassigned post when no text matches
+        assert rec_map[ev_p1_fallback] == ts_p1_fb_early, (
+            f"Expected {ts_p1_fb_early} (earliest fallback), got {rec_map.get(ev_p1_fallback)}"
+        )
+        # (4) Phase 2: picks later matching post (with HTML escape normalization) and clears DONE error_message
+        assert rec_map[ev_p2_match] == ts_p2_late_match, (
+            f"Expected {ts_p2_late_match} in phase2, got {rec_map.get(ev_p2_match)}"
+        )
+        # (5) Phase 2: falls back to earliest unassigned post when no text matches
+        assert rec_map[ev_p2_fallback] == ts_p2_fb_early, (
+            f"Expected {ts_p2_fb_early} in phase2 fallback, got {rec_map.get(ev_p2_fallback)}"
+        )
+        assert ev_p2_match in res["done_error_cleared"]["with_reply"]
+        assert ev_p2_fallback in res["done_error_cleared"]["with_reply"]
+
+        # Verify replies table records match
+        for eid, expected_ts in (
+            (ev_p1_match, ts_p1_late_match),
+            (ev_p1_escape, ts_p1_esc_match),
+            (ev_p1_fallback, ts_p1_fb_early),
+            (ev_p2_match, ts_p2_late_match),
+            (ev_p2_fallback, ts_p2_fb_early),
+        ):
+            r_row = get_recorded_reply(eid, db_path=db_path)
+            assert r_row is not None and r_row["reply_ts"] == expected_ts
+
+        return "スレッド内複数Yama投稿でintended_text一致側(遅い投稿)を優先割当・HTMLエスケープ(&amp;/&lt;/&gt;)やCRLF/前後空白の正規化一致・不一致時の最古未割当フォールバックをphase1/phase2両方で確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -5571,6 +5940,8 @@ def main() -> int:
         ("35. 遅延再送の答え済み非該当ケース (ボットのみ・10文字以下短文のみ・質問者追記のみ・Yama投稿のみ)", test_delayed_retry_not_answered_conservative_cases),
         ("36. 遅延再送の履歴取得失敗時 fail-closed (既存pre_post_check_unverifiable経路維持)", test_delayed_retry_history_failure_unverifiable),
         ("37. 再送ヘッダー3者統一形＆移行期二重付加防止 (新形式生成・新旧両形式の正規表現判定)", test_delayed_retry_legacy_and_new_header_dedup),
+        ("38. Ambiguous 送信文面保存 (ambiguous時のみintended_text保存・再送ヘッダー込み最終文字列・ALTER TABLE冪等移行)", test_ambiguous_saves_intended_text),
+        ("39. Reconcile 文面一致優先＆正規化＆フォールバック (遅い一致投稿の優先割当・エスケープ/改行/空白正規化・不一致時最古フォールバック・phase1/2適用)", test_reconcile_intended_text_matching_and_fallback),
     ]
 
     print("=" * 72)

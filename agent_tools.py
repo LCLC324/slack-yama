@@ -31,7 +31,13 @@ from zoneinfo import ZoneInfo
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from listener import DEFAULT_DB_PATH, DEFAULT_ENV_PATH, get_db_connection, init_db, load_env_file
+from listener import (
+    DEFAULT_DB_PATH,
+    DEFAULT_ENV_PATH,
+    get_db_connection,
+    init_db as _listener_init_db,
+    load_env_file,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MODE_PATH = BASE_DIR / "config" / "mode.txt"
@@ -89,6 +95,21 @@ SKIPPED_ANSWERED_RESULT: str = "skipped_answered"
 ANSWERED_MIN_TEXT_LENGTH: int = 10
 
 
+def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
+    """Initialize SQLite schema via listener.init_db and idempotently ensure
+    events.intended_text column exists."""
+    db_path = Path(db_path)
+    _listener_init_db(db_path)
+    with get_db_connection(db_path) as conn:
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(events);").fetchall()
+        }
+        if "intended_text" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN intended_text TEXT;")
+            conn.commit()
+
+
 def get_web_client(env_path: Path = DEFAULT_ENV_PATH, no_retry: bool = False) -> WebClient:
     """Load SLACK_BOT_TOKEN from config/.env (or environment) and return a Slack WebClient."""
     load_env_file(env_path)
@@ -113,7 +134,7 @@ def get_processing_events(db_path: Path = DEFAULT_DB_PATH) -> List[Dict[str, Any
             """
             SELECT event_id, channel_id, user_id, text, ts, thread_ts, is_bot,
                    status, retry_count, error_message, next_retry_at, first_unverifiable_at,
-                   created_at, updated_at
+                   intended_text, created_at, updated_at
             FROM events
             WHERE status = 'PROCESSING'
             ORDER BY CAST(ts AS REAL) ASC, created_at ASC, rowid ASC
@@ -293,7 +314,7 @@ def commit_event(
             """
             SELECT event_id, channel_id, user_id, text, ts, thread_ts, is_bot,
                    status, retry_count, error_message, next_retry_at, first_unverifiable_at,
-                   created_at, updated_at
+                   intended_text, created_at, updated_at
             FROM events
             WHERE event_id = ?
             """,
@@ -864,6 +885,78 @@ def _clear_event_error_message(
         conn.commit()
 
 
+def _save_event_intended_text(
+    event_id: str,
+    intended_text: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Save the final post_text sent to chat.postMessage into events.intended_text
+    when a reply post results in ambiguous_post_outcome."""
+    if not event_id:
+        return
+    db_path = Path(db_path)
+    init_db(db_path)
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE events
+            SET intended_text = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE event_id = ?
+            """,
+            (intended_text, event_id),
+        )
+        conn.commit()
+
+
+def _normalize_reconcile_text(text: Any) -> str:
+    """Normalize text for reconcile comparison:
+    - unify CRLF (\\r\\n) to LF (\\n)
+    - decode HTML escapes (&amp;, &lt;, &gt;)
+    - strip leading/trailing whitespace
+    """
+    if text is None:
+        return ""
+    s = str(text).replace("\r\n", "\n")
+    s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return s.strip()
+
+
+def _select_matching_yama_message(
+    yama_msgs: List[Dict[str, Any]],
+    assigned_reply_ts: Set[str],
+    cand_ts: str,
+    intended_text: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Select an unassigned Yama message strictly after cand_ts:
+    - If intended_text is present, prefer the earliest unassigned message whose
+      normalized text matches normalized intended_text.
+    - Otherwise (or if no text match is found), fall back to the earliest
+      unassigned message after cand_ts."""
+    unassigned_after: List[Dict[str, Any]] = []
+    for msg in yama_msgs:
+        m_ts = str(msg["ts"])
+        if m_ts in assigned_reply_ts:
+            continue
+        try:
+            is_after = float(m_ts) > float(cand_ts)
+        except (TypeError, ValueError):
+            is_after = m_ts > str(cand_ts)
+        if is_after:
+            unassigned_after.append(msg)
+
+    if not unassigned_after:
+        return None
+
+    norm_intended = _normalize_reconcile_text(intended_text)
+    if norm_intended:
+        for msg in unassigned_after:
+            if _normalize_reconcile_text(msg.get("text")) == norm_intended:
+                return msg
+
+    return unassigned_after[0]
+
+
 def reconcile_replies(
     days: int = DEFAULT_RECONCILE_DAYS,
     dry_run: bool = False,
@@ -913,7 +1006,7 @@ def reconcile_replies(
         raw_rows = conn.execute(
             """
             SELECT e.event_id, e.channel_id, e.user_id, e.text, e.ts, e.thread_ts,
-                   e.status, e.error_message, e.created_at, e.updated_at
+                   e.status, e.error_message, e.intended_text, e.created_at, e.updated_at
             FROM events e
             LEFT JOIN replies r ON e.event_id = r.event_id
             WHERE (
@@ -933,7 +1026,7 @@ def reconcile_replies(
         raw_done_error_rows = conn.execute(
             """
             SELECT e.event_id, e.channel_id, e.user_id, e.text, e.ts, e.thread_ts,
-                   e.status, e.error_message, e.created_at, e.updated_at
+                   e.status, e.error_message, e.intended_text, e.created_at, e.updated_at
             FROM events e
             WHERE e.status = 'DONE'
               AND e.error_message IS NOT NULL
@@ -988,12 +1081,6 @@ def reconcile_replies(
                     pass
         return active_client
 
-    def _is_reply_after_event(msg_ts: Any, event_ts: Any) -> bool:
-        try:
-            return float(msg_ts) > float(event_ts)
-        except (TypeError, ValueError):
-            return str(msg_ts) > str(event_ts)
-
     phase1_handled_events: Dict[str, bool] = {}
 
     for cand in candidates:
@@ -1012,12 +1099,12 @@ def reconcile_replies(
                 sleep_fn=sleep_fn,
             )
 
-            matched_msg: Optional[Dict[str, Any]] = None
-            for msg in yama_msgs:
-                m_ts = str(msg["ts"])
-                if m_ts not in assigned_reply_ts and _is_reply_after_event(m_ts, cand_ts):
-                    matched_msg = msg
-                    break
+            matched_msg = _select_matching_yama_message(
+                yama_msgs=yama_msgs,
+                assigned_reply_ts=assigned_reply_ts,
+                cand_ts=cand_ts,
+                intended_text=cand.get("intended_text"),
+            )
 
             if matched_msg is not None:
                 matched_ts = str(matched_msg["ts"])
@@ -1080,12 +1167,12 @@ def reconcile_replies(
                 else:
                     done_error_cleared["without_reply"].append(event_id)
             else:
-                matched_msg = None
-                for msg in yama_msgs:
-                    m_ts = str(msg["ts"])
-                    if m_ts not in assigned_reply_ts and _is_reply_after_event(m_ts, cand_ts):
-                        matched_msg = msg
-                        break
+                matched_msg = _select_matching_yama_message(
+                    yama_msgs=yama_msgs,
+                    assigned_reply_ts=assigned_reply_ts,
+                    cand_ts=cand_ts,
+                    intended_text=cand.get("intended_text"),
+                )
 
                 if matched_msg is not None:
                     matched_ts = str(matched_msg["ts"])
@@ -1219,7 +1306,7 @@ def get_event_by_id(
             """
             SELECT event_id, channel_id, user_id, text, ts, thread_ts, is_bot,
                    status, retry_count, error_message, next_retry_at, first_unverifiable_at,
-                   created_at, updated_at
+                   intended_text, created_at, updated_at
             FROM events
             WHERE event_id = ?
             """,
@@ -1737,6 +1824,16 @@ def cmd_reply(args: argparse.Namespace) -> int:
                 output["deduplicated"] = False
             print(json.dumps(output, ensure_ascii=False, indent=2))
             return 0
+
+        if event_id:
+            try:
+                _save_event_intended_text(
+                    event_id=event_id,
+                    intended_text=post_text,
+                    db_path=db_path,
+                )
+            except Exception:
+                pass
 
         ambiguous_err: Dict[str, Any] = {
             "ok": False,
