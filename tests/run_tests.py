@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import uuid
 from argparse import Namespace
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -1165,13 +1166,22 @@ def test_reply_lost_response_recovery() -> str:
                 oldest: Optional[str] = None,
                 limit: int = 50,
                 cursor: Optional[str] = None,
+                **kwargs: Any,
             ) -> Dict[str, Any]:
                 replies_calls.append(
-                    {"channel": channel, "ts": ts, "oldest": oldest, "limit": limit, "cursor": cursor}
+                    {
+                        "channel": channel,
+                        "ts": ts,
+                        "oldest": oldest,
+                        "limit": limit,
+                        "cursor": cursor,
+                        **kwargs,
+                    }
                 )
-                assert oldest == thread_ts, f"oldest parameter (thread_ts={thread_ts}) must be passed, got {oldest}"
-
                 if not post_landed["value"]:
+                    assert oldest == thread_ts, (
+                        f"pre-post oldest parameter (thread_ts={thread_ts}) must be passed, got {oldest}"
+                    )
                     # Pre-post check before chat_postMessage: reply has not been posted yet
                     return {
                         "ok": True,
@@ -1179,6 +1189,18 @@ def test_reply_lost_response_recovery() -> str:
                             {"user": "U_NEIRO", "text": "Parent post", "ts": thread_ts}
                         ],
                     }
+
+                expected_rec_oldest = f"{base_now - 180.0:.6f}"
+                expected_rec_latest = f"{base_now + 300.0:.6f}"
+                assert oldest == expected_rec_oldest, (
+                    f"recovery oldest must be attempt_ts - 180s ({expected_rec_oldest}), got {oldest}"
+                )
+                assert kwargs.get("latest") == expected_rec_latest, (
+                    f"recovery latest must be attempt_ts + 300s ({expected_rec_latest}), got {kwargs.get('latest')}"
+                )
+                assert kwargs.get("include_all_metadata") is True, (
+                    f"include_all_metadata=True must be passed, got {kwargs}"
+                )
 
                 # Post-exception recovery check: 1st attempt fails with transient error, 2nd succeeds
                 recovery_attempt["count"] += 1
@@ -1848,7 +1870,11 @@ def test_reply_thread_fullscan_and_pagination() -> str:
         stderr3 = io.StringIO()
         with patch.object(
             agent_tools, "get_web_client", return_value=PaginatedLostResponseClient()
-        ), redirect_stdout(stdout3), redirect_stderr(stderr3):
+        ), patch.object(agent_tools.time, "time", return_value=base_now), redirect_stdout(
+            stdout3
+        ), redirect_stderr(
+            stderr3
+        ):
             rc3 = agent_tools.main(
                 [
                     "--db",
@@ -5556,10 +5582,13 @@ def test_ambiguous_saves_intended_text() -> str:
                 for row in conn.execute("PRAGMA table_info(events);").fetchall()
             }
         assert "intended_text" in cols, f"intended_text column missing from events: {cols}"
+        assert "attempt_ts" in cols, f"attempt_ts column missing from events: {cols}"
 
         bot_uid = "U_YAMA_BOT"
         channel_id = "C_ALL"
         thread_ts = "1796000000.000100"
+        attempt_now_1 = 1796000190.25
+        attempt_now_2 = 1796000195.5
         first_unv_utc = "2026-11-13 23:05:00"  # -> 2026-11-14 08:05 JST
         expected_mark = "遅れての再送（元の失敗時刻：2026-11-14 08:05 JST）"
 
@@ -5591,7 +5620,7 @@ def test_ambiguous_saves_intended_text() -> str:
         text_file = Path(tmp) / "reply_ambig.txt"
         text_file.write_text(raw_body + "\n", encoding="utf-8")
 
-        # 1) Normal ambiguous_post_outcome -> intended_text saved as raw_body
+        # 1) Normal ambiguous_post_outcome -> intended_text and attempt_ts saved
         class AmbiguousClient:
             def auth_test(self) -> Dict[str, Any]:
                 return {"ok": True, "user_id": bot_uid}
@@ -5608,6 +5637,8 @@ def test_ambiguous_saves_intended_text() -> str:
 
         stdout1, stderr1 = io.StringIO(), io.StringIO()
         with patch.object(agent_tools, "get_web_client", return_value=AmbiguousClient()), patch.object(
+            agent_tools.time, "time", return_value=attempt_now_1
+        ), patch.object(
             agent_tools.time, "sleep", side_effect=lambda s: None
         ), redirect_stdout(stdout1), redirect_stderr(stderr1):
             rc1 = agent_tools.main(
@@ -5628,10 +5659,15 @@ def test_ambiguous_saves_intended_text() -> str:
         assert row_ambig_normal["intended_text"] == raw_body, (
             f"Expected intended_text={raw_body!r}, got {row_ambig_normal['intended_text']!r}"
         )
+        assert row_ambig_normal["attempt_ts"] == f"{attempt_now_1:.6f}", (
+            f"Expected attempt_ts={attempt_now_1:.6f}, got {row_ambig_normal['attempt_ts']!r}"
+        )
 
-        # 2) Delayed retry ambiguous_post_outcome -> intended_text saved WITH delayed retry header prepended
+        # 2) Delayed retry ambiguous_post_outcome -> intended_text saved WITH delayed retry header prepended + attempt_ts
         stdout2, stderr2 = io.StringIO(), io.StringIO()
         with patch.object(agent_tools, "get_web_client", return_value=AmbiguousClient()), patch.object(
+            agent_tools.time, "time", return_value=attempt_now_2
+        ), patch.object(
             agent_tools.time, "sleep", side_effect=lambda s: None
         ), redirect_stdout(stdout2), redirect_stderr(stderr2):
             rc2 = agent_tools.main(
@@ -5653,8 +5689,11 @@ def test_ambiguous_saves_intended_text() -> str:
         assert row_ambig_delayed["intended_text"] == expected_final_delayed_text, (
             f"Expected intended_text with retry header {expected_final_delayed_text!r}, got {row_ambig_delayed['intended_text']!r}"
         )
+        assert row_ambig_delayed["attempt_ts"] == f"{attempt_now_2:.6f}", (
+            f"Expected attempt_ts={attempt_now_2:.6f}, got {row_ambig_delayed['attempt_ts']!r}"
+        )
 
-        # 3) Normal success -> intended_text remains None
+        # 3) Normal success -> intended_text and attempt_ts remain None
         class SuccessClient:
             def auth_test(self) -> Dict[str, Any]:
                 return {"ok": True, "user_id": bot_uid}
@@ -5681,9 +5720,9 @@ def test_ambiguous_saves_intended_text() -> str:
             )
         assert rc3 == 0
         row_success = agent_tools.get_event_by_id(ev_success, db_path=db_path)
-        assert row_success is not None and row_success["intended_text"] is None
+        assert row_success is not None and row_success["intended_text"] is None and row_success["attempt_ts"] is None
 
-        # 4) SlackApiError failure -> intended_text remains None
+        # 4) SlackApiError failure -> intended_text and attempt_ts remain None
         class ApiFailClient:
             def auth_test(self) -> Dict[str, Any]:
                 return {"ok": True, "user_id": bot_uid}
@@ -5710,9 +5749,9 @@ def test_ambiguous_saves_intended_text() -> str:
             )
         assert rc4 == 1
         row_api_fail = agent_tools.get_event_by_id(ev_api_fail, db_path=db_path)
-        assert row_api_fail is not None and row_api_fail["intended_text"] is None
+        assert row_api_fail is not None and row_api_fail["intended_text"] is None and row_api_fail["attempt_ts"] is None
 
-        # 5) Connection error on post, but immediately recovered by _find_own_recent_message -> intended_text remains None
+        # 5) Connection error on post, but immediately recovered by _find_own_recent_message -> intended_text and attempt_ts remain None
         reply_calls = {"count": 0}
 
         class ImmediateRecoveryClient:
@@ -5733,7 +5772,9 @@ def test_ambiguous_saves_intended_text() -> str:
                 raise http.client.RemoteDisconnected("Lost connection but message landed")
 
         stdout5, stderr5 = io.StringIO(), io.StringIO()
-        with patch.object(agent_tools, "get_web_client", return_value=ImmediateRecoveryClient()), redirect_stdout(
+        with patch.object(agent_tools, "get_web_client", return_value=ImmediateRecoveryClient()), patch.object(
+            agent_tools.time, "time", return_value=attempt_now_2
+        ), redirect_stdout(
             stdout5
         ), redirect_stderr(stderr5):
             rc5 = agent_tools.main(
@@ -5748,7 +5789,7 @@ def test_ambiguous_saves_intended_text() -> str:
             )
         assert rc5 == 0
         row_recovered = agent_tools.get_event_by_id(ev_recovered, db_path=db_path)
-        assert row_recovered is not None and row_recovered["intended_text"] is None
+        assert row_recovered is not None and row_recovered["intended_text"] is None and row_recovered["attempt_ts"] is None
 
         return "ambiguous発生時のみ最終送信文字列(遅延再送ヘッダー付き含む)をevents.intended_textへ保存し、通常成功・API失敗・即時回復ではNULL維持、ALTER TABLE移行の冪等性を確認"
 
@@ -6634,6 +6675,858 @@ def test_windowed_thread_failure_unverifiable() -> str:
         return "oldest=event_ts-60sに絞ったスレッド読み取りが5回試行(1→2→4→8s)すべて失敗した場合に投稿せずpre_post_check_unverifiable(exit 1)となることを確認"
 
 
+def test_reply_metadata_attachment_and_include_all_metadata() -> str:
+    """46. 投稿時の metadata 付与と履歴読み取り時の include_all_metadata=True 指定:
+    (1) event_id あり投稿で metadata={"event_type": "yama_reply", "event_payload": {"event_id": ...}} が付与される、
+    (2) event_id なし手動投稿で metadata={"event_type": "yama_reply", "event_payload": {"request_id": "<UUID>"}} が付与される、
+    (3) 投稿前チェック（通常/遅延再送/チャンネル）・回復確認・reconcile 走査すべてで include_all_metadata=True が渡されることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1798000000.000100"
+        ev_with_id = "Ev_META_ATTACH_1"
+        ev_delayed_id = "Ev_META_DELAYED_1"
+        ev_rec_id = "Ev_META_RECONCILE_1"
+        now_dt = datetime.now(timezone.utc)
+        recent_ts_str = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, retry_count, error_message, first_unverifiable_at,
+                    intended_text, attempt_ts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        ev_with_id,
+                        channel_id,
+                        "U_ASKER",
+                        "質問1",
+                        "1798000010.000100",
+                        thread_ts,
+                        "PROCESSING",
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        recent_ts_str,
+                        recent_ts_str,
+                    ),
+                    (
+                        ev_delayed_id,
+                        channel_id,
+                        "U_ASKER",
+                        "質問2",
+                        "1798000020.000100",
+                        thread_ts,
+                        "PROCESSING",
+                        0,
+                        "pre_post_check_unverifiable",
+                        "2026-11-14 01:00:00",
+                        None,
+                        None,
+                        recent_ts_str,
+                        recent_ts_str,
+                    ),
+                    (
+                        ev_rec_id,
+                        channel_id,
+                        "U_ASKER",
+                        "質問3",
+                        "1798000030.000100",
+                        thread_ts,
+                        "FAILED",
+                        3,
+                        "ambiguous_post_outcome",
+                        None,
+                        "reconcile対象テキスト",
+                        "1798000100.000000",
+                        recent_ts_str,
+                        recent_ts_str,
+                    ),
+                ],
+            )
+            conn.commit()
+
+        text_file = Path(tmp) / "reply_meta.txt"
+        text_file.write_text("メタデータ検証用の返信テキストです。\n", encoding="utf-8")
+
+        post_calls: List[Dict[str, Any]] = []
+        replies_calls: List[Dict[str, Any]] = []
+        history_calls: List[Dict[str, Any]] = []
+
+        class MetadataInspectClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                replies_calls.append(kwargs)
+                return {
+                    "ok": True,
+                    "messages": [{"user": "U_ASKER", "text": "親投稿", "ts": thread_ts}],
+                    "has_more": False,
+                }
+
+            def conversations_history(self, **kwargs: Any) -> Dict[str, Any]:
+                history_calls.append(kwargs)
+                return {
+                    "ok": True,
+                    "messages": [{"user": "U_ASKER", "text": "チャンネル投稿", "ts": thread_ts}],
+                    "has_more": False,
+                }
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                post_calls.append(kwargs)
+                return {
+                    "ok": True,
+                    "channel": kwargs["channel"],
+                    "ts": f"{1798000050.0 + len(post_calls):.6f}",
+                    "message": {
+                        "text": kwargs["text"],
+                        "ts": f"{1798000050.0 + len(post_calls):.6f}",
+                        "metadata": kwargs.get("metadata"),
+                    },
+                }
+
+        client = MetadataInspectClient()
+
+        # (1) Thread reply WITH event_id -> metadata has event_type="yama_reply" and event_payload={"event_id": ev_with_id}
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_with_id,
+                ]
+            )
+        assert rc1 == 0, f"Expected rc=0, got {rc1}, stderr={stderr1.getvalue()}"
+        assert len(post_calls) == 1
+        meta1 = post_calls[0].get("metadata")
+        assert meta1 == {
+            "event_type": "yama_reply",
+            "event_payload": {"event_id": ev_with_id},
+        }, f"Unexpected metadata for event_id post: {meta1}"
+        assert len(replies_calls) == 1
+        assert replies_calls[0].get("include_all_metadata") is True, (
+            f"Pre-post thread check must specify include_all_metadata=True: {replies_calls[0]}"
+        )
+
+        # (2) Manual channel post WITHOUT event_id -> metadata has event_type="yama_reply" and request_id UUID
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout2
+        ), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                ]
+            )
+        assert rc2 == 0
+        assert len(post_calls) == 2
+        meta2 = post_calls[1].get("metadata")
+        assert isinstance(meta2, dict), f"Expected metadata dict on manual post, got {meta2}"
+        assert meta2.get("event_type") == "yama_reply"
+        payload2 = meta2.get("event_payload")
+        assert isinstance(payload2, dict) and "request_id" in payload2 and "event_id" not in payload2, (
+            f"Manual post metadata must contain request_id (and no event_id): {meta2}"
+        )
+        parsed_uuid = uuid.UUID(str(payload2["request_id"]))
+        assert str(parsed_uuid) == payload2["request_id"]
+        assert len(history_calls) == 1
+        assert history_calls[0].get("include_all_metadata") is True, (
+            f"Pre-post channel check must specify include_all_metadata=True: {history_calls[0]}"
+        )
+
+        # (3) Delayed retry pre-post check (_pre_post_check_thread_for_reply) -> include_all_metadata=True
+        stdout3, stderr3 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout3
+        ), redirect_stderr(stderr3):
+            rc3 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_delayed_id,
+                ]
+            )
+        assert rc3 == 0
+        assert len(replies_calls) == 2
+        assert replies_calls[1].get("include_all_metadata") is True, (
+            f"Delayed retry pre-post check must specify include_all_metadata=True: {replies_calls[1]}"
+        )
+
+        # (4) Reconcile scan (_scan_thread_yama_messages) -> include_all_metadata=True
+        rec_summary = agent_tools.reconcile_replies(
+            db_path=db_path,
+            client=client,
+            bot_user_id=bot_uid,
+        )
+        assert rec_summary["ok"] is True
+        assert len(replies_calls) == 3
+        assert replies_calls[2].get("include_all_metadata") is True, (
+            f"reconcile_replies thread scan must specify include_all_metadata=True: {replies_calls[2]}"
+        )
+
+        return "chat.postMessageへのmetadata(event_type=yama_reply + event_id/request_id)付与と全履歴読み取り経路でのinclude_all_metadata=True指定を確認"
+
+
+def test_recovery_and_reconcile_by_metadata_match() -> str:
+    """47. メタデータ一致による着地回収（文面整形差異時＆優先順位1位）:
+    (1) 応答ロスト後の回復確認で、Slack側の文面整形により送信文面と不一致でも metadata.event_payload.event_id 一致で回収できる、
+    (2) event_idなし手動投稿の応答ロストでも metadata.event_payload.request_id 一致で回収できる、
+    (3) reconcile（Phase 1 / Phase 2）で、文面が整形変化していても metadata 一致で回収でき、かつ同一スレッド内の文面一致のみの別投稿より metadata 一致が最優先されることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1798100000.000100"
+        base_now = 1798100200.0
+        ev_recover = "Ev_META_RECOVER_1"
+
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ev_recover, channel_id, "U_ASKER", "URL教えて", "1798100100.000100", thread_ts, "PROCESSING"),
+            )
+            conn.commit()
+
+        raw_text = "詳細は https://example.com/docs を参照してください。"
+        # Slack reformats URLs into <https://example.com/docs|example.com/docs>, so text match alone would fail
+        slack_reformatted_text = "詳細は <https://example.com/docs|example.com/docs> を参照してください。"
+        text_file = Path(tmp) / "reply_reformat.txt"
+        text_file.write_text(raw_text + "\n", encoding="utf-8")
+
+        landed_meta_ts = f"{base_now + 1.5:.6f}"
+        post_landed = {"value": False}
+        captured_metadata: List[Dict[str, Any]] = []
+
+        class ReformattedMetadataRecoveryClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                captured_metadata.append(kwargs.get("metadata"))
+                post_landed["value"] = True
+                raise http.client.IncompleteRead(b"dropped-after-landing", 64)
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                assert kwargs.get("include_all_metadata") is True
+                if not post_landed["value"]:
+                    return {
+                        "ok": True,
+                        "messages": [{"user": "U_ASKER", "text": "URL教えて", "ts": thread_ts}],
+                        "has_more": False,
+                    }
+                return {
+                    "ok": True,
+                    "messages": [
+                        {"user": "U_ASKER", "text": "URL教えて", "ts": thread_ts},
+                        {
+                            "user": bot_uid,
+                            "text": slack_reformatted_text,
+                            "ts": landed_meta_ts,
+                            "thread_ts": thread_ts,
+                            "metadata": {
+                                "event_type": "yama_reply",
+                                "event_payload": {"event_id": ev_recover},
+                            },
+                        },
+                    ],
+                    "has_more": False,
+                }
+
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(
+            agent_tools, "get_web_client", return_value=ReformattedMetadataRecoveryClient()
+        ), patch.object(agent_tools.time, "time", return_value=base_now), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_recover,
+                ]
+            )
+
+        assert rc1 == 0, f"Expected rc=0 via metadata recovery, got {rc1}, stderr={stderr1.getvalue()}"
+        out1 = json.loads(stdout1.getvalue())
+        assert out1["ok"] is True
+        assert out1["recovered_after_ambiguous_error"] is True
+        assert out1["ts"] == landed_meta_ts
+        rec1 = get_recorded_reply(ev_recover, db_path=db_path)
+        assert rec1 is not None and rec1["reply_ts"] == landed_meta_ts
+
+        # (2) Manual post (no event_id) lost response recovery via request_id in metadata
+        manual_landed = {"value": False, "request_id": ""}
+        manual_landed_ts = f"{base_now + 3.0:.6f}"
+
+        class ManualRequestIdRecoveryClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                meta = kwargs.get("metadata") or {}
+                manual_landed["request_id"] = (meta.get("event_payload") or {}).get("request_id", "")
+                manual_landed["value"] = True
+                raise http.client.RemoteDisconnected("manual-post-disconnected")
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                if not manual_landed["value"]:
+                    return {"ok": True, "messages": [], "has_more": False}
+                return {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "user": bot_uid,
+                            "text": slack_reformatted_text,
+                            "ts": manual_landed_ts,
+                            "thread_ts": thread_ts,
+                            "metadata": {
+                                "event_type": "yama_reply",
+                                "event_payload": {"request_id": manual_landed["request_id"]},
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                }
+
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(
+            agent_tools, "get_web_client", return_value=ManualRequestIdRecoveryClient()
+        ), patch.object(agent_tools.time, "time", return_value=base_now), redirect_stdout(
+            stdout2
+        ), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                ]
+            )
+        assert rc2 == 0, f"Expected rc=0 via request_id metadata recovery, got {rc2}"
+        out2 = json.loads(stdout2.getvalue())
+        assert out2["ok"] is True
+        assert out2["recovered_after_ambiguous_error"] is True
+        assert out2["ts"] == manual_landed_ts
+
+        # (3) Reconcile (Phase 1 & Phase 2): metadata match succeeds despite text change AND takes Priority 1 over text match
+        now_dt = datetime.now(timezone.utc)
+        recent_ts_str = (now_dt - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+        th_rec_p1 = "1798200000.000100"
+        th_rec_p2 = "1798300000.000100"
+        ev_rec_p1 = "Ev_RECONCILE_META_P1"
+        ev_rec_p2 = "Ev_RECONCILE_META_P2"
+        attempt_p1 = 1798200100.0
+        attempt_p2 = 1798300100.0
+        ts_p1_text_only = f"{attempt_p1 + 5.0:.6f}"
+        ts_p1_meta_match = f"{attempt_p1 + 15.0:.6f}"
+        ts_p2_meta_match = f"{attempt_p2 + 10.0:.6f}"
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, retry_count, error_message, intended_text, attempt_ts,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        ev_rec_p1,
+                        channel_id,
+                        "U_ASKER",
+                        "質問P1",
+                        "1798200050.000100",
+                        th_rec_p1,
+                        "FAILED",
+                        3,
+                        "ambiguous_post_outcome",
+                        "定型文：確認して折り返します。",
+                        f"{attempt_p1:.6f}",
+                        recent_ts_str,
+                        recent_ts_str,
+                    ),
+                    (
+                        ev_rec_p2,
+                        channel_id,
+                        "U_ASKER",
+                        "質問P2",
+                        "1798300050.000100",
+                        th_rec_p2,
+                        "DONE",
+                        1,
+                        "residual_timeout_error",
+                        "元の送信テキスト（リンク https://example.org あり）",
+                        f"{attempt_p2:.6f}",
+                        recent_ts_str,
+                        recent_ts_str,
+                    ),
+                ],
+            )
+            conn.commit()
+
+        class ReconcileMetadataPriorityClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                assert kwargs.get("include_all_metadata") is True
+                ts = kwargs.get("ts")
+                if ts == th_rec_p1:
+                    return {
+                        "ok": True,
+                        "messages": [
+                            # Earlier message has exact matching text, but no metadata (or from another context)
+                            {
+                                "user": bot_uid,
+                                "text": "定型文：確認して折り返します。",
+                                "ts": ts_p1_text_only,
+                                "thread_ts": th_rec_p1,
+                            },
+                            # Later message has reformatted text, but exact metadata match for ev_rec_p1 -> Priority 1!
+                            {
+                                "user": bot_uid,
+                                "text": "定型文：確認して折り返します！（整形後）",
+                                "ts": ts_p1_meta_match,
+                                "thread_ts": th_rec_p1,
+                                "metadata": {
+                                    "event_type": "yama_reply",
+                                    "event_payload": {"event_id": ev_rec_p1},
+                                },
+                            },
+                        ],
+                        "has_more": False,
+                    }
+                if ts == th_rec_p2:
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {
+                                "user": bot_uid,
+                                "text": "元の送信テキスト（リンク <https://example.org> あり）",
+                                "ts": ts_p2_meta_match,
+                                "thread_ts": th_rec_p2,
+                                "metadata": {
+                                    "event_type": "yama_reply",
+                                    "event_payload": {"event_id": ev_rec_p2},
+                                },
+                            }
+                        ],
+                        "has_more": False,
+                    }
+                return {"ok": True, "messages": [], "has_more": False}
+
+        summary = agent_tools.reconcile_replies(
+            db_path=db_path,
+            client=ReconcileMetadataPriorityClient(),
+            bot_user_id=bot_uid,
+        )
+        assert summary["ok"] is True
+        assert len(summary["recorded"]) == 2
+        assert summary["done_error_cleared"]["with_reply"] == [ev_rec_p2]
+
+        rec_p1 = get_recorded_reply(ev_rec_p1, db_path=db_path)
+        assert rec_p1 is not None
+        assert rec_p1["reply_ts"] == ts_p1_meta_match, (
+            f"Priority 1 metadata match ({ts_p1_meta_match}) must win over text-only match ({ts_p1_text_only}), got {rec_p1['reply_ts']}"
+        )
+
+        rec_p2 = get_recorded_reply(ev_rec_p2, db_path=db_path)
+        assert rec_p2 is not None
+        assert rec_p2["reply_ts"] == ts_p2_meta_match
+
+        return "応答ロスト回復およびreconcile(Phase1/2)で文面整形差異があってもmetadata(event_id/request_id)一致で回収でき、文面一致より優先されることを確認"
+
+
+def test_recovery_and_reconcile_attempt_window_boundaries() -> str:
+    """48. 試行時刻の窓（前3分〜後5分）の境界制御:
+    (1) 応答ロスト後の回復確認で [attempt_ts - 180s, attempt_ts + 300s] が oldest/latest に指定され、窓の外（-181s / +301s）にある同一メタデータの投稿は回収対象にしない、
+    (2) reconcile でもイベントの attempt_ts の前後（前3分〜後5分）で走査し、窓の外にある同一メタデータの投稿は回収せず、窓の境界内（-180s / +300s）は回収できることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1798400000.000100"
+        attempt_now = 1798401000.0
+        expected_oldest = f"{attempt_now - 180.0:.6f}"
+        expected_latest = f"{attempt_now + 300.0:.6f}"
+        ev_out_of_win = "Ev_WIN_OUTSIDE_1"
+
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ev_out_of_win, channel_id, "U_ASKER", "窓境界テスト", "1798400500.000100", thread_ts, "PROCESSING"),
+            )
+            conn.commit()
+
+        reply_body = "試行時刻窓テストの本文です。"
+        text_file = Path(tmp) / "reply_win_bound.txt"
+        text_file.write_text(reply_body + "\n", encoding="utf-8")
+
+        post_attempted = {"value": False}
+        recovery_calls: List[Dict[str, Any]] = []
+
+        # Messages outside the [attempt_now - 180s, attempt_now + 300s] window with identical metadata & text
+        ts_before_win = f"{attempt_now - 180.001:.6f}"
+        ts_after_win = f"{attempt_now + 300.001:.6f}"
+
+        class OutsideWindowRecoveryClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                post_attempted["value"] = True
+                raise http.client.IncompleteRead(b"dropped", 32)
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                if not post_attempted["value"]:
+                    return {"ok": True, "messages": [], "has_more": False}
+                recovery_calls.append(kwargs)
+                return {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "user": bot_uid,
+                            "text": reply_body,
+                            "ts": ts_before_win,
+                            "thread_ts": thread_ts,
+                            "metadata": {
+                                "event_type": "yama_reply",
+                                "event_payload": {"event_id": ev_out_of_win},
+                            },
+                        },
+                        {
+                            "user": bot_uid,
+                            "text": reply_body,
+                            "ts": ts_after_win,
+                            "thread_ts": thread_ts,
+                            "metadata": {
+                                "event_type": "yama_reply",
+                                "event_payload": {"event_id": ev_out_of_win},
+                            },
+                        },
+                    ],
+                    "has_more": False,
+                }
+
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(
+            agent_tools, "get_web_client", return_value=OutsideWindowRecoveryClient()
+        ), patch.object(agent_tools.time, "time", return_value=attempt_now), patch.object(
+            agent_tools.time, "sleep", side_effect=lambda s: None
+        ), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_out_of_win,
+                ]
+            )
+
+        assert rc1 == 1, f"Expected rc=1 when matching metadata is outside window, got {rc1}"
+        assert len(recovery_calls) == 1
+        assert recovery_calls[0].get("oldest") == expected_oldest
+        assert recovery_calls[0].get("latest") == expected_latest
+        assert get_recorded_reply(ev_out_of_win, db_path=db_path) is None
+        err1 = json.loads(stderr1.getvalue())
+        assert err1["error"] == "ambiguous_post_outcome"
+
+        # Verify attempt_ts was recorded on ev_out_of_win
+        ev_row = agent_tools.get_event_by_id(ev_out_of_win, db_path=db_path)
+        assert ev_row is not None and ev_row["attempt_ts"] == f"{attempt_now:.6f}"
+
+        # (2) Reconcile window test:
+        #   - ev_out_of_win has messages only at attempt_now - 180.001s and attempt_now + 300.001s -> must NOT be reconciled
+        #   - ev_in_win has a message right on the +300.0s boundary -> MUST be reconciled
+        th_in_win = "1798500000.000100"
+        ev_in_win = "Ev_WIN_INSIDE_BOUNDARY"
+        attempt_in = 1798501000.0
+        ts_on_upper_boundary = f"{attempt_in + 300.0:.6f}"
+        now_dt = datetime.now(timezone.utc)
+        recent_ts_str = (now_dt - timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
+
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE events SET status = 'FAILED', error_message = 'ambiguous_post_outcome', created_at = ?, updated_at = ? WHERE event_id = ?",
+                (recent_ts_str, recent_ts_str, ev_out_of_win),
+            )
+            conn.execute(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, retry_count, error_message, intended_text, attempt_ts,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ev_in_win,
+                    channel_id,
+                    "U_ASKER",
+                    "境界内テスト",
+                    "1798500500.000100",
+                    th_in_win,
+                    "FAILED",
+                    3,
+                    "ambiguous_post_outcome",
+                    reply_body,
+                    f"{attempt_in:.6f}",
+                    recent_ts_str,
+                    recent_ts_str,
+                ),
+            )
+            conn.commit()
+
+        reconcile_ReplyCalls: List[Dict[str, Any]] = []
+
+        class ReconcileWindowClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                reconcile_ReplyCalls.append(kwargs)
+                ts = kwargs.get("ts")
+                if ts == thread_ts:
+                    assert kwargs.get("oldest") == expected_oldest
+                    assert kwargs.get("latest") == expected_latest
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {
+                                "user": bot_uid,
+                                "text": reply_body,
+                                "ts": ts_before_win,
+                                "thread_ts": thread_ts,
+                                "metadata": {
+                                    "event_type": "yama_reply",
+                                    "event_payload": {"event_id": ev_out_of_win},
+                                },
+                            },
+                            {
+                                "user": bot_uid,
+                                "text": reply_body,
+                                "ts": ts_after_win,
+                                "thread_ts": thread_ts,
+                                "metadata": {
+                                    "event_type": "yama_reply",
+                                    "event_payload": {"event_id": ev_out_of_win},
+                                },
+                            },
+                        ],
+                        "has_more": False,
+                    }
+                if ts == th_in_win:
+                    assert kwargs.get("oldest") == f"{attempt_in - 180.0:.6f}"
+                    assert kwargs.get("latest") == f"{attempt_in + 300.0:.6f}"
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {
+                                "user": bot_uid,
+                                "text": reply_body,
+                                "ts": ts_on_upper_boundary,
+                                "thread_ts": th_in_win,
+                                "metadata": {
+                                    "event_type": "yama_reply",
+                                    "event_payload": {"event_id": ev_in_win},
+                                },
+                            }
+                        ],
+                        "has_more": False,
+                    }
+                return {"ok": True, "messages": [], "has_more": False}
+
+        summary = agent_tools.reconcile_replies(
+            db_path=db_path,
+            client=ReconcileWindowClient(),
+            bot_user_id=bot_uid,
+        )
+        assert summary["ok"] is True
+        assert summary["recorded"] == [{"event_id": ev_in_win, "reply_ts": ts_on_upper_boundary}]
+        assert summary["not_found"] == [ev_out_of_win]
+        assert get_recorded_reply(ev_out_of_win, db_path=db_path) is None, (
+            "Post outside [attempt_ts - 3m, attempt_ts + 5m] must NOT be recovered even with matching metadata"
+        )
+        rec_in = get_recorded_reply(ev_in_win, db_path=db_path)
+        assert rec_in is not None and rec_in["reply_ts"] == ts_on_upper_boundary
+
+        return "試行時刻の窓(前3分〜後5分)でoldest/latestが指定され、窓外の同一metadata投稿は回収せず窓内(境界含む)のみ回収することを確認"
+
+
+def test_legacy_post_without_metadata_text_fallback() -> str:
+    """49. メタデータのない旧投稿の後方互換（第2優先：文面一致）と別イベントメタデータ衝突除外:
+    (1) metadata を持たない旧投稿でも intended_text と文面一致すれば従来どおり回収できる、
+    (2) 別 event_id の metadata が付いた同一文面（定型文など）は文面一致フォールバックで誤回収しない、
+    (3) metadata がなく文面も不一致の投稿は推定回収しないことを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        now_dt = datetime.now(timezone.utc)
+        recent_ts_str = (now_dt - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
+
+        th_legacy_ok = "1798600000.000100"
+        th_conflict_meta = "1798700000.000100"
+        ev_legacy_ok = "Ev_LEGACY_TEXT_OK"
+        ev_conflict_meta = "Ev_CONFLICT_META_SKIP"
+        attempt_legacy = 1798600100.0
+        attempt_conflict = 1798700100.0
+        ts_legacy_reply = f"{attempt_legacy + 12.0:.6f}"
+        ts_other_event_reply = f"{attempt_conflict + 8.0:.6f}"
+        template_text = "了解しました。担当にて確認します。"
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, retry_count, error_message, intended_text, attempt_ts,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        ev_legacy_ok,
+                        channel_id,
+                        "U_ASKER",
+                        "旧投稿テスト",
+                        "1798600050.000100",
+                        th_legacy_ok,
+                        "FAILED",
+                        3,
+                        "ambiguous_post_outcome",
+                        template_text,
+                        f"{attempt_legacy:.6f}",
+                        recent_ts_str,
+                        recent_ts_str,
+                    ),
+                    (
+                        ev_conflict_meta,
+                        channel_id,
+                        "U_ASKER",
+                        "別イベント定型文衝突テスト",
+                        "1798700050.000100",
+                        th_conflict_meta,
+                        "FAILED",
+                        3,
+                        "ambiguous_post_outcome",
+                        template_text,
+                        f"{attempt_conflict:.6f}",
+                        recent_ts_str,
+                        recent_ts_str,
+                    ),
+                ],
+            )
+            conn.commit()
+
+        class LegacyAndConflictClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                ts = kwargs.get("ts")
+                if ts == th_legacy_ok:
+                    # Legacy message without metadata -> recovered by Priority 2 text match
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {
+                                "user": bot_uid,
+                                "text": template_text,
+                                "ts": ts_legacy_reply,
+                                "thread_ts": th_legacy_ok,
+                            }
+                        ],
+                        "has_more": False,
+                    }
+                if ts == th_conflict_meta:
+                    # Identical template text within the window, but metadata belongs to ANOTHER event_id
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {
+                                "user": bot_uid,
+                                "text": template_text,
+                                "ts": ts_other_event_reply,
+                                "thread_ts": th_conflict_meta,
+                                "metadata": {
+                                    "event_type": "yama_reply",
+                                    "event_payload": {"event_id": "Ev_DIFFERENT_EVENT_999"},
+                                },
+                            }
+                        ],
+                        "has_more": False,
+                    }
+                return {"ok": True, "messages": [], "has_more": False}
+
+        summary = agent_tools.reconcile_replies(
+            db_path=db_path,
+            client=LegacyAndConflictClient(),
+            bot_user_id=bot_uid,
+        )
+        assert summary["ok"] is True
+        assert summary["recorded"] == [{"event_id": ev_legacy_ok, "reply_ts": ts_legacy_reply}]
+        assert summary["not_found"] == [ev_conflict_meta]
+
+        rec_legacy = get_recorded_reply(ev_legacy_ok, db_path=db_path)
+        assert rec_legacy is not None and rec_legacy["reply_ts"] == ts_legacy_reply
+
+        rec_conflict = get_recorded_reply(ev_conflict_meta, db_path=db_path)
+        assert rec_conflict is None, (
+            "Message carrying metadata for a different event_id must NOT be matched by text fallback"
+        )
+
+        return "metadataなしの旧投稿は従来どおり文面一致(第2優先)で回収でき、別event_idのmetadataを持つ同一文面は誤回収しないことを確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -6681,6 +7574,10 @@ def main() -> int:
         ("43. 安全マージン内の重複検出 (イベントtsの数秒前・60秒マージン内の自Bot投稿を検出してスキップ)", test_windowed_thread_dedup_within_margin_before_event_ts),
         ("44. 対象イベント以降の答え済み判定 (イベントtsより後の他者回答でskipped_answered・前の発言は非該当)", test_windowed_thread_answered_after_event_ts),
         ("45. 絞ったスレッド読み取り失敗時のfail-closed維持 (oldest=event_ts-60sで5回失敗時pre_post_check_unverifiable)", test_windowed_thread_failure_unverifiable),
+        ("46. 投稿メタデータ付与＆include_all_metadata指定 (yama_reply+event_id/request_id・全読み取り経路)", test_reply_metadata_attachment_and_include_all_metadata),
+        ("47. メタデータ一致での着地回収＆優先順位1位 (文面整形変化時の回復・reconcile・文面一致より優先)", test_recovery_and_reconcile_by_metadata_match),
+        ("48. 試行時刻の窓(前3分〜後5分)による回収範囲制御 (窓外の同一metadata除外・窓境界内回収)", test_recovery_and_reconcile_attempt_window_boundaries),
+        ("49. 旧投稿(metadataなし)の文面一致回収維持＆別イベントmetadata衝突防止", test_legacy_post_without_metadata_text_fallback),
     ]
 
     print("=" * 72)
