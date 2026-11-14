@@ -79,7 +79,11 @@ except Exception:
     ASIA_TOKYO_TZ = timezone(timedelta(hours=9))
 
 DELAYED_RETRY_PREFIX_RE = re.compile(
-    r"^（遅れての再送：最初の試行 \d{2}-\d{2} \d{2}:\d{2}）(?:\r?\n|$)"
+    r"^(?:"
+    r"遅れての再送（元の失敗時刻：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）"
+    r"|"
+    r"（遅れての再送：最初の試行 \d{2}-\d{2} \d{2}:\d{2}）"
+    r")(?:\r?\n|$)"
 )
 SKIPPED_ANSWERED_RESULT: str = "skipped_answered"
 ANSWERED_MIN_TEXT_LENGTH: int = 10
@@ -1226,7 +1230,7 @@ def get_event_by_id(
 
 def format_delayed_retry_prefix(first_unverifiable_at: Any) -> Optional[str]:
     """Format first_unverifiable_at in Asia/Tokyo as:
-    （遅れての再送：最初の試行 {MM-DD HH:MM}）
+    遅れての再送（元の失敗時刻：{YYYY-MM-DD HH:MM} JST）
     Returns None if first_unverifiable_at is None, empty, or unparseable."""
     parsed_dt = _parse_reply_created_at(first_unverifiable_at)
     if parsed_dt is None and isinstance(first_unverifiable_at, (int, float)):
@@ -1244,7 +1248,7 @@ def format_delayed_retry_prefix(first_unverifiable_at: Any) -> Optional[str]:
     if parsed_dt is None:
         return None
     jst_dt = parsed_dt.astimezone(ASIA_TOKYO_TZ)
-    return f"（遅れての再送：最初の試行 {jst_dt.strftime('%m-%d %H:%M')}）"
+    return f"遅れての再送（元の失敗時刻：{jst_dt.strftime('%Y-%m-%d %H:%M')} JST）"
 
 
 def apply_delayed_retry_prefix(

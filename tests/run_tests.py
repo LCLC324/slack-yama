@@ -4802,7 +4802,7 @@ fi
 
 
 def test_delayed_retry_mark_prefix() -> str:
-    """33. 遅延再送の印付加: 遅延再送(first_unverifiable_at記録あり)で印が1行だけ前置される／通常返信には付かない／既に同じ印がある場合は二重付加しない"""
+    """33. 遅延再送の印付加: 遅延再送(first_unverifiable_at記録あり)で新形式ヘッダーが1行だけ前置される／通常返信には付かない／既に新形式・旧形式の印がある場合は二重付加しない"""
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "slack_events.db"
         init_db(db_path)
@@ -4814,12 +4814,14 @@ def test_delayed_retry_mark_prefix() -> str:
 
         # 2026-11-13 23:05:00 UTC == 2026-11-14 08:05 Asia/Tokyo
         first_unv_utc = "2026-11-13 23:05:00"
-        expected_mark = "（遅れての再送：最初の試行 11-14 08:05）"
+        expected_mark = "遅れての再送（元の失敗時刻：2026-11-14 08:05 JST）"
+        legacy_mark = "（遅れての再送：最初の試行 11-14 08:05）"
         body_text = "ご質問の件、設定ファイルのタイムアウト値を見直すことで解決します。"
 
         ev_delayed = "Ev_DELAYED_MARK_1"
         ev_normal = "Ev_NORMAL_NO_MARK_1"
         ev_already_marked = "Ev_DELAYED_ALREADY_MARKED_1"
+        ev_legacy_marked = "Ev_DELAYED_LEGACY_MARKED_1"
 
         with get_db_connection(db_path) as conn:
             conn.executemany(
@@ -4869,6 +4871,19 @@ def test_delayed_retry_mark_prefix() -> str:
                         None,
                         first_unv_utc,
                     ),
+                    (
+                        ev_legacy_marked,
+                        channel_id,
+                        questioner_uid,
+                        "質問3",
+                        "1795100300.000100",
+                        None,
+                        "PROCESSING",
+                        0,
+                        "pre_post_check_unverifiable",
+                        None,
+                        first_unv_utc,
+                    ),
                 ],
             )
             conn.commit()
@@ -4899,7 +4914,7 @@ def test_delayed_retry_mark_prefix() -> str:
                     "message": {"text": kwargs["text"], "ts": posted_ts},
                 }
 
-        # 1) Delayed retry -> prepends exactly 1 line of expected_mark
+        # 1) Delayed retry -> prepends exactly 1 line of expected_mark (new unified format)
         text_file_1 = Path(tmp) / "reply_delayed.txt"
         text_file_1.write_text(body_text + "\n", encoding="utf-8")
 
@@ -4968,7 +4983,7 @@ def test_delayed_retry_mark_prefix() -> str:
         assert out2["retry_mark_added"] is False
         assert "retry_mark" not in out2
 
-        # 3) Delayed retry when input text ALREADY starts with the mark -> does NOT double-prepend
+        # 3) Delayed retry when input text ALREADY starts with the new mark -> does NOT double-prepend
         text_file_3 = Path(tmp) / "reply_already_marked.txt"
         text_file_3.write_text(f"{expected_mark}\n{body_text}\n", encoding="utf-8")
 
@@ -4996,7 +5011,7 @@ def test_delayed_retry_mark_prefix() -> str:
         assert len(post_calls) == 3
         posted_text_3 = post_calls[2]["text"]
         assert posted_text_3 == f"{expected_mark}\n{body_text}", (
-            f"Mark must not be duplicated when already present, got: {posted_text_3!r}"
+            f"Mark must not be duplicated when new format already present, got: {posted_text_3!r}"
         )
         assert posted_text_3.count("遅れての再送") == 1
         out3 = json.loads(stdout3.getvalue())
@@ -5004,7 +5019,43 @@ def test_delayed_retry_mark_prefix() -> str:
         assert out3["delayed_retry"] is True
         assert out3["retry_mark_added"] is False
 
-        return "遅延再送でAsia/Tokyo整形の印1行前置(retry_mark_added=true)・通常返信は印なし(retry_mark_added=false)・既存印あり時は二重付加防止を確認"
+        # 4) Delayed retry when input text ALREADY starts with the legacy mark -> does NOT prepend new mark
+        text_file_4 = Path(tmp) / "reply_legacy_marked.txt"
+        text_file_4.write_text(f"{legacy_mark}\n{body_text}\n", encoding="utf-8")
+
+        stdout4 = io.StringIO()
+        stderr4 = io.StringIO()
+        with patch.object(
+            agent_tools, "get_web_client", return_value=MarkTestClient()
+        ), redirect_stdout(stdout4), redirect_stderr(stderr4):
+            rc4 = agent_tools.main(
+                [
+                    "--db",
+                    str(db_path),
+                    "reply",
+                    "--channel",
+                    channel_id,
+                    "--text-file",
+                    str(text_file_4),
+                    "--thread-ts",
+                    "1795100300.000100",
+                    "--event-id",
+                    ev_legacy_marked,
+                ]
+            )
+        assert rc4 == 0
+        assert len(post_calls) == 4
+        posted_text_4 = post_calls[3]["text"]
+        assert posted_text_4 == f"{legacy_mark}\n{body_text}", (
+            f"Mark must not be duplicated when legacy format already present, got: {posted_text_4!r}"
+        )
+        assert posted_text_4.count("遅れての再送") == 1
+        out4 = json.loads(stdout4.getvalue())
+        assert out4["ok"] is True
+        assert out4["delayed_retry"] is True
+        assert out4["retry_mark_added"] is False
+
+        return "遅延再送でAsia/Tokyo整形の新形式ヘッダー1行前置(retry_mark_added=true)・通常返信は印なし(retry_mark_added=false)・新旧両形式の既存ヘッダーあり時は二重付加防止を確認"
 
 
 def test_delayed_retry_skipped_answered() -> str:
@@ -5136,8 +5187,8 @@ def test_delayed_retry_not_answered_conservative_cases() -> str:
         channel_id = "C_ALL"
         questioner_uid = "U_QUESTIONER"
         other_human_uid = "U_OTHER_HUMAN"
-        first_unv_utc = "2026-11-13 23:30:00"  # -> 11-14 08:30 JST
-        expected_mark = "（遅れての再送：最初の試行 11-14 08:30）"
+        first_unv_utc = "2026-11-13 23:30:00"  # -> 2026-11-14 08:30 JST
+        expected_mark = "遅れての再送（元の失敗時刻：2026-11-14 08:30 JST）"
         reply_body = "Yamaからの遅延回答本文です。"
 
         text_file = Path(tmp) / "reply_conservative.txt"
@@ -5418,6 +5469,69 @@ def test_delayed_retry_history_failure_unverifiable() -> str:
         return "遅延再送時のスレッド履歴取得5回全失敗で送信せず既存のpre_post_check_unverifiable(exit 1)を返し、下書き本文とfirst_unverifiable_atが維持されることを確認"
 
 
+def test_delayed_retry_legacy_and_new_header_dedup() -> str:
+    """37. 再送ヘッダー3者統一形＆移行期二重付加防止: 新形式生成・新旧両形式の正規表現判定（別時刻・CRLF含む）で二重付加しないことを確認"""
+    # 1) format_delayed_retry_prefix formats in Asia/Tokyo with YYYY-MM-DD HH:MM JST
+    # 2026-11-13 14:00:00 UTC == 2026-11-13 23:00 Asia/Tokyo
+    prefix = agent_tools.format_delayed_retry_prefix("2026-11-13 14:00:00")
+    assert prefix == "遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）", (
+        f"Unexpected formatted prefix: {prefix!r}"
+    )
+
+    body = "テスト本文です。"
+
+    # 2) apply_delayed_retry_prefix: prepends 1 line when no header exists
+    out_added, added_flag, p_line = agent_tools.apply_delayed_retry_prefix(
+        body, "2026-11-13 14:00:00"
+    )
+    assert added_flag is True
+    assert p_line == "遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）"
+    assert out_added == f"遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）\n{body}"
+
+    # 3) apply_delayed_retry_prefix: does NOT add when starting with new format (same or different timestamp, LF or CRLF)
+    for new_existing in (
+        f"遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）\n{body}",
+        f"遅れての再送（元の失敗時刻：2026-11-12 09:15 JST）\n{body}",
+        f"遅れての再送（元の失敗時刻：2026-11-12 09:15 JST）\r\n{body}",
+        "遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）",
+    ):
+        assert agent_tools.DELAYED_RETRY_PREFIX_RE.match(new_existing) is not None, (
+            f"Regex should match new format: {new_existing!r}"
+        )
+        res_text, res_added, _ = agent_tools.apply_delayed_retry_prefix(
+            new_existing, "2026-11-13 14:00:00"
+        )
+        assert res_added is False, f"Should not add mark to {new_existing!r}"
+        assert res_text == new_existing
+
+    # 4) apply_delayed_retry_prefix: does NOT add when starting with legacy format (same or different timestamp, LF or CRLF)
+    for legacy_existing in (
+        f"（遅れての再送：最初の試行 11-13 23:00）\n{body}",
+        f"（遅れての再送：最初の試行 11-12 09:15）\n{body}",
+        f"（遅れての再送：最初の試行 11-12 09:15）\r\n{body}",
+        "（遅れての再送：最初の試行 11-13 23:00）",
+    ):
+        assert agent_tools.DELAYED_RETRY_PREFIX_RE.match(legacy_existing) is not None, (
+            f"Regex should match legacy format: {legacy_existing!r}"
+        )
+        res_text, res_added, _ = agent_tools.apply_delayed_retry_prefix(
+            legacy_existing, "2026-11-13 14:00:00"
+        )
+        assert res_added is False, f"Should not add mark to {legacy_existing!r}"
+        assert res_text == legacy_existing
+
+    # 5) Normal text mentioning "遅れての再送" in the middle is NOT matched as a header and gets the header prepended on delayed retry
+    normal_body_with_word = "先ほどの遅れての再送についての補足です。"
+    assert agent_tools.DELAYED_RETRY_PREFIX_RE.match(normal_body_with_word) is None
+    res_norm, res_norm_added, _ = agent_tools.apply_delayed_retry_prefix(
+        normal_body_with_word, "2026-11-13 14:00:00"
+    )
+    assert res_norm_added is True
+    assert res_norm == f"遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）\n{normal_body_with_word}"
+
+    return "新形式（遅れての再送（元の失敗時刻：YYYY-MM-DD HH:MM JST））整形・新旧2形式の正規表現判定（別時刻・CRLF対応）による二重付加防止を確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -5452,10 +5566,11 @@ def main() -> int:
         ("30. Hook .envアトミック書き換え (同一ディレクトリ一時ファイル・chmod 600・mv置換)", test_hook_env_atomic_replace),
         ("31. エラー分類適正化＆listener auth_testリトライ (429 Retry-After/5xxリトライ・503時local_db_fallback・恒常エラー即時失敗)", test_transient_slack_api_error_retry_and_listener_auth_retry),
         ("32. バッチD検証 (commit IGNORED時errorクリア・watchdog初回60s backoff・フック自己修復ログ・busy_timeout統一・未使用定数削除)", test_batch_d_ignored_error_clear_watchdog_and_busy_timeout),
-        ("33. 遅延再送の印付加 (Asia/Tokyo整形1行前置・通常返信不付加・二重付加防止)", test_delayed_retry_mark_prefix),
+        ("33. 遅延再送の印付加 (Asia/Tokyo整形1行前置・通常返信不付加・新旧両形式の二重付加防止)", test_delayed_retry_mark_prefix),
         ("34. 遅延再送の答え済み送信抑止 (他者10文字超回答でskipped_answered・判定ts出力・DONE遷移)", test_delayed_retry_skipped_answered),
         ("35. 遅延再送の答え済み非該当ケース (ボットのみ・10文字以下短文のみ・質問者追記のみ・Yama投稿のみ)", test_delayed_retry_not_answered_conservative_cases),
         ("36. 遅延再送の履歴取得失敗時 fail-closed (既存pre_post_check_unverifiable経路維持)", test_delayed_retry_history_failure_unverifiable),
+        ("37. 再送ヘッダー3者統一形＆移行期二重付加防止 (新形式生成・新旧両形式の正規表現判定)", test_delayed_retry_legacy_and_new_header_dedup),
     ]
 
     print("=" * 72)
