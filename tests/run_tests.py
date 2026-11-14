@@ -2664,7 +2664,7 @@ def test_reconcile_replies() -> str:
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "slack_events.db"
-        init_db(db_path)
+        agent_tools.init_db(db_path)
 
         bot_uid = "U_YAMA_BOT"
         channel_id = "C_ALL"
@@ -2711,24 +2711,24 @@ def test_reconcile_replies() -> str:
 
         with get_db_connection(db_path) as conn:
             events_rows = [
-                (ev_cand_done, channel_id, "U_USER1", "Q1", th_1, None, "DONE", "reply not posted, no replies-table record", recent_ts_str),
-                (ev_cand_no_yama, channel_id, "U_USER2", "Q2", th_2, None, "FAILED", "reply not posted", recent_ts_str),
-                (ev_already_recorded, channel_id, "U_USER3", "Q3", th_3, None, "FAILED", "reply not posted", recent_ts_str),
+                (ev_cand_done, channel_id, "U_USER1", "Q1", th_1, None, "DONE", "reply not posted, no replies-table record", reply_text_1, recent_ts_str),
+                (ev_cand_no_yama, channel_id, "U_USER2", "Q2", th_2, None, "FAILED", "reply not posted", "未着地の送信文面", recent_ts_str),
+                (ev_already_recorded, channel_id, "U_USER3", "Q3", th_3, None, "FAILED", "reply not posted", "既に台帳記録済みの返信", recent_ts_str),
                 # Insert ev_shared_new BEFORE ev_shared_old in row order to verify sorting by event ts (oldest first)
-                (ev_shared_new, channel_id, "U_USER4", "Q4b", "1794479005.000000", th_4, "FAILED", "ambiguous_post_outcome", recent_ts_str),
-                (ev_shared_old, channel_id, "U_USER4", "Q4a", "1794479001.000000", th_4, "DONE", "reply not posted", recent_ts_str),
-                ("Ev_UNRELATED_ERR", channel_id, "U_USER5", "Q5", "1794480000.000000", None, "FAILED", "rate_limited", recent_ts_str),
-                ("Ev_NO_ERR", channel_id, "U_USER6", "Q6", "1794481000.000000", None, "DONE", None, recent_ts_str),
-                ("Ev_PENDING_REPLY", channel_id, "U_USER7", "Q7", "1794482000.000000", None, "PENDING", "reply not posted", recent_ts_str),
-                ("Ev_TOO_OLD_10D", channel_id, "U_USER8", "Q8", "1794470000.000000", None, "DONE", "reply not posted", old_ts_str),
+                (ev_shared_new, channel_id, "U_USER4", "Q4b", "1794479005.000000", th_4, "FAILED", "ambiguous_post_outcome", reply_text_4b, recent_ts_str),
+                (ev_shared_old, channel_id, "U_USER4", "Q4a", "1794479001.000000", th_4, "DONE", "reply not posted", reply_text_4a, recent_ts_str),
+                ("Ev_UNRELATED_ERR", channel_id, "U_USER5", "Q5", "1794480000.000000", None, "FAILED", "rate_limited", None, recent_ts_str),
+                ("Ev_NO_ERR", channel_id, "U_USER6", "Q6", "1794481000.000000", None, "DONE", None, None, recent_ts_str),
+                ("Ev_PENDING_REPLY", channel_id, "U_USER7", "Q7", "1794482000.000000", None, "PENDING", "reply not posted", None, recent_ts_str),
+                ("Ev_TOO_OLD_10D", channel_id, "U_USER8", "Q8", "1794470000.000000", None, "DONE", "reply not posted", None, old_ts_str),
             ]
             conn.executemany(
                 """
                 INSERT INTO events (
-                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [(e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[8]) for e in events_rows],
+                [(e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[9]) for e in events_rows],
             )
             conn.commit()
 
@@ -2890,12 +2890,12 @@ def test_reconcile_replies() -> str:
             conn.executemany(
                 """
                 INSERT INTO events (
-                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (ev_api_err, channel_id, "U_USER9", "Q_err", th_err, None, "DONE", "reply not posted", recent_ts_str, recent_ts_str),
-                    (ev_after_err, channel_id, "U_USER9", "Q_ok", th_after, None, "DONE", "reply not posted", recent_ts_str, recent_ts_str),
+                    (ev_api_err, channel_id, "U_USER9", "Q_err", th_err, None, "DONE", "reply not posted", "エラー時の文面", recent_ts_str, recent_ts_str),
+                    (ev_after_err, channel_id, "U_USER9", "Q_ok", th_after, None, "DONE", "reply not posted", "エラー後の正常記録", recent_ts_str, recent_ts_str),
                 ],
             )
             conn.commit()
@@ -3043,12 +3043,13 @@ def test_history_retry_5_attempts_and_backoff() -> str:
         # 3) reconcile_replies: thread scan fails 3 times -> succeeds on 4th attempt
         now_dt = datetime.now(timezone.utc)
         recent_ts_str = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        agent_tools.init_db(db_path)
         with get_db_connection(db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO events (
-                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "Ev_REC_4TH",
@@ -3059,6 +3060,7 @@ def test_history_retry_5_attempts_and_backoff() -> str:
                     None,
                     "FAILED",
                     "ambiguous_post_outcome",
+                    "Recovered on 4th attempt",
                     recent_ts_str,
                     recent_ts_str,
                 ),
@@ -3276,19 +3278,20 @@ def test_reconcile_done_residual_errors() -> str:
         ev_done_scan_err = "Ev_DONE_ERR_SCAN_FAIL"
         th_scan_err = "1794496000.100000"
 
+        agent_tools.init_db(db_path)
         with get_db_connection(db_path) as conn:
             conn.executemany(
                 """
                 INSERT INTO events (
-                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (ev_done_unrec, channel_id, "U_U1", "Q_unrec", th_unrec, None, "DONE", "IncompleteRead(64 bytes read)", recent_ts_str, recent_ts_str),
-                    (ev_done_alr, channel_id, "U_U2", "Q_alr", th_alr, None, "DONE", "reply not posted, no replies-table record", recent_ts_str, recent_ts_str),
-                    (ev_done_no_reply, channel_id, "U_U3", "Q_norep", th_no_reply, None, "DONE", "pre_post_check_unverifiable", recent_ts_str, recent_ts_str),
-                    (ev_done_phase1_no_reply, channel_id, "U_U4", "Q_p1_norep", th_phase1_no_reply, None, "DONE", "reply not posted", recent_ts_str, recent_ts_str),
-                    (ev_done_scan_err, channel_id, "U_U5", "Q_scan_err", th_scan_err, None, "DONE", "max attempts exceeded", recent_ts_str, recent_ts_str),
+                    (ev_done_unrec, channel_id, "U_U1", "Q_unrec", th_unrec, None, "DONE", "IncompleteRead(64 bytes read)", reply_text_unrec, recent_ts_str, recent_ts_str),
+                    (ev_done_alr, channel_id, "U_U2", "Q_alr", th_alr, None, "DONE", "reply not posted, no replies-table record", None, recent_ts_str, recent_ts_str),
+                    (ev_done_no_reply, channel_id, "U_U3", "Q_norep", th_no_reply, None, "DONE", "pre_post_check_unverifiable", None, recent_ts_str, recent_ts_str),
+                    (ev_done_phase1_no_reply, channel_id, "U_U4", "Q_p1_norep", th_phase1_no_reply, None, "DONE", "reply not posted", None, recent_ts_str, recent_ts_str),
+                    (ev_done_scan_err, channel_id, "U_U5", "Q_scan_err", th_scan_err, None, "DONE", "max attempts exceeded", None, recent_ts_str, recent_ts_str),
                 ],
             )
             conn.commit()
@@ -3580,19 +3583,20 @@ def test_reconcile_replies_no_false_linking_and_ts_order() -> str:
         ghost_rec_ts = "1794520099.999999"
         other_yama_ts = "1794520010.000100"
 
+        agent_tools.init_db(db_path)
         with get_db_connection(db_path) as conn:
             conn.executemany(
                 """
                 INSERT INTO events (
-                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    event_id, channel_id, user_id, text, ts, thread_ts, status, error_message, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (ev_a, channel_id, "U_1", "Parent A", th_1, None, "DONE", None, recent_ts_str, recent_ts_str),
-                    (ev_b, channel_id, "U_2", "Followup B (no reply needed)", ev_b_ts, th_1, "DONE", "IncompleteRead(32 bytes read)", recent_ts_str, recent_ts_str),
-                    (ev_child_p1, channel_id, "U_3", "Child P1", ev_child_p1_ts, th_2, "FAILED", "ambiguous_post_outcome", recent_ts_str, recent_ts_str),
-                    (ev_child_p2, channel_id, "U_4", "Child P2", ev_child_p2_ts, th_2, "DONE", "IncompleteRead", recent_ts_str, recent_ts_str),
-                    (ev_c, channel_id, "U_5", "Event C", th_3, None, "DONE", "residual error", recent_ts_str, recent_ts_str),
+                    (ev_a, channel_id, "U_1", "Parent A", th_1, None, "DONE", None, None, recent_ts_str, recent_ts_str),
+                    (ev_b, channel_id, "U_2", "Followup B (no reply needed)", ev_b_ts, th_1, "DONE", "IncompleteRead(32 bytes read)", "Event Aへの正常な返信", recent_ts_str, recent_ts_str),
+                    (ev_child_p1, channel_id, "U_3", "Child P1", ev_child_p1_ts, th_2, "FAILED", "ambiguous_post_outcome", "子イベント発生前の古いYama発言", recent_ts_str, recent_ts_str),
+                    (ev_child_p2, channel_id, "U_4", "Child P2", ev_child_p2_ts, th_2, "DONE", "IncompleteRead", "子イベント発生前の古いYama発言", recent_ts_str, recent_ts_str),
+                    (ev_c, channel_id, "U_5", "Event C", th_3, None, "DONE", "residual error", None, recent_ts_str, recent_ts_str),
                 ],
             )
             conn.commit()
@@ -3989,14 +3993,15 @@ def test_reconcile_replies_picks_up_unverifiable() -> str:
         ev_pending_no_reply = "Ev_REC_PENDING_UNV_NONE"
         th_3 = "1794602000.100000"
 
+        agent_tools.init_db(db_path)
         with get_db_connection(db_path) as conn:
             conn.executemany(
                 """
                 INSERT INTO events (
                     event_id, channel_id, user_id, text, ts, thread_ts,
                     status, retry_count, error_message, next_retry_at, first_unverifiable_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -4011,6 +4016,7 @@ def test_reconcile_replies_picks_up_unverifiable() -> str:
                         "pre_post_check_unverifiable",
                         future_retry_str,
                         recent_ts_str,
+                        reply_text_1,
                         recent_ts_str,
                         recent_ts_str,
                     ),
@@ -4026,6 +4032,7 @@ def test_reconcile_replies_picks_up_unverifiable() -> str:
                         "pre_post_check_unverifiable (abandoned after 24h)",
                         None,
                         recent_ts_str,
+                        reply_text_2,
                         recent_ts_str,
                         recent_ts_str,
                     ),
@@ -4041,6 +4048,7 @@ def test_reconcile_replies_picks_up_unverifiable() -> str:
                         "pre_post_check_unverifiable",
                         future_retry_str,
                         recent_ts_str,
+                        "未着地の送信予定文面",
                         recent_ts_str,
                         recent_ts_str,
                     ),
@@ -5746,7 +5754,7 @@ def test_ambiguous_saves_intended_text() -> str:
 
 
 def test_reconcile_intended_text_matching_and_fallback() -> str:
-    """39. reconcileのintended_text文面一致優先＆正規化＆フォールバック: (1)スレッド内Yama投稿2件で遅い方がintended_textと一致→一致側を割当、(2)HTMLエスケープ(&amp;/&lt;/&gt;)・CRLF・前後空白違いでも正規化一致、(3)不一致時は最も早い未割当投稿へフォールバック（phase1/phase2両方）を確認"""
+    """39. reconcileのintended_text文面一致＆正規化＆不一致時未記録（推定フォールバック廃止）: (1)スレッド内Yama投稿2件で遅い方がintended_textと一致→一致側を割当、(2)HTMLエスケープ(&amp;/&lt;/&gt;)・CRLF・前後空白違いでも正規化一致、(3)不一致時は最古未割当へフォールバックせず未記録(phase1はnot_found、phase2はerror消去のみwithout_reply)を確認"""
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "slack_events.db"
         init_db(db_path)
@@ -5772,9 +5780,9 @@ def test_reconcile_intended_text_matching_and_fallback() -> str:
         intended_p2 = "  条件: a < b && c > d\r\n2行目のテキスト  "
         slack_escaped_p2 = "\n条件: a &lt; b &amp;&amp; c &gt; d\n2行目のテキスト\t"
 
-        # Thread 3 (phase1): intended_text is present, but neither Yama post matches -> falls back to earliest unassigned post
+        # Thread 3 (phase1): intended_text is present, but neither Yama post matches -> must NOT record (not_found)
         th_3 = "1796100300.000100"
-        ev_p1_fallback = "Ev_P1_FALLBACK_EARLIEST"
+        ev_p1_mismatch = "Ev_P1_MISMATCH_NOT_RECORDED"
         ts_p1_fb_early = "1796100310.000100"
         ts_p1_fb_late = "1796100320.000200"
         intended_p3 = "どの投稿とも一致しない送信予定文面"
@@ -5788,9 +5796,9 @@ def test_reconcile_intended_text_matching_and_fallback() -> str:
         intended_p4 = "Phase2の回答: X & Y < Z > W"
         slack_escaped_p4 = "Phase2の回答: X &amp; Y &lt; Z &gt; W"
 
-        # Thread 5 (phase2 - DONE with residual error_message, non-matching intended_text -> fallback to earliest)
+        # Thread 5 (phase2 - DONE with residual error_message, non-matching intended_text -> NOT recorded, without_reply)
         th_5 = "1796100500.000100"
-        ev_p2_fallback = "Ev_P2_FALLBACK_EARLIEST"
+        ev_p2_mismatch = "Ev_P2_MISMATCH_NOT_RECORDED"
         ts_p2_fb_early = "1796100510.000100"
         ts_p2_fb_late = "1796100520.000200"
         intended_p5 = "Phase2で一致しない文面"
@@ -5806,9 +5814,9 @@ def test_reconcile_intended_text_matching_and_fallback() -> str:
                 [
                     (ev_p1_match, channel_id, "U_1", "Q1", th_1, None, "FAILED", "ambiguous_post_outcome", intended_p1, recent_ts_str, recent_ts_str),
                     (ev_p1_escape, channel_id, "U_2", "Q2", th_2, None, "FAILED", "ambiguous_post_outcome", intended_p2, recent_ts_str, recent_ts_str),
-                    (ev_p1_fallback, channel_id, "U_3", "Q3", th_3, None, "FAILED", "ambiguous_post_outcome", intended_p3, recent_ts_str, recent_ts_str),
+                    (ev_p1_mismatch, channel_id, "U_3", "Q3", th_3, None, "FAILED", "ambiguous_post_outcome", intended_p3, recent_ts_str, recent_ts_str),
                     (ev_p2_match, channel_id, "U_4", "Q4", th_4, None, "DONE", "transient_socket_warning", intended_p4, recent_ts_str, recent_ts_str),
-                    (ev_p2_fallback, channel_id, "U_5", "Q5", th_5, None, "DONE", "transient_socket_warning", intended_p5, recent_ts_str, recent_ts_str),
+                    (ev_p2_mismatch, channel_id, "U_5", "Q5", th_5, None, "DONE", "transient_socket_warning", intended_p5, recent_ts_str, recent_ts_str),
                 ],
             )
             conn.commit()
@@ -5826,7 +5834,7 @@ def test_reconcile_intended_text_matching_and_fallback() -> str:
             ],
             th_3: [
                 {"user": "U_3", "text": "Q3", "ts": th_3},
-                {"user": bot_uid, "text": "手動編集された早い方の返信", "ts": ts_p1_fb_early, "thread_ts": th_3},
+                {"user": bot_uid, "text": "別件の早い方の返信", "ts": ts_p1_fb_early, "thread_ts": th_3},
                 {"user": bot_uid, "text": "別の遅い返信", "ts": ts_p1_fb_late, "thread_ts": th_3},
             ],
             th_4: [
@@ -5836,8 +5844,8 @@ def test_reconcile_intended_text_matching_and_fallback() -> str:
             ],
             th_5: [
                 {"user": "U_5", "text": "Q5", "ts": th_5},
-                {"user": bot_uid, "text": "Phase2フォールバック早い方", "ts": ts_p2_fb_early, "thread_ts": th_5},
-                {"user": bot_uid, "text": "Phase2フォールバック遅い方", "ts": ts_p2_fb_late, "thread_ts": th_5},
+                {"user": bot_uid, "text": "Phase2別件の早い方", "ts": ts_p2_fb_early, "thread_ts": th_5},
+                {"user": bot_uid, "text": "Phase2別件の遅い方", "ts": ts_p2_fb_late, "thread_ts": th_5},
             ],
         }
 
@@ -5872,33 +5880,174 @@ def test_reconcile_intended_text_matching_and_fallback() -> str:
         assert rec_map[ev_p1_escape] == ts_p1_esc_match, (
             f"Expected {ts_p1_esc_match} (normalized escape match), got {rec_map.get(ev_p1_escape)}"
         )
-        # (3) Phase 1: falls back to earliest unassigned post when no text matches
-        assert rec_map[ev_p1_fallback] == ts_p1_fb_early, (
-            f"Expected {ts_p1_fb_early} (earliest fallback), got {rec_map.get(ev_p1_fallback)}"
+        # (3) Phase 1: does NOT fall back when no text matches -> left unrecorded and listed in not_found
+        assert ev_p1_mismatch not in rec_map, (
+            f"Mismatched phase1 event must not be recorded, got {rec_map.get(ev_p1_mismatch)}"
         )
-        # (4) Phase 2: picks later matching post (with HTML escape normalization) and clears DONE error_message
+        assert res["not_found"] == [ev_p1_mismatch], (
+            f"Expected [{ev_p1_mismatch}] in not_found, got {res['not_found']}"
+        )
+        # (4) Phase 2: picks later matching post (with HTML escape normalization) and clears DONE error_message as with_reply
         assert rec_map[ev_p2_match] == ts_p2_late_match, (
             f"Expected {ts_p2_late_match} in phase2, got {rec_map.get(ev_p2_match)}"
         )
-        # (5) Phase 2: falls back to earliest unassigned post when no text matches
-        assert rec_map[ev_p2_fallback] == ts_p2_fb_early, (
-            f"Expected {ts_p2_fb_early} in phase2 fallback, got {rec_map.get(ev_p2_fallback)}"
+        # (5) Phase 2: does NOT fall back when no text matches -> clears DONE error_message as without_reply, not recorded
+        assert ev_p2_mismatch not in rec_map, (
+            f"Mismatched phase2 event must not be recorded, got {rec_map.get(ev_p2_mismatch)}"
         )
-        assert ev_p2_match in res["done_error_cleared"]["with_reply"]
-        assert ev_p2_fallback in res["done_error_cleared"]["with_reply"]
+        assert res["done_error_cleared"]["with_reply"] == [ev_p2_match], (
+            f"Expected only [{ev_p2_match}] in with_reply, got {res['done_error_cleared']['with_reply']}"
+        )
+        assert res["done_error_cleared"]["without_reply"] == [ev_p2_mismatch], (
+            f"Expected [{ev_p2_mismatch}] in without_reply, got {res['done_error_cleared']['without_reply']}"
+        )
 
-        # Verify replies table records match
+        # Verify replies table records match only the text-matched events
         for eid, expected_ts in (
             (ev_p1_match, ts_p1_late_match),
             (ev_p1_escape, ts_p1_esc_match),
-            (ev_p1_fallback, ts_p1_fb_early),
             (ev_p2_match, ts_p2_late_match),
-            (ev_p2_fallback, ts_p2_fb_early),
         ):
             r_row = get_recorded_reply(eid, db_path=db_path)
             assert r_row is not None and r_row["reply_ts"] == expected_ts
 
-        return "スレッド内複数Yama投稿でintended_text一致側(遅い投稿)を優先割当・HTMLエスケープ(&amp;/&lt;/&gt;)やCRLF/前後空白の正規化一致・不一致時の最古未割当フォールバックをphase1/phase2両方で確認"
+        assert get_recorded_reply(ev_p1_mismatch, db_path=db_path) is None
+        assert get_recorded_reply(ev_p2_mismatch, db_path=db_path) is None
+
+        # Verify DONE error_message was cleared for both phase2 DONE events
+        for eid in (ev_p2_match, ev_p2_mismatch):
+            ev_row = agent_tools.get_event_by_id(eid, db_path=db_path)
+            assert ev_row is not None and ev_row["error_message"] is None
+
+        return "スレッド内複数Yama投稿でintended_text一致側(遅い投稿)を割当・HTMLエスケープ(&amp;/&lt;/&gt;)やCRLF/前後空白の正規化一致・不一致時は推定割当せず未記録(phase1=not_found, phase2=without_reply)を確認"
+
+
+def test_reconcile_no_intended_text_never_estimated() -> str:
+    """40. intended_textがないイベントの推定割当廃止: intended_textがNULL/空文字のイベントは未割当Yama投稿が後に存在してもreplies台帳に記録せず(phase1=not_found、phase2 DONE=without_replyでエラー消去)、台帳記録済みDONEイベントのts完全一致確認(with_reply)は維持されることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        now_dt = datetime.now(timezone.utc)
+        recent_ts_str = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1) Phase 1 FAILED candidate with intended_text=None, unassigned Yama post exists after event -> not_found, not recorded
+        th_1 = "1796200100.000100"
+        ev_p1_null = "Ev_P1_NO_INTENDED_NULL"
+        ts_yama_1 = "1796200110.000100"
+
+        # 2) Phase 1 DONE candidate with intended_text="   " (whitespace only), unassigned Yama post exists -> not_found, not recorded, cleared as without_reply
+        th_2 = "1796200200.000100"
+        ev_p1_done_empty = "Ev_P1_DONE_NO_INTENDED_EMPTY"
+        ts_yama_2 = "1796200210.000100"
+
+        # 3) Phase 2 DONE candidate (non-phase1 error_message) with intended_text=None, unassigned Yama post exists -> not recorded, cleared as without_reply
+        th_3 = "1796200300.000100"
+        ev_p2_done_null = "Ev_P2_DONE_NO_INTENDED_NULL"
+        ts_yama_3 = "1796200310.000100"
+
+        # 4) Phase 2 DONE candidate already recorded in replies table with intended_text=None -> confirmed via ts match -> cleared as with_reply
+        th_4 = "1796200400.000100"
+        ev_p2_recorded_ts = "Ev_P2_RECORDED_TS_CONFIRM"
+        ts_yama_4 = "1796200410.000100"
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, error_message, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_p1_null, channel_id, "U_1", "Q1", th_1, None, "FAILED", "ambiguous_post_outcome", None, recent_ts_str, recent_ts_str),
+                    (ev_p1_done_empty, channel_id, "U_2", "Q2", th_2, None, "DONE", "reply not posted", "   \n  ", recent_ts_str, recent_ts_str),
+                    (ev_p2_done_null, channel_id, "U_3", "Q3", th_3, None, "DONE", "IncompleteRead(16 bytes read)", None, recent_ts_str, recent_ts_str),
+                    (ev_p2_recorded_ts, channel_id, "U_4", "Q4", th_4, None, "DONE", "reply not posted", None, recent_ts_str, recent_ts_str),
+                ],
+            )
+            conn.commit()
+
+        agent_tools.record_reply(
+            event_id=ev_p2_recorded_ts,
+            channel_id=channel_id,
+            thread_ts=th_4,
+            reply_ts=ts_yama_4,
+            text="既に台帳記録済みのYama返信",
+            db_path=db_path,
+        )
+
+        threads_data = {
+            th_1: [
+                {"user": "U_1", "text": "Q1", "ts": th_1},
+                {"user": bot_uid, "text": "未割当のYama返信1", "ts": ts_yama_1, "thread_ts": th_1},
+            ],
+            th_2: [
+                {"user": "U_2", "text": "Q2", "ts": th_2},
+                {"user": bot_uid, "text": "未割当のYama返信2", "ts": ts_yama_2, "thread_ts": th_2},
+            ],
+            th_3: [
+                {"user": "U_3", "text": "Q3", "ts": th_3},
+                {"user": bot_uid, "text": "未割当のYama返信3", "ts": ts_yama_3, "thread_ts": th_3},
+            ],
+            th_4: [
+                {"user": "U_4", "text": "Q4", "ts": th_4},
+                {"user": bot_uid, "text": "既に台帳記録済みのYama返信", "ts": ts_yama_4, "thread_ts": th_4},
+            ],
+        }
+
+        class NoEstimateClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                ts = str(kwargs.get("ts"))
+                return {
+                    "ok": True,
+                    "messages": threads_data.get(ts, []),
+                    "has_more": False,
+                }
+
+        res = agent_tools.reconcile_replies(
+            days=7,
+            dry_run=False,
+            db_path=db_path,
+            client=NoEstimateClient(),
+            now=now_dt,
+        )
+        assert res["ok"] is True
+        assert res["errors"] == 0
+        assert res["checked"] == 2  # ev_p1_null, ev_p1_done_empty
+        assert res["recorded"] == [], f"Expected no estimated recordings, got {res['recorded']}"
+        assert res["not_found"] == [ev_p1_null, ev_p1_done_empty], (
+            f"Expected [{ev_p1_null}, {ev_p1_done_empty}] in not_found, got {res['not_found']}"
+        )
+        assert res["done_error_cleared"]["with_reply"] == [ev_p2_recorded_ts], (
+            f"Expected only ts-confirmed [{ev_p2_recorded_ts}] in with_reply, got {res['done_error_cleared']['with_reply']}"
+        )
+        assert res["done_error_cleared"]["without_reply"] == [ev_p1_done_empty, ev_p2_done_null], (
+            f"Expected [{ev_p1_done_empty}, {ev_p2_done_null}] in without_reply, got {res['done_error_cleared']['without_reply']}"
+        )
+
+        # Confirm none of the events without intended_text were recorded into replies table
+        assert get_recorded_reply(ev_p1_null, db_path=db_path) is None
+        assert get_recorded_reply(ev_p1_done_empty, db_path=db_path) is None
+        assert get_recorded_reply(ev_p2_done_null, db_path=db_path) is None
+        # Pre-recorded event stays intact
+        rec_4 = get_recorded_reply(ev_p2_recorded_ts, db_path=db_path)
+        assert rec_4 is not None and rec_4["reply_ts"] == ts_yama_4
+
+        # Confirm DONE events had their error_message cleared, while FAILED event kept its error_message
+        for eid in (ev_p1_done_empty, ev_p2_done_null, ev_p2_recorded_ts):
+            row = agent_tools.get_event_by_id(eid, db_path=db_path)
+            assert row is not None and row["error_message"] is None
+        row_failed = agent_tools.get_event_by_id(ev_p1_null, db_path=db_path)
+        assert row_failed is not None and row_failed["error_message"] == "ambiguous_post_outcome"
+
+        return "intended_textなし(NULL/空白のみ)のイベントは未割当Yama投稿が後にあっても推定記録せず(not_found/without_reply)、台帳記録済みDONEイベントのts完全一致確認(with_reply)は維持されることを確認"
 
 
 def main() -> int:
@@ -5941,7 +6090,8 @@ def main() -> int:
         ("36. 遅延再送の履歴取得失敗時 fail-closed (既存pre_post_check_unverifiable経路維持)", test_delayed_retry_history_failure_unverifiable),
         ("37. 再送ヘッダー3者統一形＆移行期二重付加防止 (新形式生成・新旧両形式の正規表現判定)", test_delayed_retry_legacy_and_new_header_dedup),
         ("38. Ambiguous 送信文面保存 (ambiguous時のみintended_text保存・再送ヘッダー込み最終文字列・ALTER TABLE冪等移行)", test_ambiguous_saves_intended_text),
-        ("39. Reconcile 文面一致優先＆正規化＆フォールバック (遅い一致投稿の優先割当・エスケープ/改行/空白正規化・不一致時最古フォールバック・phase1/2適用)", test_reconcile_intended_text_matching_and_fallback),
+        ("39. Reconcile 文面一致＆正規化＆不一致時未記録 (遅い一致投稿の割当・エスケープ/改行/空白正規化・不一致時フォールバック廃止)", test_reconcile_intended_text_matching_and_fallback),
+        ("40. Reconcile intended_textなし時の推定割当廃止 (NULL/空白時は未記録＆without_reply・記録済みts確認はwith_reply維持)", test_reconcile_no_intended_text_never_estimated),
     ]
 
     print("=" * 72)

@@ -928,12 +928,13 @@ def _select_matching_yama_message(
     cand_ts: str,
     intended_text: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Select an unassigned Yama message strictly after cand_ts:
-    - If intended_text is present, prefer the earliest unassigned message whose
-      normalized text matches normalized intended_text.
-    - Otherwise (or if no text match is found), fall back to the earliest
-      unassigned message after cand_ts."""
-    unassigned_after: List[Dict[str, Any]] = []
+    """Select an unassigned Yama message strictly after cand_ts whose normalized
+    text matches normalized intended_text.
+    Returns None if intended_text is missing/empty or no matching unassigned message exists."""
+    norm_intended = _normalize_reconcile_text(intended_text)
+    if not norm_intended:
+        return None
+
     for msg in yama_msgs:
         m_ts = str(msg["ts"])
         if m_ts in assigned_reply_ts:
@@ -942,19 +943,12 @@ def _select_matching_yama_message(
             is_after = float(m_ts) > float(cand_ts)
         except (TypeError, ValueError):
             is_after = m_ts > str(cand_ts)
-        if is_after:
-            unassigned_after.append(msg)
+        if not is_after:
+            continue
+        if _normalize_reconcile_text(msg.get("text")) == norm_intended:
+            return msg
 
-    if not unassigned_after:
-        return None
-
-    norm_intended = _normalize_reconcile_text(intended_text)
-    if norm_intended:
-        for msg in unassigned_after:
-            if _normalize_reconcile_text(msg.get("text")) == norm_intended:
-                return msg
-
-    return unassigned_after[0]
+    return None
 
 
 def reconcile_replies(
@@ -967,9 +961,10 @@ def reconcile_replies(
     sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Reconcile late-landed replies into the replies ledger for recent DONE/FAILED events
-    whose error_message mentions 'reply' or 'ambiguous' and that have no replies table entry,
-    and clear residual error_message on DONE events whose thread scan completes (recording any
-    unrecorded Yama reply found, and separating cleared events into with_reply / without_reply)."""
+    whose error_message mentions 'reply' or 'ambiguous' (or pre_post_check_unverifiable) and that
+    have no replies table entry, recording only unassigned Yama replies whose normalized text
+    matches intended_text, and clear residual error_message on DONE events whose thread scan
+    completes (separating cleared events into with_reply / without_reply)."""
     if days < 0:
         raise ValueError(f"days must be non-negative, got {days}")
     db_path = Path(db_path)
