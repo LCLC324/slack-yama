@@ -1099,6 +1099,9 @@ def test_reply_idempotency() -> str:
         assert out2["thread_ts"] == "1794472708.249819"
 
         # 3) Legacy call WITHOUT --event-id -> backward compatible, posts normally every time
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         stdout3 = io.StringIO()
         stderr3 = io.StringIO()
         with patch.object(agent_tools, "get_web_client", return_value=MockReplyClient()), redirect_stdout(
@@ -1289,6 +1292,9 @@ def test_reply_lost_response_recovery() -> str:
         assert out2["deduplicated"] is True and out2["ts"] == landed_ts
 
         # Verify unrecoverable case: all 3 recovery attempts fail -> error="ambiguous_post_outcome" and exit 1
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         unrec_sleeps: List[float] = []
         unrec_history_attempts = {"count": 0}
         unrec_posted = {"value": False}
@@ -1732,6 +1738,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
         assert rec1 is not None and rec1["reply_ts"] == old_reply_ts
 
         # Case 2: Multi-page thread (2 pages) where identical message is on page 2 (pre-post check)
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         page_calls: List[Dict[str, Any]] = []
         page_posts: List[Dict[str, Any]] = []
 
@@ -1826,6 +1835,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
         assert rec2 is not None and rec2["reply_ts"] == page2_reply_ts
 
         # Case 3: Lost response recovery (_find_own_recent_message) also scans across pages (page 2)
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         rec_landed = {"value": False}
         rec_posts: List[Dict[str, Any]] = []
         rec_landed_ts = f"{base_now - 2.0:.6f}"
@@ -1899,6 +1911,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
         assert out3["ts"] == rec_landed_ts
 
         # Case 4: Page cap at 20 pages -> stops after 20 calls, logs warning to stderr, and posts normally
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         cap_calls: List[Dict[str, Any]] = []
         cap_posts: List[Dict[str, Any]] = []
 
@@ -5723,6 +5738,9 @@ def test_ambiguous_saves_intended_text() -> str:
         assert row_success is not None and row_success["intended_text"] is None and row_success["attempt_ts"] is None
 
         # 4) SlackApiError failure -> intended_text and attempt_ts remain None
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         class ApiFailClient:
             def auth_test(self) -> Dict[str, Any]:
                 return {"ok": True, "user_id": bot_uid}
@@ -6337,6 +6355,9 @@ def test_windowed_thread_ignores_past_event_template() -> str:
         assert out2["ok"] is True and out2["result"] == "posted" and out2["deduplicated"] is False
 
         # 3) Manual post WITHOUT event_id -> still scans full thread (oldest=thread_ts) and detects past_yama_ts
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         seen_oldest.clear()
         stdout3, stderr3 = io.StringIO(), io.StringIO()
         with patch.object(agent_tools, "get_web_client", return_value=PastTemplateThreadClient()), redirect_stdout(
@@ -6988,6 +7009,9 @@ def test_recovery_and_reconcile_by_metadata_match() -> str:
         assert rec1 is not None and rec1["reply_ts"] == landed_meta_ts
 
         # (2) Manual post (no event_id) lost response recovery via request_id in metadata
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
         manual_landed = {"value": False, "request_id": ""}
         manual_landed_ts = f"{base_now + 3.0:.6f}"
 
@@ -7527,6 +7551,238 @@ def test_legacy_post_without_metadata_text_fallback() -> str:
         return "metadataなしの旧投稿は従来どおり文面一致(第2優先)で回収でき、別event_idのmetadataを持つ同一文面は誤回収しないことを確認"
 
 
+def test_pre_post_thread_ledger_parroting_prevention() -> str:
+    """50. 投稿前チェックの台帳（replies）照合による同一スレッド内 parroting 防止:
+    (1) 同一スレッドで台帳の過去投稿と文面一致 → 送らない（deduplicated=True・台帳記録）、
+    (2) 別スレッドで台帳の過去投稿と文面一致 → 通常どおり送る、
+    (3) 正規化の差異だけの一致（前後空白・\\r\\n→\\n・&amp;/&lt;/&gt;デコード） → 送らない、
+    (4) 台帳に文面が記録されていない（NULL/空白のみ）過去投稿 → 照合対象外として通常どおり送る、
+    (5) チャンネル直投稿（thread_tsなし）は対象外として送ることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+
+        thread_same = "1799000000.000100"
+        thread_other = "1799100000.000100"
+        thread_norm = "1799200000.000100"
+        thread_no_text = "1799300000.000100"
+
+        past_same_reply_ts = "1799000010.000100"
+        past_norm_reply_ts = "1799200020.000200"
+        past_null_reply_ts = "1799300010.000100"
+        past_blank_reply_ts = "1799300020.000200"
+
+        same_text = "了解しました。担当にてログを確認します。"
+        norm_ledger_text = "  条件チェック: A &amp; B &lt; C &gt; D\r\n2行目の確認結果です。  \r\n"
+        norm_input_text = "条件チェック: A & B < C > D\n2行目の確認結果です。"
+        no_text_input = "台帳に文面が未記録のスレッドへの新規返信です。"
+
+        # Record past replies in the ledger (outside the 60s Slack window of new events)
+        agent_tools.record_reply(
+            event_id="Ev50_PAST_SAME_1",
+            channel_id=channel_id,
+            thread_ts=thread_same,
+            reply_ts=past_same_reply_ts,
+            text=same_text,
+            db_path=db_path,
+        )
+        agent_tools.record_reply(
+            event_id="Ev50_PAST_NORM_1",
+            channel_id=channel_id,
+            thread_ts=thread_norm,
+            reply_ts=past_norm_reply_ts,
+            text=norm_ledger_text,
+            db_path=db_path,
+        )
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO replies (event_id, channel_id, thread_ts, reply_ts, text_hash, text)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("Ev50_PAST_NULL_TEXT", channel_id, thread_no_text, past_null_reply_ts, "hash_null", None),
+                    ("Ev50_PAST_BLANK_TEXT", channel_id, thread_no_text, past_blank_reply_ts, "hash_blank", "   \r\n  "),
+                    ("Ev50_PAST_CHANNEL_DIRECT", channel_id, None, "1799000005.000100", "hash_ch", same_text),
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("Ev50_NEW_SAME", channel_id, "U_ASKER", "再確認です", "1799003600.000100", thread_same, "PROCESSING"),
+                    ("Ev50_NEW_OTHER", channel_id, "U_ASKER", "別スレッド質問", "1799103600.000100", thread_other, "PROCESSING"),
+                    ("Ev50_NEW_NORM", channel_id, "U_ASKER", "条件の再確認", "1799203600.000100", thread_norm, "PROCESSING"),
+                    ("Ev50_NEW_NOTEXT", channel_id, "U_ASKER", "文面なし台帳スレッド", "1799303600.000100", thread_no_text, "PROCESSING"),
+                ],
+            )
+            conn.commit()
+
+        post_calls: List[Dict[str, Any]] = []
+
+        class LedgerParrotTestClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                # 60s window in Slack contains no past Yama reply
+                return {
+                    "ok": True,
+                    "messages": [
+                        {"user": "U_ASKER", "text": "trigger message", "ts": kwargs.get("oldest") or kwargs.get("ts")}
+                    ],
+                    "has_more": False,
+                }
+
+            def conversations_history(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "messages": [], "has_more": False}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                post_calls.append(kwargs)
+                posted_ts = f"179990000{len(post_calls)}.000100"
+                return {
+                    "ok": True,
+                    "channel": kwargs["channel"],
+                    "ts": posted_ts,
+                    "message": {"text": kwargs["text"], "ts": posted_ts},
+                }
+
+        client = LedgerParrotTestClient()
+
+        # (1) Same thread + matching text in ledger -> do NOT send (parroting prevented)
+        file_same = Path(tmp) / "reply_same.txt"
+        file_same.write_text(same_text + "\n", encoding="utf-8")
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(file_same),
+                    "--thread-ts", thread_same,
+                    "--event-id", "Ev50_NEW_SAME",
+                ]
+            )
+        assert rc1 == 0, f"Expected rc=0, got {rc1}, stderr={stderr1.getvalue()}"
+        assert len(post_calls) == 0, f"Same-thread parroting must NOT post, got {len(post_calls)} posts"
+        out1 = json.loads(stdout1.getvalue())
+        assert out1["ok"] is True
+        assert out1["deduplicated"] is True
+        assert out1["ts"] == past_same_reply_ts
+        assert out1["thread_ts"] == thread_same
+        assert out1["event_id"] == "Ev50_NEW_SAME"
+        rec_same = get_recorded_reply("Ev50_NEW_SAME", db_path=db_path)
+        assert rec_same is not None and rec_same["reply_ts"] == past_same_reply_ts
+
+        # (2) Different thread + matching text in ledger -> send normally
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout2
+        ), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(file_same),
+                    "--thread-ts", thread_other,
+                    "--event-id", "Ev50_NEW_OTHER",
+                ]
+            )
+        assert rc2 == 0, f"Expected rc=0, got {rc2}, stderr={stderr2.getvalue()}"
+        assert len(post_calls) == 1, f"Different thread with same text must post normally, got {len(post_calls)}"
+        out2 = json.loads(stdout2.getvalue())
+        assert out2["ok"] is True
+        assert out2["result"] == "posted"
+        assert out2["deduplicated"] is False
+        assert out2["ts"] == "1799900001.000100"
+
+        # (3) Same thread + normalization differences only (whitespace, \r\n->\n, &amp;/&lt;/&gt;) -> do NOT send
+        file_norm = Path(tmp) / "reply_norm.txt"
+        file_norm.write_text(norm_input_text, encoding="utf-8")
+        stdout3, stderr3 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout3
+        ), redirect_stderr(stderr3):
+            rc3 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(file_norm),
+                    "--thread-ts", thread_norm,
+                    "--event-id", "Ev50_NEW_NORM",
+                ]
+            )
+        assert rc3 == 0, f"Expected rc=0, got {rc3}, stderr={stderr3.getvalue()}"
+        assert len(post_calls) == 1, "Normalized text match in same thread must NOT post"
+        out3 = json.loads(stdout3.getvalue())
+        assert out3["ok"] is True
+        assert out3["deduplicated"] is True
+        assert out3["ts"] == past_norm_reply_ts
+        assert out3["thread_ts"] == thread_norm
+        assert out3["event_id"] == "Ev50_NEW_NORM"
+        rec_norm = get_recorded_reply("Ev50_NEW_NORM", db_path=db_path)
+        assert rec_norm is not None and rec_norm["reply_ts"] == past_norm_reply_ts
+
+        # (4) Same thread + past ledger rows have no recorded text (NULL / whitespace-only) -> send normally
+        file_no_text = Path(tmp) / "reply_no_text.txt"
+        file_no_text.write_text(no_text_input + "\n", encoding="utf-8")
+        stdout4, stderr4 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout4
+        ), redirect_stderr(stderr4):
+            rc4 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(file_no_text),
+                    "--thread-ts", thread_no_text,
+                    "--event-id", "Ev50_NEW_NOTEXT",
+                ]
+            )
+        assert rc4 == 0, f"Expected rc=0, got {rc4}, stderr={stderr4.getvalue()}"
+        assert len(post_calls) == 2, "Unrecorded text (NULL/blank) in ledger must NOT suppress posting"
+        out4 = json.loads(stdout4.getvalue())
+        assert out4["ok"] is True
+        assert out4["result"] == "posted"
+        assert out4["deduplicated"] is False
+        assert out4["ts"] == "1799900002.000100"
+
+        # (5) Channel direct post (no --thread-ts) is out of scope for ledger check -> send normally
+        stdout5, stderr5 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=client), redirect_stdout(
+            stdout5
+        ), redirect_stderr(stderr5):
+            rc5 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(file_same),
+                    "--event-id", "Ev50_NEW_CHANNEL_DIRECT",
+                ]
+            )
+        assert rc5 == 0, f"Expected rc=0, got {rc5}, stderr={stderr5.getvalue()}"
+        assert len(post_calls) == 3, "Channel direct post must not be suppressed by thread ledger check"
+        out5 = json.loads(stdout5.getvalue())
+        assert out5["ok"] is True
+        assert out5["result"] == "posted"
+        assert out5["deduplicated"] is False
+
+        return "同一スレッド一致は送信抑止(deduplicated=True)・別スレッド一致は送信・正規化差異(空白/CRLF/HTMLエスケープ)のみの一致は送信抑止・台帳文面なし(NULL/空白)およびチャンネル直投稿は送信されることを確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -7578,6 +7834,7 @@ def main() -> int:
         ("47. メタデータ一致での着地回収＆優先順位1位 (文面整形変化時の回復・reconcile・文面一致より優先)", test_recovery_and_reconcile_by_metadata_match),
         ("48. 試行時刻の窓(前3分〜後5分)による回収範囲制御 (窓外の同一metadata除外・窓境界内回収)", test_recovery_and_reconcile_attempt_window_boundaries),
         ("49. 旧投稿(metadataなし)の文面一致回収維持＆別イベントmetadata衝突防止", test_legacy_post_without_metadata_text_fallback),
+        ("50. 投稿前チェックの台帳照合によるparroting防止 (同一スレッド一致抑止・別スレッド送信・正規化一致抑止・文面なし送信)", test_pre_post_thread_ledger_parroting_prevention),
     ]
 
     print("=" * 72)

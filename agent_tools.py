@@ -685,6 +685,46 @@ def get_recorded_reply(
         return dict(row) if row else None
 
 
+def _find_own_ledger_reply(
+    channel: str,
+    text: str,
+    thread_ts: Optional[str],
+    db_path: Path = DEFAULT_DB_PATH,
+) -> Optional[str]:
+    """Look up Yama's past reply in the same thread (thread_ts) from the local replies ledger
+    using normalized exact text match (_normalize_reconcile_text).
+    Channel direct posts (thread_ts is None/empty) and rows without recorded text are excluded."""
+    if not thread_ts or not str(thread_ts).strip():
+        return None
+    norm_target = _normalize_reconcile_text(text)
+    if not norm_target:
+        return None
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return None
+    _ensure_replies_table(db_path)
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT reply_ts, text
+            FROM replies
+            WHERE channel_id = ? AND thread_ts = ? AND text IS NOT NULL
+            ORDER BY CAST(reply_ts AS REAL) ASC, created_at ASC, rowid ASC
+            """,
+            (channel, str(thread_ts)),
+        ).fetchall()
+    for row in rows:
+        raw_row_text = row["text"]
+        if raw_row_text is None:
+            continue
+        norm_row_text = _normalize_reconcile_text(raw_row_text)
+        if not norm_row_text:
+            continue
+        if norm_row_text == norm_target:
+            return str(row["reply_ts"])
+    return None
+
+
 def record_reply(
     event_id: str,
     channel_id: str,
@@ -1907,6 +1947,37 @@ def cmd_reply(args: argparse.Namespace) -> int:
                 "delayed_retry": is_delayed_retry,
                 "retry_mark_added": False,
             }
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+            return 0
+
+    if args.thread_ts:
+        ledger_ts = _find_own_ledger_reply(
+            channel=args.channel,
+            text=post_text,
+            thread_ts=args.thread_ts,
+            db_path=db_path,
+        )
+        if ledger_ts:
+            if event_id:
+                record_reply(
+                    event_id=event_id,
+                    channel_id=args.channel,
+                    thread_ts=args.thread_ts,
+                    reply_ts=ledger_ts,
+                    text=post_text,
+                    db_path=db_path,
+                )
+            output = {
+                "ok": True,
+                "channel": args.channel,
+                "ts": ledger_ts,
+                "thread_ts": args.thread_ts,
+                "deduplicated": True,
+                "delayed_retry": is_delayed_retry,
+                "retry_mark_added": False,
+            }
+            if event_id:
+                output["event_id"] = event_id
             print(json.dumps(output, ensure_ascii=False, indent=2))
             return 0
 
