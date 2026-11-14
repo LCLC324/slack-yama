@@ -96,7 +96,11 @@ fi
 if (( now_epoch - last_reconcile >= 3600 )); then
   mkdir -p "$PROJECT_DIR/state" 2>/dev/null || true
   echo "$now_epoch" > "$RECONCILE_LAST_RUN_FILE" 2>/dev/null || true
-  "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" reconcile-replies --days 7 >/dev/null 2>&1 || true
+  {
+    echo "[$(date -Iseconds)] START reconcile-replies --days 7" >> "$PROJECT_DIR/state/reconcile_history.log"
+    "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" reconcile-replies --days 7 > "$PROJECT_DIR/state/reconcile_last_output.log" 2>&1
+    echo "[$(date -Iseconds)] END reconcile-replies (exit: $?)" >> "$PROJECT_DIR/state/reconcile_history.log"
+  } || true
 fi
 
 # Keep the listener's proxy credentials fresh: the egress proxy credentials
