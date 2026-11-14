@@ -69,6 +69,10 @@ HISTORY_RETRY_BACKOFFS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
 CHANNEL_HISTORY_BOUND_LIMIT: int = 50
 THREAD_REPLIES_PAGE_LIMIT: int = 50
 THREAD_REPLIES_MAX_PAGES: int = 20
+# Delayed-retry answered check: read at most one page of this many replies from the
+# scan start (event ts - 60s). If no qualifying answer is in that page and more
+# replies remain, the check is incomplete and the resend is refused (fail-closed).
+ANSWERED_CHECK_PAGE_LIMIT: int = 100
 THREAD_SCAN_MARGIN_SECONDS: int = 60
 RECOVERY_WINDOW_BEFORE_SECONDS: float = 180.0
 RECOVERY_WINDOW_AFTER_SECONDS: float = 300.0
@@ -1772,6 +1776,9 @@ def _pre_post_check_thread_for_reply(
     to check:
       1. Whether Yama's own identical message (matching metadata event_id, raw_text, or post_text) already exists
       2. If is_delayed_retry is True, whether a qualifying answer from another human user exists
+    For delayed retries the scan is capped at a single page of ANSWERED_CHECK_PAGE_LIMIT
+    replies; if more replies remain beyond that page and no qualifying answer was found,
+    RuntimeError is raised so the caller fails closed (pre_post_check_unverifiable).
     Returns (existing_own_ts, answered_msg)."""
     active_client = client if client is not None else get_web_client()
     if not hasattr(active_client, "conversations_replies"):
@@ -1794,13 +1801,17 @@ def _pre_post_check_thread_for_reply(
 
     thread_messages: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
+    single_page_cap = is_delayed_retry
+    page_limit = ANSWERED_CHECK_PAGE_LIMIT if single_page_cap else THREAD_REPLIES_PAGE_LIMIT
+    max_pages = 1 if single_page_cap else THREAD_REPLIES_MAX_PAGES
+    scan_truncated = False
 
-    for page in range(1, THREAD_REPLIES_MAX_PAGES + 1):
+    for page in range(1, max_pages + 1):
         replies_kwargs: Dict[str, Any] = {
             "channel": channel,
             "ts": thread_ts,
             "oldest": scan_oldest,
-            "limit": THREAD_REPLIES_PAGE_LIMIT,
+            "limit": page_limit,
             "include_all_metadata": True,
         }
         if cursor:
@@ -1859,7 +1870,10 @@ def _pre_post_check_thread_for_reply(
         has_more = resp.get("has_more")
         if not next_cursor or has_more is False:
             break
-        if page >= THREAD_REPLIES_MAX_PAGES:
+        if single_page_cap:
+            scan_truncated = True
+            break
+        if page >= max_pages:
             print(
                 json.dumps(
                     {
@@ -1897,7 +1911,15 @@ def _pre_post_check_thread_for_reply(
         bot_ts_set=bot_ts_set,
         min_text_length=ANSWERED_MIN_TEXT_LENGTH,
     )
-    return None, answered_msg
+    if answered_msg is not None:
+        return None, answered_msg
+    if scan_truncated:
+        raise RuntimeError(
+            "answered_check_incomplete: more replies exist beyond the first "
+            f"{ANSWERED_CHECK_PAGE_LIMIT} after the scan start and no qualifying "
+            "answer was found in the checked range; refusing the delayed resend (fail-closed)"
+        )
+    return None, None
 
 
 def cmd_reply(args: argparse.Namespace) -> int:

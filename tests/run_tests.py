@@ -7783,6 +7783,123 @@ def test_pre_post_thread_ledger_parroting_prevention() -> str:
         return "同一スレッド一致は送信抑止(deduplicated=True)・別スレッド一致は送信・正規化差異(空白/CRLF/HTMLエスケープ)のみの一致は送信抑止・台帳文面なし(NULL/空白)およびチャンネル直投稿は送信されることを確認"
 
 
+def test_delayed_retry_answered_check_single_page_cap() -> str:
+    """51. 遅延再送の答え済み確認1ページ上限: 起点(event_ts-60s)から最大100件を1ページだけ読み、(A)ページ内に条件を満たす回答があれば後続があっても skipped_answered、(B)回答がなく後続もなければ送信、(C)回答がなく後続がある場合は確認未完として pre_post_check_unverifiable で送信しない(fail-closed)。いずれも conversations_replies の読み取りは1回だけ"""
+    bot_uid = "U_YAMA_BOT"
+    channel_id = "C_ALL"
+    thread_ts = "1795200000.000100"
+    questioner_uid = "U_QUESTIONER"
+    answerer_uid = "U_OTHER_HUMAN"
+    answer_ts = "1795200045.000200"
+    answer_text = "そのエラーは config/.env の権限設定を確認すると直りますよ。"
+    filler_ts = "1795200030.000150"
+
+    def run_case(messages: List[Dict[str, Any]], has_more: bool, next_cursor: Any) -> Any:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "slack_events.db"
+            init_db(db_path)
+            ev_id = "Ev_DELAYED_PAGECAP_1"
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO events (
+                        event_id, channel_id, user_id, text, ts, thread_ts,
+                        status, retry_count, error_message, next_retry_at, first_unverifiable_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ev_id,
+                        channel_id,
+                        questioner_uid,
+                        "エラーの原因が分かりません",
+                        thread_ts,
+                        None,
+                        "PROCESSING",
+                        0,
+                        "pre_post_check_unverifiable",
+                        None,
+                        "2026-11-14 09:00:00",
+                    ),
+                )
+                conn.commit()
+            text_file = Path(tmp) / "reply.txt"
+            text_file.write_text("Yamaからの遅延回答です。\n", encoding="utf-8")
+            reply_calls: List[Dict[str, Any]] = []
+            post_calls: List[Dict[str, Any]] = []
+
+            class PagedClient:
+                def auth_test(self) -> Dict[str, Any]:
+                    return {"ok": True, "user_id": bot_uid}
+
+                def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                    reply_calls.append(kwargs)
+                    resp: Dict[str, Any] = {
+                        "ok": True,
+                        "messages": messages,
+                        "has_more": has_more,
+                    }
+                    if next_cursor:
+                        resp["response_metadata"] = {"next_cursor": next_cursor}
+                    return resp
+
+                def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                    post_calls.append(kwargs)
+                    return {"ok": True, "channel": channel_id, "ts": "1795203600.000300"}
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch.object(
+                agent_tools, "get_web_client", return_value=PagedClient()
+            ), redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                rc = agent_tools.main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "reply",
+                        "--channel",
+                        channel_id,
+                        "--text-file",
+                        str(text_file),
+                        "--thread-ts",
+                        thread_ts,
+                        "--event-id",
+                        ev_id,
+                    ]
+                )
+            return rc, stdout_buf.getvalue(), stderr_buf.getvalue(), reply_calls, post_calls
+
+    parent_msg = {"user": questioner_uid, "text": "エラーの原因が分かりません", "ts": thread_ts}
+    answer_msg = {"user": answerer_uid, "text": answer_text, "ts": answer_ts, "thread_ts": thread_ts}
+    filler_msg = {"user": answerer_uid, "text": "あ", "ts": filler_ts, "thread_ts": thread_ts}
+
+    # (A) Answer inside the single page, more replies remain -> skipped_answered, exactly one read with limit=100
+    rc_a, out_a, err_a, calls_a, posts_a = run_case([parent_msg, answer_msg], True, "cursor-2")
+    assert rc_a == 0, f"A: expected rc=0, got {rc_a}, stderr={err_a}"
+    assert len(posts_a) == 0, "A: must not post when answered"
+    assert len(calls_a) == 1 and calls_a[0].get("limit") == 100, f"A: expected exactly one read with limit=100, got {calls_a}"
+    out_a_json = json.loads(out_a)
+    assert out_a_json["result"] == "skipped_answered", f"A: unexpected output {out_a_json}"
+
+    # (B) No qualifying answer and no more replies -> resend proceeds
+    rc_b, out_b, err_b, calls_b, posts_b = run_case([parent_msg, filler_msg], False, None)
+    assert rc_b == 0, f"B: expected rc=0, got {rc_b}, stderr={err_b}"
+    assert len(posts_b) == 1, "B: resend must be posted when not answered and scan complete"
+    assert calls_b[0].get("limit") == 100, f"B: expected limit=100, got {calls_b[0]}"
+    out_b_json = json.loads(out_b)
+    assert out_b_json["ok"] is True and out_b_json["result"] == "posted", f"B: unexpected output {out_b_json}"
+
+    # (C) No qualifying answer but more replies remain -> fail-closed unverifiable, no post, exactly one read
+    rc_c, out_c, err_c, calls_c, posts_c = run_case([parent_msg, filler_msg], True, "cursor-2")
+    assert rc_c == 1, f"C: expected rc=1, got {rc_c}, stdout={out_c}"
+    assert len(posts_c) == 0, "C: must not post when the answered check is incomplete"
+    assert len(calls_c) == 1 and calls_c[0].get("limit") == 100, f"C: expected exactly one read with limit=100, got {calls_c}"
+    err_c_json = json.loads(err_c)
+    assert err_c_json["error"] == "pre_post_check_unverifiable", f"C: unexpected error {err_c_json}"
+    assert "answered_check_incomplete" in str(err_c_json.get("check_error") or ""), f"C: check_error must name the incomplete answered check: {err_c_json}"
+
+    return "遅延再送の答え済み確認は起点から1ページ(最大100件)のみ読み、ページ内回答で抑止・後続なしで送信・後続あり未完はfail-closed(pre_post_check_unverifiable)になることを確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -7835,6 +7952,7 @@ def main() -> int:
         ("48. 試行時刻の窓(前3分〜後5分)による回収範囲制御 (窓外の同一metadata除外・窓境界内回収)", test_recovery_and_reconcile_attempt_window_boundaries),
         ("49. 旧投稿(metadataなし)の文面一致回収維持＆別イベントmetadata衝突防止", test_legacy_post_without_metadata_text_fallback),
         ("50. 投稿前チェックの台帳照合によるparroting防止 (同一スレッド一致抑止・別スレッド送信・正規化一致抑止・文面なし送信)", test_pre_post_thread_ledger_parroting_prevention),
+        ("51. 遅延再送の答え済み確認1ページ上限＆fail-closed (ページ内回答で抑止・後続なしで送信・後続ありは未完として送信せず)", test_delayed_retry_answered_check_single_page_cap),
     ]
 
     print("=" * 72)
