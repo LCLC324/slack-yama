@@ -6050,6 +6050,590 @@ def test_reconcile_no_intended_text_never_estimated() -> str:
         return "intended_textなし(NULL/空白のみ)のイベントは未割当Yama投稿が後にあっても推定記録せず(not_found/without_reply)、台帳記録済みDONEイベントのts完全一致確認(with_reply)は維持されることを確認"
 
 
+def test_windowed_thread_dedup_after_event_ts() -> str:
+    """41. 対象イベント以降のスレッド読み取り（重複検出・reconcile起点）: イベント ts より後にある自分の同一文面を oldest=event_ts-60s で検出してスキップし、reconcile も同じ oldest 起点を渡すことを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1797000000.000100"
+        event_ts = "1797005000.000200"
+        expected_oldest = f"{float(event_ts) - 60.0:.6f}"  # 1797004940.000200
+        own_after_ts = "1797005015.000300"
+        reply_text = "対象イベントの後に着地済みのYama返信です。"
+
+        ev_normal = "Ev_WIN_AFTER_NORMAL"
+        ev_delayed = "Ev_WIN_AFTER_DELAYED"
+        ev_reconcile = "Ev_WIN_AFTER_RECONCILE"
+        reconcile_event_ts = "1797008000.000500"
+        expected_reconcile_oldest = f"{float(reconcile_event_ts) - 60.0:.6f}"
+        reconcile_reply_ts = "1797008020.000600"
+        reconcile_text = "reconcile対象のYama返信です。"
+        now_dt = datetime.now(timezone.utc)
+        recent_str = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, error_message, first_unverifiable_at, intended_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_normal, channel_id, "U_ASKER", "質問1", event_ts, thread_ts, "PROCESSING", None, None, None, recent_str, recent_str),
+                    (ev_delayed, channel_id, "U_ASKER", "質問2", event_ts, thread_ts, "PROCESSING", "pre_post_check_unverifiable", "2026-11-13 23:00:00", None, recent_str, recent_str),
+                    (ev_reconcile, channel_id, "U_ASKER", "質問3", reconcile_event_ts, thread_ts, "FAILED", "ambiguous_post_outcome", None, reconcile_text, recent_str, recent_str),
+                ],
+            )
+            conn.commit()
+
+        text_file = Path(tmp) / "reply_win_after.txt"
+        text_file.write_text(reply_text + "\n", encoding="utf-8")
+
+        seen_oldest: List[Optional[str]] = []
+
+        class WindowAfterClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                seen_oldest.append(kwargs.get("oldest"))
+                if kwargs.get("oldest") == expected_reconcile_oldest:
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {"user": "U_ASKER", "text": "親", "ts": thread_ts},
+                            {"user": bot_uid, "text": reconcile_text, "ts": reconcile_reply_ts, "thread_ts": thread_ts},
+                        ],
+                        "has_more": False,
+                    }
+                return {
+                    "ok": True,
+                    "messages": [
+                        {"user": "U_ASKER", "text": "親", "ts": thread_ts},
+                        {"user": "U_ASKER", "text": "質問", "ts": event_ts, "thread_ts": thread_ts},
+                        {"user": bot_uid, "text": reply_text, "ts": own_after_ts, "thread_ts": thread_ts},
+                    ],
+                    "has_more": False,
+                }
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                raise AssertionError("chat_postMessage must NOT be called when own message after event_ts is found")
+
+        # 1) Normal reply with event_id -> uses oldest = event_ts - 60, detects own message after event_ts, skips
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=WindowAfterClient()), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_normal,
+                ]
+            )
+        assert rc1 == 0, f"Expected rc=0, got {rc1}, stderr={stderr1.getvalue()}"
+        assert seen_oldest == [expected_oldest], f"Expected oldest={expected_oldest}, got {seen_oldest}"
+        out1 = json.loads(stdout1.getvalue())
+        assert out1["ok"] is True and out1["deduplicated"] is True and out1["ts"] == own_after_ts
+        assert get_recorded_reply(ev_normal, db_path=db_path) is not None
+
+        # 2) Delayed retry with event_id -> also uses oldest = event_ts - 60, detects own message after event_ts, skips
+        seen_oldest.clear()
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=WindowAfterClient()), redirect_stdout(
+            stdout2
+        ), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_delayed,
+                ]
+            )
+        assert rc2 == 0, f"Expected rc=0, got {rc2}, stderr={stderr2.getvalue()}"
+        assert seen_oldest == [expected_oldest], f"Expected oldest={expected_oldest} on delayed retry, got {seen_oldest}"
+        out2 = json.loads(stdout2.getvalue())
+        assert out2["ok"] is True and out2["deduplicated"] is True and out2["ts"] == own_after_ts
+
+        # 3) reconcile_replies -> also scans from oldest = cand_ts - 60
+        seen_oldest.clear()
+        res_rec = agent_tools.reconcile_replies(
+            days=7,
+            dry_run=False,
+            db_path=db_path,
+            client=WindowAfterClient(),
+            now=now_dt,
+        )
+        assert res_rec["ok"] is True
+        assert seen_oldest == [expected_reconcile_oldest], (
+            f"Expected reconcile oldest={expected_reconcile_oldest}, got {seen_oldest}"
+        )
+        assert res_rec["recorded"] == [{"event_id": ev_reconcile, "reply_ts": reconcile_reply_ts}]
+
+        return "イベントtsより後の自Bot同一文面をoldest=event_ts-60sで検出・スキップ(通常/遅延再送)し、reconcileもoldest=event_ts-60sで走査することを確認"
+
+
+def test_windowed_thread_ignores_past_event_template() -> str:
+    """42. 過去イベントへの定型文の誤スキップ防止: イベント ts より前（60秒マージン外）にある自分の同一文面は重複とみなさず通常投稿し、event_idなし手動投稿は従来どおり全件走査を維持することを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1797100000.000100"
+        past_yama_ts = "1797100100.000200"  # Past template reply 4900s before current event
+        current_event_ts = "1797105000.000300"
+        expected_oldest = f"{float(current_event_ts) - 60.0:.6f}"  # 1797104940.000300
+        template_text = "了解しました。確認して折り返します。"
+
+        ev_normal = "Ev_PAST_TEMPLATE_NORMAL"
+        ev_delayed = "Ev_PAST_TEMPLATE_DELAYED"
+        first_unv_utc = "2026-11-13 23:00:00"  # -> 2026-11-14 08:00 JST
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, error_message, first_unverifiable_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_normal, channel_id, "U_ASKER", "新しい依頼1", current_event_ts, thread_ts, "PROCESSING", None, None),
+                    (ev_delayed, channel_id, "U_ASKER", "新しい依頼2", current_event_ts, thread_ts, "PROCESSING", "pre_post_check_unverifiable", first_unv_utc),
+                ],
+            )
+            conn.commit()
+
+        text_file = Path(tmp) / "reply_template.txt"
+        text_file.write_text(template_text + "\n", encoding="utf-8")
+
+        seen_oldest: List[Optional[str]] = []
+        post_calls: List[Dict[str, Any]] = []
+
+        class PastTemplateThreadClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                seen_oldest.append(kwargs.get("oldest"))
+                # Even if the API/mock returns the old message alongside current messages,
+                # or filters by oldest, messages before (event_ts - 60) must not be treated as duplicates
+                return {
+                    "ok": True,
+                    "messages": [
+                        {"user": "U_ASKER", "text": "スレッド親", "ts": thread_ts},
+                        {"user": bot_uid, "text": template_text, "ts": past_yama_ts, "thread_ts": thread_ts},
+                        {"user": "U_ASKER", "text": "新しい依頼", "ts": current_event_ts, "thread_ts": thread_ts},
+                    ],
+                    "has_more": False,
+                }
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                post_calls.append(kwargs)
+                posted_ts = f"1797105050.00000{len(post_calls)}"
+                return {
+                    "ok": True,
+                    "channel": kwargs["channel"],
+                    "ts": posted_ts,
+                    "message": {"text": kwargs["text"], "ts": posted_ts},
+                }
+
+        # 1) Normal reply for current_event_ts -> does NOT falsely deduplicate against past_yama_ts, posts normally
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=PastTemplateThreadClient()), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_normal,
+                ]
+            )
+        assert rc1 == 0, f"Expected rc=0, got {rc1}, stderr={stderr1.getvalue()}"
+        assert seen_oldest == [expected_oldest], f"Expected oldest={expected_oldest}, got {seen_oldest}"
+        assert len(post_calls) == 1, "Past template reply before window must NOT suppress new post"
+        out1 = json.loads(stdout1.getvalue())
+        assert out1["ok"] is True and out1["result"] == "posted" and out1["deduplicated"] is False
+
+        # 2) Delayed retry for current_event_ts -> also does NOT falsely deduplicate against past_yama_ts, posts with mark
+        seen_oldest.clear()
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=PastTemplateThreadClient()), redirect_stdout(
+            stdout2
+        ), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_delayed,
+                ]
+            )
+        assert rc2 == 0, f"Expected rc=0, got {rc2}, stderr={stderr2.getvalue()}"
+        assert seen_oldest == [expected_oldest]
+        assert len(post_calls) == 2, "Past template reply before window must NOT suppress delayed retry post"
+        out2 = json.loads(stdout2.getvalue())
+        assert out2["ok"] is True and out2["result"] == "posted" and out2["deduplicated"] is False
+
+        # 3) Manual post WITHOUT event_id -> still scans full thread (oldest=thread_ts) and detects past_yama_ts
+        seen_oldest.clear()
+        stdout3, stderr3 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=PastTemplateThreadClient()), redirect_stdout(
+            stdout3
+        ), redirect_stderr(stderr3):
+            rc3 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                ]
+            )
+        assert rc3 == 0
+        assert seen_oldest == [thread_ts], f"Manual post without event_id must scan from thread_ts, got {seen_oldest}"
+        assert len(post_calls) == 2, "Manual post should deduplicate against full thread scan"
+        out3 = json.loads(stdout3.getvalue())
+        assert out3["ok"] is True and out3["deduplicated"] is True and out3["ts"] == past_yama_ts
+
+        return "イベントtsより前(マージン外)の過去定型文では誤スキップせず正常投稿し、event_idなし手動投稿は従来どおりoldest=親ts全件走査を維持することを確認"
+
+
+def test_windowed_thread_dedup_within_margin_before_event_ts() -> str:
+    """43. 安全マージン内の重複検出: イベント ts の数秒前（60秒マージン内）にある自分の同一文面投稿も検出してスキップすることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1797200000.000100"
+        event_ts = "1797203000.000200"
+        expected_oldest = f"{float(event_ts) - 60.0:.6f}"  # 1797202940.000200
+        # 5 seconds before event_ts (well within the 60s safety margin)
+        margin_own_ts = f"{float(event_ts) - 5.0:.6f}"  # 1797202995.000200
+        reply_text = "イベントtsの5秒前（60秒マージン内）にあるYamaの投稿です。"
+
+        ev_normal = "Ev_MARGIN_NORMAL"
+        ev_delayed = "Ev_MARGIN_DELAYED"
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, error_message, first_unverifiable_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_normal, channel_id, "U_ASKER", "質問A", event_ts, thread_ts, "PROCESSING", None, None),
+                    (ev_delayed, channel_id, "U_ASKER", "質問B", event_ts, thread_ts, "PROCESSING", "pre_post_check_unverifiable", "2026-11-13 23:00:00"),
+                ],
+            )
+            conn.commit()
+
+        text_file = Path(tmp) / "reply_margin.txt"
+        text_file.write_text(reply_text + "\n", encoding="utf-8")
+
+        seen_oldest: List[Optional[str]] = []
+
+        class MarginThreadClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                seen_oldest.append(kwargs.get("oldest"))
+                return {
+                    "ok": True,
+                    "messages": [
+                        {"user": bot_uid, "text": reply_text, "ts": margin_own_ts, "thread_ts": thread_ts},
+                        {"user": "U_ASKER", "text": "質問", "ts": event_ts, "thread_ts": thread_ts},
+                    ],
+                    "has_more": False,
+                }
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                raise AssertionError("chat_postMessage must NOT be called when own post exists within 60s margin")
+
+        # 1) Normal reply -> detects own post at event_ts - 5s and skips
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=MarginThreadClient()), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_normal,
+                ]
+            )
+        assert rc1 == 0, f"Expected rc=0, got {rc1}, stderr={stderr1.getvalue()}"
+        assert seen_oldest == [expected_oldest]
+        out1 = json.loads(stdout1.getvalue())
+        assert out1["ok"] is True and out1["deduplicated"] is True and out1["ts"] == margin_own_ts
+        rec1 = get_recorded_reply(ev_normal, db_path=db_path)
+        assert rec1 is not None and rec1["reply_ts"] == margin_own_ts
+
+        # 2) Delayed retry -> also detects own post at event_ts - 5s and skips
+        seen_oldest.clear()
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=MarginThreadClient()), redirect_stdout(
+            stdout2
+        ), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_delayed,
+                ]
+            )
+        assert rc2 == 0, f"Expected rc=0, got {rc2}, stderr={stderr2.getvalue()}"
+        assert seen_oldest == [expected_oldest]
+        out2 = json.loads(stdout2.getvalue())
+        assert out2["ok"] is True and out2["deduplicated"] is True and out2["ts"] == margin_own_ts
+
+        return "イベントtsの5秒前(60秒安全マージン内)にある自Bot同一文面を通常返信・遅延再送の双方で検出しスキップ(deduplicated=true)することを確認"
+
+
+def test_windowed_thread_answered_after_event_ts() -> str:
+    """44. 絞った読み取り範囲での答え済み判定: スレッド内の対象イベント ts より後の他者投稿で答え済み判定が従来どおり働き、イベント ts より前の他者投稿では誤抑止しないことを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1797300000.000100"
+        questioner_uid = "U_QUESTIONER"
+        answerer_uid = "U_ANSWERER"
+        first_unv_utc = "2026-11-13 22:00:00"
+
+        # Case 1: Child event in a grown thread; another user answers AFTER event_ts -> skipped_answered
+        ev_answered = "Ev_WIN_ANS_AFTER"
+        event_ts_1 = "1797305000.000200"
+        expected_oldest_1 = f"{float(event_ts_1) - 60.0:.6f}"
+        answer_after_ts = "1797305030.000300"
+        answer_text = "その設定は config/mode.txt を書き換えることで反映されますよ。"
+
+        # Case 2: Child event in a grown thread; another user's long comment exists ONLY BEFORE event_ts -> posts normally
+        ev_only_before = "Ev_WIN_ANS_BEFORE_ONLY"
+        event_ts_2 = "1797309000.000200"
+        expected_oldest_2 = f"{float(event_ts_2) - 60.0:.6f}"
+        comment_before_ts = f"{float(event_ts_2) - 10.0:.6f}"  # inside 60s margin, but before event_ts_2
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, retry_count, error_message, first_unverifiable_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_answered, channel_id, questioner_uid, "スレッド内の追加質問1", event_ts_1, thread_ts, "PROCESSING", 0, "pre_post_check_unverifiable", first_unv_utc),
+                    (ev_only_before, channel_id, questioner_uid, "スレッド内の追加質問2", event_ts_2, thread_ts, "PROCESSING", 0, "pre_post_check_unverifiable", first_unv_utc),
+                ],
+            )
+            conn.commit()
+
+        text_file = Path(tmp) / "reply_win_ans.txt"
+        text_file.write_text("Yamaからの遅延回答です。\n", encoding="utf-8")
+
+        seen_oldest: List[Optional[str]] = []
+        post_calls: List[Dict[str, Any]] = []
+
+        class WindowAnsweredClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                oldest = kwargs.get("oldest")
+                seen_oldest.append(oldest)
+                if oldest == expected_oldest_1:
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {"user": questioner_uid, "text": "スレッド内の追加質問1", "ts": event_ts_1, "thread_ts": thread_ts},
+                            {"user": answerer_uid, "text": answer_text, "ts": answer_after_ts, "thread_ts": thread_ts},
+                        ],
+                        "has_more": False,
+                    }
+                if oldest == expected_oldest_2:
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {"user": answerer_uid, "text": "前の話題に対する10文字以上の他者コメントです。", "ts": comment_before_ts, "thread_ts": thread_ts},
+                            {"user": questioner_uid, "text": "スレッド内の追加質問2", "ts": event_ts_2, "thread_ts": thread_ts},
+                        ],
+                        "has_more": False,
+                    }
+                raise AssertionError(f"Unexpected oldest: {oldest}")
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                post_calls.append(kwargs)
+                return {
+                    "ok": True,
+                    "channel": kwargs["channel"],
+                    "ts": "1797309050.000900",
+                    "message": {"text": kwargs["text"], "ts": "1797309050.000900"},
+                }
+
+        # 1) Answer after event_ts_1 -> skipped_answered and DONE
+        stdout1, stderr1 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=WindowAnsweredClient()), redirect_stdout(
+            stdout1
+        ), redirect_stderr(stderr1):
+            rc1 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_answered,
+                ]
+            )
+        assert rc1 == 0, f"Expected rc=0, got {rc1}, stderr={stderr1.getvalue()}"
+        assert seen_oldest == [expected_oldest_1]
+        assert len(post_calls) == 0
+        out1 = json.loads(stdout1.getvalue())
+        assert out1["ok"] is True
+        assert out1["result"] == "skipped_answered"
+        assert out1["answered_by_ts"] == answer_after_ts
+        assert out1["answered_by_user"] == answerer_uid
+        assert out1["status"] == "DONE"
+        ev1_row = agent_tools.get_event_by_id(ev_answered, db_path=db_path)
+        assert ev1_row is not None and ev1_row["status"] == "DONE"
+
+        # 2) Other user's comment only before event_ts_2 -> NOT skipped, posts normally
+        seen_oldest.clear()
+        stdout2, stderr2 = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=WindowAnsweredClient()), redirect_stdout(
+            stdout2
+        ), redirect_stderr(stderr2):
+            rc2 = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_only_before,
+                ]
+            )
+        assert rc2 == 0, f"Expected rc=0, got {rc2}, stderr={stderr2.getvalue()}"
+        assert seen_oldest == [expected_oldest_2]
+        assert len(post_calls) == 1
+        out2 = json.loads(stdout2.getvalue())
+        assert out2["ok"] is True and out2["result"] == "posted"
+
+        return "oldest=event_ts-60sの窓読み取りでイベントtsより後の他者回答によりskipped_answered＆DONE遷移し、イベントts前の他者発言では誤抑止しないことを確認"
+
+
+def test_windowed_thread_failure_unverifiable() -> str:
+    """45. 絞った読み取り失敗時の fail-closed 維持: イベント ts 起点（oldest=event_ts-60s）の読み取りが5回リトライ後も失敗した場合は投稿せず pre_post_check_unverifiable になることを確認"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        db_path = state_dir / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1797400000.000100"
+        event_ts = "1797405000.000200"
+        expected_oldest = f"{float(event_ts) - 60.0:.6f}"
+        ev_id = "Ev_WIN_FAIL_CLOSED"
+
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ev_id, channel_id, "U_ASKER", "質問テキスト", event_ts, thread_ts, "PROCESSING"),
+            )
+            conn.commit()
+
+        text_file = Path(tmp) / "reply_win_fail.txt"
+        text_file.write_text("fail-closed検証用の返信文面です。\n", encoding="utf-8")
+
+        seen_oldest: List[Optional[str]] = []
+        sleeps: List[float] = []
+
+        class FailingWindowClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                seen_oldest.append(kwargs.get("oldest"))
+                raise http.client.IncompleteRead(b"window-read-dropped", 32)
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                raise AssertionError("chat_postMessage must NOT be called when windowed thread read fails")
+
+        stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+        with patch.object(
+            agent_tools, "get_web_client", return_value=FailingWindowClient()
+        ), patch.object(
+            agent_tools.time, "sleep", side_effect=lambda s: sleeps.append(s)
+        ), redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            rc = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_id,
+                ]
+            )
+
+        assert rc == 1, f"Expected exit code 1 on fail-closed, got {rc}"
+        assert seen_oldest == [expected_oldest] * 5, (
+            f"Expected 5 attempts with oldest={expected_oldest}, got {seen_oldest}"
+        )
+        assert sleeps == [1.0, 2.0, 4.0, 8.0]
+        assert stdout_buf.getvalue() == ""
+        err_out = json.loads(stderr_buf.getvalue())
+        assert err_out["ok"] is False
+        assert err_out["error"] == "pre_post_check_unverifiable"
+        assert err_out["event_id"] == ev_id
+        assert get_recorded_reply(ev_id, db_path=db_path) is None
+
+        return "oldest=event_ts-60sに絞ったスレッド読み取りが5回試行(1→2→4→8s)すべて失敗した場合に投稿せずpre_post_check_unverifiable(exit 1)となることを確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -6092,6 +6676,11 @@ def main() -> int:
         ("38. Ambiguous 送信文面保存 (ambiguous時のみintended_text保存・再送ヘッダー込み最終文字列・ALTER TABLE冪等移行)", test_ambiguous_saves_intended_text),
         ("39. Reconcile 文面一致＆正規化＆不一致時未記録 (遅い一致投稿の割当・エスケープ/改行/空白正規化・不一致時フォールバック廃止)", test_reconcile_intended_text_matching_and_fallback),
         ("40. Reconcile intended_textなし時の推定割当廃止 (NULL/空白時は未記録＆without_reply・記録済みts確認はwith_reply維持)", test_reconcile_no_intended_text_never_estimated),
+        ("41. 対象イベント以降のスレッド重複検出＆reconcile起点 (oldest=event_ts-60s・イベント後の同一文面スキップ)", test_windowed_thread_dedup_after_event_ts),
+        ("42. 過去イベント定型文の誤スキップ防止＆手動投稿全件走査維持 (イベント前の同一文面は非重複・event_idなしは全件走査)", test_windowed_thread_ignores_past_event_template),
+        ("43. 安全マージン内の重複検出 (イベントtsの数秒前・60秒マージン内の自Bot投稿を検出してスキップ)", test_windowed_thread_dedup_within_margin_before_event_ts),
+        ("44. 対象イベント以降の答え済み判定 (イベントtsより後の他者回答でskipped_answered・前の発言は非該当)", test_windowed_thread_answered_after_event_ts),
+        ("45. 絞ったスレッド読み取り失敗時のfail-closed維持 (oldest=event_ts-60sで5回失敗時pre_post_check_unverifiable)", test_windowed_thread_failure_unverifiable),
     ]
 
     print("=" * 72)

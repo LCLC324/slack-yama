@@ -68,6 +68,7 @@ HISTORY_RETRY_BACKOFFS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
 CHANNEL_HISTORY_BOUND_LIMIT: int = 50
 THREAD_REPLIES_PAGE_LIMIT: int = 50
 THREAD_REPLIES_MAX_PAGES: int = 20
+THREAD_SCAN_MARGIN_SECONDS: int = 60
 DEFAULT_PRUNE_DAYS: int = 90
 DEFAULT_RECONCILE_DAYS: int = 7
 YAMA_BOT_USER_ID: str = "U_YAMA_BOT"
@@ -789,15 +790,49 @@ def cmd_prune_replies(args: argparse.Namespace) -> int:
         return 1
 
 
+def _compute_thread_scan_oldest(
+    thread_ts: str,
+    event_ts: Optional[str] = None,
+    margin_seconds: float = THREAD_SCAN_MARGIN_SECONDS,
+) -> str:
+    """Compute the oldest timestamp for scanning a thread:
+    - If event_ts is provided and numeric, returns (event_ts - margin_seconds) formatted with 6 decimal places.
+    - Otherwise (e.g. manual post without an event row), falls back to thread_ts for full-thread scan."""
+    if event_ts is not None and str(event_ts).strip() != "":
+        try:
+            target_ts = float(event_ts)
+            oldest_val = max(0.0, target_ts - float(margin_seconds))
+            return f"{oldest_val:.6f}"
+        except (TypeError, ValueError):
+            pass
+    return str(thread_ts)
+
+
+def _is_ts_at_or_after(msg_ts: Any, oldest_ts: Any) -> bool:
+    """Return True if msg_ts >= oldest_ts."""
+    try:
+        return float(msg_ts) >= float(oldest_ts)
+    except (TypeError, ValueError):
+        return str(msg_ts) >= str(oldest_ts)
+
+
 def _scan_thread_yama_messages(
     channel: str,
     parent_ts: str,
     client: Any,
     bot_user_ids: Set[str],
     sleep_fn: Optional[Callable[[float], None]] = None,
+    event_ts: Optional[str] = None,
+    oldest: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Scan a thread from oldest=parent_ts across up to THREAD_REPLIES_MAX_PAGES pages
-    and return all messages posted by Yama in chronological order (oldest first)."""
+    """Scan a thread from oldest=(event_ts - 60s) (or parent_ts when event_ts is not given)
+    across up to THREAD_REPLIES_MAX_PAGES pages and return all messages posted by Yama
+    within the scan window in chronological order (oldest first)."""
+    scan_oldest = (
+        str(oldest)
+        if oldest is not None
+        else _compute_thread_scan_oldest(parent_ts, event_ts=event_ts)
+    )
     yama_messages: List[Dict[str, Any]] = []
     seen_ts: Set[str] = set()
     cursor: Optional[str] = None
@@ -806,7 +841,7 @@ def _scan_thread_yama_messages(
         replies_kwargs: Dict[str, Any] = {
             "channel": channel,
             "ts": str(parent_ts),
-            "oldest": str(parent_ts),
+            "oldest": scan_oldest,
             "limit": THREAD_REPLIES_PAGE_LIMIT,
         }
         if cursor:
@@ -835,6 +870,8 @@ def _scan_thread_yama_messages(
                 continue
             msg_ts = msg.get("ts")
             if not msg_ts:
+                continue
+            if not _is_ts_at_or_after(msg_ts, scan_oldest):
                 continue
             msg_ts_str = str(msg_ts)
             if msg_ts_str in seen_ts:
@@ -1092,6 +1129,7 @@ def reconcile_replies(
                 client=cli,
                 bot_user_ids=bot_user_ids,
                 sleep_fn=sleep_fn,
+                event_ts=cand_ts,
             )
 
             matched_msg = _select_matching_yama_message(
@@ -1150,6 +1188,7 @@ def reconcile_replies(
                 client=cli,
                 bot_user_ids=bot_user_ids,
                 sleep_fn=sleep_fn,
+                event_ts=cand_ts,
             )
 
             if event_id in existing_replies_by_event:
@@ -1456,8 +1495,11 @@ def _pre_post_check_thread_for_reply(
     max_attempts: int = HISTORY_RETRY_MAX_ATTEMPTS,
     backoffs: Tuple[float, ...] = HISTORY_RETRY_BACKOFFS,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    event_ts: Optional[str] = None,
+    oldest: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Scan a thread (using the existing full-thread pagination with per-page retry)
+    """Scan a thread (starting from event_ts - 60s when event_ts is given, or thread_ts
+    for full-thread scan, using pagination with per-page retry)
     to check:
       1. Whether Yama's own identical message (matching raw_text or post_text) already exists
       2. If is_delayed_retry is True, whether a qualifying answer from another human user exists
@@ -1475,6 +1517,11 @@ def _pre_post_check_thread_for_reply(
     )
     yama_user_ids: Set[str] = {YAMA_BOT_USER_ID, resolved_bot_uid}
     target_texts: Set[str] = {raw_text.strip(), post_text.strip()}
+    scan_oldest = (
+        str(oldest)
+        if oldest is not None
+        else _compute_thread_scan_oldest(thread_ts, event_ts=event_ts)
+    )
 
     thread_messages: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
@@ -1483,7 +1530,7 @@ def _pre_post_check_thread_for_reply(
         replies_kwargs: Dict[str, Any] = {
             "channel": channel,
             "ts": thread_ts,
-            "oldest": str(thread_ts),
+            "oldest": scan_oldest,
             "limit": THREAD_REPLIES_PAGE_LIMIT,
         }
         if cursor:
@@ -1508,11 +1555,13 @@ def _pre_post_check_thread_for_reply(
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
+            msg_ts = msg.get("ts")
+            if msg_ts and not _is_ts_at_or_after(msg_ts, scan_oldest):
+                continue
             if (
                 msg.get("user") in yama_user_ids
                 and (msg.get("text") or "").strip() in target_texts
             ):
-                msg_ts = msg.get("ts")
                 if msg_ts:
                     return str(msg_ts), None
             thread_messages.append(msg)
@@ -1551,9 +1600,14 @@ def _pre_post_check_thread_for_reply(
         questioner_uids.add(str(questioner_user_id).strip())
     bot_ts_set = _get_channel_bot_ts_set(channel, db_path=db_path)
 
+    answered_baseline_ts = (
+        str(event_ts)
+        if (event_ts is not None and str(event_ts).strip() != "")
+        else str(thread_ts)
+    )
     answered_msg = _find_answering_message_in_thread(
         messages=thread_messages,
-        parent_ts=str(thread_ts),
+        parent_ts=answered_baseline_ts,
         questioner_user_ids=questioner_uids,
         yama_user_ids=yama_user_ids,
         bot_ts_set=bot_ts_set,
@@ -1583,6 +1637,11 @@ def cmd_reply(args: argparse.Namespace) -> int:
     db_path = Path(getattr(args, "db", DEFAULT_DB_PATH))
 
     event_row = get_event_by_id(event_id, db_path=db_path) if event_id else None
+    event_ts: Optional[str] = (
+        str(event_row["ts"])
+        if (event_row is not None and event_row.get("ts") is not None)
+        else None
+    )
     first_unverifiable_at = (
         event_row.get("first_unverifiable_at") if event_row is not None else None
     )
@@ -1623,6 +1682,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
                 db_path=db_path,
                 max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
                 backoffs=HISTORY_RETRY_BACKOFFS,
+                event_ts=event_ts,
             )
         else:
             existing_ts = _find_own_recent_message(
@@ -1633,6 +1693,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
                 max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
                 backoffs=HISTORY_RETRY_BACKOFFS,
                 raise_on_error=True,
+                event_ts=event_ts,
             )
     except Exception as pre_exc:
         if args.thread_ts:
@@ -1787,6 +1848,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
                 max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
                 backoffs=HISTORY_RETRY_BACKOFFS,
                 raise_on_error=True,
+                event_ts=event_ts,
             )
         except Exception as rec_exc:
             recovered = None
@@ -1895,12 +1957,15 @@ def _lookup_own_recent_message_once(
     max_attempts: int = HISTORY_RETRY_MAX_ATTEMPTS,
     backoffs: Tuple[float, ...] = HISTORY_RETRY_BACKOFFS,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    event_ts: Optional[str] = None,
+    oldest: Optional[str] = None,
 ) -> Optional[str]:
-    """Look up our own identical message in the target thread (full thread scan
-    starting from oldest=thread_ts, oldest-first pagination up to
-    THREAD_REPLIES_MAX_PAGES pages with limit=50) or channel (latest 50 messages,
-    no time window). Applies _call_with_retry per individual API call so a transient
-    failure on page N retries only page N rather than restarting from page 1."""
+    """Look up our own identical message in the target thread (scanning from
+    oldest=(event_ts - 60s) when event_ts is given, or oldest=thread_ts for
+    full-thread scan, oldest-first pagination up to THREAD_REPLIES_MAX_PAGES
+    pages with limit=50) or channel (latest 50 messages, no time window).
+    Applies _call_with_retry per individual API call so a transient failure on
+    page N retries only page N rather than restarting from page 1."""
     active_client = client if client is not None else get_web_client()
     if thread_ts and not hasattr(active_client, "conversations_replies"):
         return None
@@ -1916,12 +1981,17 @@ def _lookup_own_recent_message_once(
     normalized_target = text.strip()
 
     if thread_ts:
+        scan_oldest = (
+            str(oldest)
+            if oldest is not None
+            else _compute_thread_scan_oldest(thread_ts, event_ts=event_ts)
+        )
         cursor: Optional[str] = None
         for page in range(1, THREAD_REPLIES_MAX_PAGES + 1):
             replies_kwargs: Dict[str, Any] = {
                 "channel": channel,
                 "ts": thread_ts,
-                "oldest": str(thread_ts),
+                "oldest": scan_oldest,
                 "limit": THREAD_REPLIES_PAGE_LIMIT,
             }
             if cursor:
@@ -1949,8 +2019,11 @@ def _lookup_own_recent_message_once(
                 if msg.get("text", "").strip() != normalized_target:
                     continue
                 msg_ts = msg.get("ts")
-                if msg_ts:
-                    return str(msg_ts)
+                if not msg_ts:
+                    continue
+                if not _is_ts_at_or_after(msg_ts, scan_oldest):
+                    continue
+                return str(msg_ts)
 
             meta = resp.get("response_metadata") or {}
             next_cursor = (
@@ -2010,10 +2083,13 @@ def _find_own_recent_message(
     backoffs: Tuple[float, ...] = HISTORY_RETRY_BACKOFFS,
     sleep_fn: Optional[Callable[[float], None]] = None,
     raise_on_error: bool = False,
+    event_ts: Optional[str] = None,
+    oldest: Optional[str] = None,
 ) -> Optional[str]:
-    """Return the ts of our own identical message in the target thread (full
-    thread scan from oldest=thread_ts, up to 20 pages) or channel (latest 50
-    messages, no time window), or None.
+    """Return the ts of our own identical message in the target thread (scanning
+    from event_ts - 60s when event_ts is given, or oldest=thread_ts for full
+    thread scan, up to 20 pages) or channel (latest 50 messages, no time window),
+    or None.
     Used to confirm whether a post whose response was lost actually landed,
     with up to max_attempts retries per API call."""
     try:
@@ -2026,6 +2102,8 @@ def _find_own_recent_message(
             max_attempts=max_attempts,
             backoffs=backoffs,
             sleep_fn=sleep_fn,
+            event_ts=event_ts,
+            oldest=oldest,
         )
     except Exception:
         if raise_on_error:
