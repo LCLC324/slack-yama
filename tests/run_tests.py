@@ -7900,6 +7900,155 @@ def test_delayed_retry_answered_check_single_page_cap() -> str:
     return "遅延再送の答え済み確認は起点から1ページ(最大100件)のみ読み、ページ内回答で抑止・後続なしで送信・後続あり未完はfail-closed(pre_post_check_unverifiable)になることを確認"
 
 
+def test_reply_post_no_retry_on_timeout_and_server_error() -> str:
+    """52. reply: chat.postMessage は再送しない。TimeoutError直撃時は1回のみPOST→回復確認の履歴読み取り→未着地ならambiguous_post_outcome＋intended_text保存、HTTP 500のSlackApiError時は1回のみPOST→回復確認に進まず即失敗"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        agent_tools.init_db(db_path)
+
+        bot_uid = "U_YAMA_BOT"
+        channel_id = "C_ALL"
+        thread_ts = "1797000000.000100"
+        base_now = 1797000190.5
+        ev_timeout = "Ev_POST_TIMEOUT_1"
+        ev_500 = "Ev_POST_HTTP500_1"
+
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO events (
+                    event_id, channel_id, user_id, text, ts, thread_ts,
+                    status, retry_count, error_message, next_retry_at, first_unverifiable_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (ev_timeout, channel_id, "U_ASKER", "Q1", "1797000001.000100", thread_ts, "PROCESSING", 0, None, None, None),
+                    (ev_500, channel_id, "U_ASKER", "Q2", "1797000002.000100", thread_ts, "PROCESSING", 0, None, None, None),
+                ],
+            )
+            conn.commit()
+
+        reply_text = "再送しない設計の確認テスト本文です。"
+        text_file = Path(tmp) / "reply_no_retry.txt"
+        text_file.write_text(reply_text + "\n", encoding="utf-8")
+
+        # --- Case A: TimeoutError hits chat_postMessage directly ---
+        a_post_calls: List[Dict[str, Any]] = []
+        a_replies_pre = {"count": 0}
+        a_replies_recovery = {"count": 0}
+        a_posted = {"value": False}
+
+        class TimeoutPostClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                a_post_calls.append(kwargs)
+                a_posted["value"] = True
+                raise TimeoutError("The read operation timed out")
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                if a_posted["value"]:
+                    a_replies_recovery["count"] += 1
+                else:
+                    a_replies_pre["count"] += 1
+                # Landing is never found: only the parent message exists
+                return {
+                    "ok": True,
+                    "messages": [{"user": "U_ASKER", "text": "parent", "ts": thread_ts}],
+                    "has_more": False,
+                }
+
+        stdout_a, stderr_a = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=TimeoutPostClient()), patch.object(
+            agent_tools.time, "time", return_value=base_now
+        ), patch.object(
+            agent_tools.time, "sleep", side_effect=lambda s: None
+        ), redirect_stdout(stdout_a), redirect_stderr(stderr_a):
+            rc_a = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_timeout,
+                ]
+            )
+
+        assert rc_a == 1, f"Case A: expected rc=1, got {rc_a}, stderr={stderr_a.getvalue()}"
+        assert len(a_post_calls) == 1, f"Case A: expected exactly 1 chat_postMessage call, got {len(a_post_calls)}"
+        assert a_replies_recovery["count"] >= 1, (
+            f"Case A: recovery history read must be attempted after TimeoutError, got {a_replies_recovery['count']}"
+        )
+        err_a = json.loads(stderr_a.getvalue())
+        assert err_a["ok"] is False
+        assert err_a["error"] == "ambiguous_post_outcome", f"Case A: expected ambiguous_post_outcome, got {err_a}"
+        row_a = agent_tools.get_event_by_id(ev_timeout, db_path=db_path)
+        assert row_a is not None
+        assert row_a["intended_text"] == reply_text, (
+            f"Case A: expected intended_text={reply_text!r}, got {row_a['intended_text']!r}"
+        )
+        assert get_recorded_reply(ev_timeout, db_path=db_path) is None
+
+        # --- Case B: HTTP 500 SlackApiError returned on chat_postMessage ---
+        b_post_calls: List[Dict[str, Any]] = []
+        b_replies_recovery = {"count": 0}
+        b_posted = {"value": False}
+
+        class ServerErrorPostClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": bot_uid}
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                b_post_calls.append(kwargs)
+                b_posted["value"] = True
+                raise SlackApiError(
+                    message="internal_error",
+                    response={"ok": False, "error": "internal_error", "status_code": 500},
+                )
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                if b_posted["value"]:
+                    b_replies_recovery["count"] += 1
+                return {
+                    "ok": True,
+                    "messages": [{"user": "U_ASKER", "text": "parent", "ts": thread_ts}],
+                    "has_more": False,
+                }
+
+        stdout_b, stderr_b = io.StringIO(), io.StringIO()
+        with patch.object(agent_tools, "get_web_client", return_value=ServerErrorPostClient()), patch.object(
+            agent_tools.time, "time", return_value=base_now
+        ), patch.object(
+            agent_tools.time, "sleep", side_effect=lambda s: None
+        ), redirect_stdout(stdout_b), redirect_stderr(stderr_b):
+            rc_b = agent_tools.main(
+                [
+                    "--db", str(db_path),
+                    "reply",
+                    "--channel", channel_id,
+                    "--text-file", str(text_file),
+                    "--thread-ts", thread_ts,
+                    "--event-id", ev_500,
+                ]
+            )
+
+        assert rc_b == 1, f"Case B: expected rc=1, got {rc_b}, stderr={stderr_b.getvalue()}"
+        assert len(b_post_calls) == 1, f"Case B: expected exactly 1 chat_postMessage call, got {len(b_post_calls)}"
+        assert b_replies_recovery["count"] == 0, (
+            f"Case B: SlackApiError must fail immediately without recovery history read, got {b_replies_recovery['count']}"
+        )
+        err_b = json.loads(stderr_b.getvalue())
+        assert err_b["ok"] is False
+        assert err_b["error"] == "internal_error", f"Case B: expected error=internal_error, got {err_b}"
+        row_b = agent_tools.get_event_by_id(ev_500, db_path=db_path)
+        assert row_b is not None and row_b["intended_text"] is None
+
+        return "TimeoutError直撃時はPOST1回のみ・回復確認履歴読み取り実施・未着地でambiguous_post_outcome＋intended_text保存、HTTP 500 SlackApiError時はPOST1回のみ・回復確認なしで即失敗(error=internal_error)を確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -7953,6 +8102,7 @@ def main() -> int:
         ("49. 旧投稿(metadataなし)の文面一致回収維持＆別イベントmetadata衝突防止", test_legacy_post_without_metadata_text_fallback),
         ("50. 投稿前チェックの台帳照合によるparroting防止 (同一スレッド一致抑止・別スレッド送信・正規化一致抑止・文面なし送信)", test_pre_post_thread_ledger_parroting_prevention),
         ("51. 遅延再送の答え済み確認1ページ上限＆fail-closed (ページ内回答で抑止・後続なしで送信・後続ありは未完として送信せず)", test_delayed_retry_answered_check_single_page_cap),
+        ("52. 送信の再送なし確認 (TimeoutError直撃でPOST1回・回復確認→ambiguous_post_outcome＋intended_text保存／HTTP 500 SlackApiErrorでPOST1回・回復確認なし即失敗)", test_reply_post_no_retry_on_timeout_and_server_error),
     ]
 
     print("=" * 72)
