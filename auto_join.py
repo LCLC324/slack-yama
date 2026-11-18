@@ -69,29 +69,110 @@ def empty_state() -> Dict[str, List[str]]:
     return {"known_member": [], "opted_out": []}
 
 
-def load_state(state_path: Path = DEFAULT_STATE_PATH) -> Dict[str, List[str]]:
-    state_path = Path(state_path)
-    if not state_path.exists():
-        return empty_state()
-    with state_path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
+class StateLoadError(RuntimeError):
+    """The state file and its .bak backup both exist but neither is readable.
+    Auto-join must stop (fail-safe) instead of starting empty, because an empty
+    start would forget opted_out and re-join channels Yama was removed from."""
+
+
+def _bak_path(state_path: Path) -> Path:
+    return state_path.with_name(state_path.name + ".bak")
+
+
+def _parse_state(raw: Any) -> Optional[Dict[str, List[str]]]:
+    """Sanity-check a parsed state payload. Valid only if it is a dict that has
+    both keys (known_member / opted_out) and both values are lists. A count
+    floor is deliberately NOT checked: opted_out legitimately returns to 0
+    when a channel is manually re-invited."""
+    if not isinstance(raw, dict):
+        return None
+    if "known_member" not in raw or "opted_out" not in raw:
+        return None
     state = empty_state()
-    if isinstance(raw, dict):
-        for key in ("known_member", "opted_out"):
-            vals = raw.get(key) or []
-            if isinstance(vals, list):
-                state[key] = sorted({str(v) for v in vals if v})
+    for key in ("known_member", "opted_out"):
+        vals = raw.get(key)
+        if not isinstance(vals, list):
+            return None
+        state[key] = sorted({str(v) for v in vals if v})
     return state
 
 
-def save_state(state: Dict[str, List[str]], state_path: Path = DEFAULT_STATE_PATH) -> None:
-    """Atomically write the state file (temp file in the same dir + os.replace)."""
+def _read_state_file(path: Path) -> Optional[Dict[str, List[str]]]:
+    """Read and sanity-check one state file. Returns None if missing/unreadable/invalid."""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return _parse_state(raw)
+
+
+def load_state_with_status(
+    state_path: Path = DEFAULT_STATE_PATH,
+) -> Tuple[Dict[str, List[str]], str]:
+    """Load state, falling back to the .bak backup. Returns (state, source) where
+    source is "main", "bak", or "empty" (neither file exists: first run).
+    Raises StateLoadError when at least one file exists but neither is readable."""
+    state_path = Path(state_path)
+    bak_path = _bak_path(state_path)
+    if state_path.exists():
+        state = _read_state_file(state_path)
+        if state is not None:
+            return state, "main"
+    if bak_path.exists():
+        state = _read_state_file(bak_path)
+        if state is not None:
+            return state, "bak"
+    if not state_path.exists() and not bak_path.exists():
+        return empty_state(), "empty"
+    raise StateLoadError(
+        f"state file and backup are both unreadable: {state_path} / {bak_path}"
+    )
+
+
+def load_state(state_path: Path = DEFAULT_STATE_PATH) -> Dict[str, List[str]]:
+    state_path = Path(state_path)
+    state, source = load_state_with_status(state_path)
+    if source == "bak":
+        # Restore immediately: write the recovered state back to the main file
+        # (without rotating, so the good .bak is not overwritten by the broken main).
+        save_state(state, state_path, _rotate=False)
+    return state
+
+
+def save_state(
+    state: Dict[str, List[str]],
+    state_path: Path = DEFAULT_STATE_PATH,
+    _rotate: bool = True,
+) -> None:
+    """Atomically write the state file (temp file in the same dir + os.replace).
+
+    Before replacing, the current main file is rotated to <name>.bak, but only
+    when the current main file still passes the sanity check. A corrupted or
+    shape-broken main file must never overwrite a good .bak."""
     state_path = Path(state_path)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "known_member": sorted(set(state.get("known_member", []))),
         "opted_out": sorted(set(state.get("opted_out", []))),
     }
+    if _rotate and state_path.exists() and _read_state_file(state_path) is not None:
+        bak_path = _bak_path(state_path)
+        fd_b, tmp_bak = tempfile.mkstemp(
+            prefix=f"{bak_path.name}.tmp.", dir=str(state_path.parent)
+        )
+        try:
+            with os.fdopen(fd_b, "wb") as out, state_path.open("rb") as src:
+                out.write(src.read())
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp_bak, bak_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_bak)
+            except OSError:
+                pass
+            raise
     fd, tmp_name = tempfile.mkstemp(
         prefix=f"{state_path.name}.tmp.", dir=str(state_path.parent)
     )
@@ -331,10 +412,25 @@ def run_auto_join(
     load_env_file(Path(env_path))
     active_client = client if client is not None else get_web_client(Path(env_path))
 
+    try:
+        loaded_state, load_source = load_state_with_status(state_path)
+    except StateLoadError as exc:
+        # Fail-safe: never start from an empty state when files exist but are
+        # unreadable; that would forget opted_out and re-join removed channels.
+        _log(f"error: {exc}; auto-join aborted")
+        summary["errors"] += 1
+        summary["state_error"] = True
+        return summary
+    if load_source == "bak":
+        if dry_run:
+            _log("dry-run: state main file unreadable; would restore from .bak backup")
+        else:
+            save_state(loaded_state, state_path, _rotate=False)
+            _log("state restored from .bak backup (main file was unreadable)")
+
     channels = list_public_channels(active_client, sleep_fn=sleep_fn)
     names = {c.get("id"): c.get("name", "") for c in channels}
 
-    loaded_state = load_state(state_path)
     state, newly_opted, cleared = update_membership_state(loaded_state, channels)
     for cid in newly_opted:
         prefix = "dry-run: would opt out" if dry_run else "opt-out added"

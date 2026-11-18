@@ -20,9 +20,11 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +33,7 @@ from zoneinfo import ZoneInfo
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from slack_sdk.web.slack_response import SlackResponse
 
 from listener import (
     DEFAULT_DB_PATH,
@@ -121,6 +124,97 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.commit()
 
 
+CURL_READ_CONNECT_TIMEOUT_SECS: int = 5
+CURL_READ_TIMEOUT_SECS: int = 15
+
+
+def _curl_api_read(token: str, method: str, params: Dict[str, Any]) -> SlackResponse:
+    """Perform one read-only Slack Web API call via a curl subprocess and return
+    the parsed response as a SlackResponse. The curl config (including the
+    Authorization header) is passed over stdin (`curl -K -`), never via argv,
+    so the token does not appear in the process list. Raises RuntimeError on
+    any curl-side failure (nonzero exit, unparsable output, or ok=false)."""
+    if not token or '"' in token or "\n" in token or "\r" in token:
+        raise RuntimeError("curl read aborted: token is not safe to pass via config")
+    form: Dict[str, str] = {}
+    for key, value in (params or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            form[key] = "true" if value else "false"
+        else:
+            form[key] = str(value)
+    config = "\n".join(
+        [
+            f'url = "https://slack.com/api/{method}"',
+            f'header = "Authorization: Bearer {token}"',
+            'header = "Content-Type: application/x-www-form-urlencoded"',
+            f'data = "{urllib.parse.urlencode(form)}"',
+            "silent",
+            "show-error",
+            f"connect-timeout = {CURL_READ_CONNECT_TIMEOUT_SECS}",
+            f"max-time = {CURL_READ_TIMEOUT_SECS}",
+            "",
+        ]
+    )
+    proc = subprocess.run(
+        ["curl", "-K", "-"],
+        input=config,
+        capture_output=True,
+        text=True,
+        timeout=CURL_READ_TIMEOUT_SECS + 10,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"curl read failed for {method}: exit={proc.returncode}")
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        raise RuntimeError(f"curl read failed for {method}: response is not JSON")
+    if not isinstance(data, dict) or not data.get("ok"):
+        err = data.get("error") if isinstance(data, dict) else "unknown"
+        raise RuntimeError(f"curl read failed for {method}: slack error={err}")
+    return SlackResponse(
+        client=None,
+        http_verb="POST",
+        api_url=f"https://slack.com/api/{method}",
+        req_args={},
+        data=data,
+        headers={},
+        status_code=200,
+    )
+
+
+class _CurlFallbackWebClient(WebClient):
+    """WebClient whose read calls (conversations_replies / conversations_history)
+    fall back to a curl subprocess read when the SDK transport fails with a
+    connection error (e.g. http.client.IncompleteRead during a bursty outage).
+    If curl also fails, the original SDK exception is re-raised, so existing
+    failure semantics (retry layers, local DB fallback, fail-closed pre-post
+    checks) are unchanged: curl only ever adds successes. POST methods such as
+    chat_postMessage are never overridden."""
+
+    def _read_with_curl_fallback(
+        self, method: str, super_fn: Callable[..., Any], kwargs: Dict[str, Any]
+    ) -> Any:
+        try:
+            return super_fn(**kwargs)
+        except TRANSIENT_CONNECTION_ERRORS as exc:
+            try:
+                return _curl_api_read(self.token, method, kwargs)
+            except Exception:
+                raise exc
+
+    def conversations_replies(self, **kwargs: Any) -> Any:  # type: ignore[override]
+        return self._read_with_curl_fallback(
+            "conversations.replies", super().conversations_replies, kwargs
+        )
+
+    def conversations_history(self, **kwargs: Any) -> Any:  # type: ignore[override]
+        return self._read_with_curl_fallback(
+            "conversations.history", super().conversations_history, kwargs
+        )
+
+
 def get_web_client(env_path: Path = DEFAULT_ENV_PATH, no_retry: bool = False) -> WebClient:
     """Load SLACK_BOT_TOKEN from config/.env (or environment) and return a Slack WebClient."""
     load_env_file(env_path)
@@ -130,8 +224,8 @@ def get_web_client(env_path: Path = DEFAULT_ENV_PATH, no_retry: bool = False) ->
     if no_retry:
         # Never auto-retry a POST whose outcome is unknown: a lost response
         # combined with an automatic retry posts the message twice.
-        return WebClient(token=bot_token, retry_handlers=[])
-    return WebClient(token=bot_token)
+        return _CurlFallbackWebClient(token=bot_token, retry_handlers=[])
+    return _CurlFallbackWebClient(token=bot_token)
 
 
 def get_processing_events(db_path: Path = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:

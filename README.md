@@ -50,7 +50,7 @@ Slackワークスペース「muse取締役会」において、新着メッセ�
 │ [Layer 4] 死活監視 (yama-listener.service & watchdog.sh)    │
 │  - systemd (Restart=always, RestartSec=10)                  │
 │  - watchdog.sh: 30秒ごとのイベントフック内で実行、           │
-│    heartbeat が3分以上停止で systemctl restart              │
+│    heartbeat が120秒以上停止で systemctl restart              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -63,7 +63,7 @@ Slackワークスペース「muse取締役会」において、新着メッセ�
 | `listener.py` | Socket Mode 常駐リスナー（ACK返却・フィルタリング・SQLite保存・Heartbeat出力） |
 | `dispatcher.sh` | フック用ディスパッチャ（`flock` 排他制御・PENDING→PROCESSING遷移・`state/payload.json` 生成） |
 | `agent_tools.py` | エージェント用CLIツール（`pending`, `history`, `reply`（送信前チェック・応答ロスト回復確認最大5回）, `record-reply`, `reconcile-replies`, `prune-replies`, `react`, `commit`, `mode`） |
-| `watchdog.sh` | 死活監視スクリプト（30秒ごとのイベントフック `~/hooks/scripts/slack-yama-dispatch.sh` 内で毎回実行。`state/heartbeat.json` が3分以上未更新なら `systemctl restart yama-listener` を実行し `state/watchdog.log` に記録） |
+| `watchdog.sh` | 死活監視スクリプト（30秒ごとのイベントフック `~/hooks/scripts/slack-yama-dispatch.sh` 内で毎回実行。`state/heartbeat.json` が120秒以上未更新なら（再起動前に5秒おいて再確認し、再起動成功後は同一heartbeatへの再起動を60秒抑止） `systemctl restart yama-listener` を実行し `state/watchdog.log` に記録） |
 | `yama-listener.service` | systemd ユニット定義ファイル（インストール・有効化はセットアップ手順参照） |
 | `config/.env.example` | Slack トークン設定ファイルのテンプレート |
 | `config/mode.txt` | 動作モード設定ファイル（初期値: `shadow`） |

@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Yama Listener Watchdog (Layer 4)
-# - Checks if state/heartbeat.json has not been updated for >= 3 minutes (180 seconds)
+# - Checks if state/heartbeat.json has not been updated for >= 120 seconds
+#   (restart threshold; the escalation/warning threshold is restart + 60s = 180s,
+#   recorded in IMPROVEMENTS.md - the warning itself is not implemented here)
+# - Before restarting, waits RECHECK_SEC and reads the heartbeat once more;
+#   if it recovered, no restart is attempted.
+# - After a successful restart, further restarts for the same unchanged
+#   heartbeat are suppressed for RESTART_COOLDOWN_SEC (60s), so a listener
+#   that is still starting up is not restart-looped by the 30s check cycle.
 # - If missing or stale, runs `systemctl restart yama-listener` and logs the result to state/watchdog.log
 # - If restart fails with "not found" (Unit yama-listener.service not found),
 #   attempts bounded unit file recovery (with pre-checks, content/hash comparison, max attempts, and exponential backoff):
@@ -13,7 +20,10 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${YAMA_STATE_DIR:-${BASE_DIR}/state}"
 HEARTBEAT_PATH="${YAMA_HEARTBEAT_PATH:-${STATE_DIR}/heartbeat.json}"
 LOG_PATH="${YAMA_WATCHDOG_LOG:-${STATE_DIR}/watchdog.log}"
-THRESHOLD_SEC="${YAMA_WATCHDOG_THRESHOLD_SEC:-180}"
+THRESHOLD_SEC="${YAMA_WATCHDOG_THRESHOLD_SEC:-120}"
+RECHECK_SEC="${YAMA_WATCHDOG_RECHECK_SEC:-5}"
+RESTART_COOLDOWN_SEC="${YAMA_WATCHDOG_RESTART_COOLDOWN_SEC:-60}"
+RESTART_STATE_PATH="${YAMA_RESTART_STATE_PATH:-${STATE_DIR}/last_restart.json}"
 PYTHON_BIN="${YAMA_PYTHON_BIN:-${BASE_DIR}/venv/bin/python}"
 RESTART_CMD="${YAMA_RESTART_CMD:-systemctl restart yama-listener}"
 
@@ -255,13 +265,68 @@ reinstall_and_restart_unit() {
     fi
 }
 
+record_restart_marker() {
+    # Remember (restart time, heartbeat ts) so the next 30s-cycle check does not
+    # restart-loop a listener that is still starting up. Only direct restart
+    # successes are recorded; the unit-reinstall path has its own backoff.
+    local hb_ts="$1"
+    if [[ -z "${hb_ts}" ]]; then
+        return 0
+    fi
+    "${PYTHON_BIN}" - "${RESTART_STATE_PATH}" "${hb_ts}" <<'PYEOF'
+import json
+import sys
+import time
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+try:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"ts": time.time(), "hb_ts": float(sys.argv[2])}
+    state_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+except Exception:
+    pass
+PYEOF
+}
+
+check_restart_cooldown() {
+    # Prints "SUPPRESS:<remaining_sec>" when the same unchanged heartbeat was
+    # already restarted within RESTART_COOLDOWN_SEC, otherwise "ALLOW".
+    "${PYTHON_BIN}" - "${RESTART_STATE_PATH}" "${RESTART_COOLDOWN_SEC}" "$1" <<'PYEOF'
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+cooldown = float(sys.argv[2])
+hb_ts = float(sys.argv[3]) if sys.argv[3] else 0.0
+try:
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    last_ts = float(data.get("ts", 0.0))
+    last_hb = float(data.get("hb_ts", 0.0))
+except Exception:
+    print("ALLOW")
+    sys.exit(0)
+
+remaining = cooldown - (time.time() - last_ts)
+if last_ts > 0 and hb_ts > 0 and last_hb == hb_ts and remaining > 0:
+    print(f"SUPPRESS:{int(math.ceil(remaining))}")
+else:
+    print("ALLOW")
+PYEOF
+}
+
 restart_listener() {
     local reason="$1"
+    local hb_ts="${2:-}"
     log_msg "[WARN] Heartbeat check failed (${reason}). Attempting: ${RESTART_CMD}"
     local output
     if output=$(${RESTART_CMD} 2>&1); then
         log_msg "[INFO] Restart succeeded: ${RESTART_CMD} ${output}"
         reset_reinstall_state
+        record_restart_marker "${hb_ts}"
         return 0
     else
         local rc=$?
@@ -274,12 +339,8 @@ restart_listener() {
     fi
 }
 
-if [[ ! -f "${HEARTBEAT_PATH}" ]]; then
-    restart_listener "missing heartbeat file: ${HEARTBEAT_PATH}"
-    exit $?
-fi
-
-CHECK_RESULT="$("${PYTHON_BIN}" - "${HEARTBEAT_PATH}" "${THRESHOLD_SEC}" <<'PYEOF'
+run_heartbeat_check() {
+    "${PYTHON_BIN}" - "${HEARTBEAT_PATH}" "${THRESHOLD_SEC}" <<'PYEOF'
 import json
 import os
 import sys
@@ -305,14 +366,45 @@ if hb_ts <= 0:
 
 age = now - hb_ts
 if age >= threshold:
-    print(f"STALE:age={int(age)}s>=threshold={int(threshold)}s")
+    print(f"STALE:age={int(age)}s>=threshold={int(threshold)}s:hb_ts={hb_ts}")
 else:
     print(f"OK:age={int(age)}s")
 PYEOF
-)"
+}
+
+if [[ ! -f "${HEARTBEAT_PATH}" ]]; then
+    restart_listener "missing heartbeat file: ${HEARTBEAT_PATH}"
+    exit $?
+fi
+
+CHECK_RESULT="$(run_heartbeat_check)"
 
 if [[ "${CHECK_RESULT}" == STALE:* ]]; then
-    restart_listener "${CHECK_RESULT}"
+    HB_TS="$(echo "${CHECK_RESULT}" | sed -n 's/.*hb_ts=\([0-9.]*\).*/\1/p')"
+
+    # Recheck: wait a few seconds and read once more before restarting, so a
+    # heartbeat that was just about to be written is not mistaken for a hang.
+    if [[ "${RECHECK_SEC}" != "0" ]]; then
+        sleep "${RECHECK_SEC}"
+        RECHECK_RESULT="$(run_heartbeat_check)"
+        if [[ "${RECHECK_RESULT}" == OK:* ]]; then
+            log_msg "[OK] Heartbeat recovered on recheck (${RECHECK_RESULT})"
+            exit 0
+        fi
+        CHECK_RESULT="${RECHECK_RESULT}"
+        HB_TS="$(echo "${CHECK_RESULT}" | sed -n 's/.*hb_ts=\([0-9.]*\).*/\1/p')"
+    fi
+
+    # Cooldown: do not restart the same unchanged heartbeat twice in a row
+    # while the listener may still be starting up from the previous restart.
+    COOLDOWN_RESULT="$(check_restart_cooldown "${HB_TS}")"
+    if [[ "${COOLDOWN_RESULT}" == SUPPRESS:* ]]; then
+        REMAINING="$(echo "${COOLDOWN_RESULT}" | cut -d: -f2)"
+        log_msg "[WARN] Restart suppressed by cooldown (${REMAINING}s remaining, same heartbeat already restarted)"
+        exit 0
+    fi
+
+    restart_listener "${CHECK_RESULT}" "${HB_TS}"
     exit $?
 else
     log_msg "[OK] Heartbeat healthy (${CHECK_RESULT})"

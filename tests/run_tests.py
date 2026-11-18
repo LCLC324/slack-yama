@@ -2329,6 +2329,8 @@ echo "MOCK_RELOAD_OK"
         trace_file.write_text("", encoding="utf-8")
         log_path.write_text("", encoding="utf-8")
         reinstall_state_path.unlink(missing_ok=True)
+        # 独立ケースとして、再起動クールダウンの記録 (last_restart.json) もリセットする
+        (state_dir / "last_restart.json").unlink(missing_ok=True)
 
         res5 = subprocess.run(
             ["bash", str(WATCHDOG_SH)], env=env5, capture_output=True, text=True
@@ -8267,6 +8269,271 @@ def test_auto_join_run_with_mock_client() -> str:
     return "ドライランは副作用なし・オーナー1人chへ参加＆シード2件(PENDING/fallback event_id)・join失敗で継続・外されたchはopted_out・平穏回は無出力を確認"
 
 
+def test_auto_join_state_bak_rotation_and_restore() -> str:
+    """56. auto_join .bak: 保存時に正常な本体を.bakへ退避・本体破損時は.bakから復旧し本体を即修復・形の壊れた本体(空dict)も.bakへfallback"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state" / "auto_join_state.json"
+        bak_path = auto_join._bak_path(state_path)
+        s1 = {"known_member": ["C_A"], "opted_out": ["C_X"]}
+        s2 = {"known_member": ["C_A", "C_B"], "opted_out": ["C_X"]}
+
+        auto_join.save_state(s1, state_path)
+        assert not bak_path.exists(), "first save must not create .bak"
+        auto_join.save_state(s2, state_path)
+        assert auto_join._read_state_file(bak_path) == s1, ".bak must hold previous good state"
+        assert auto_join.load_state(state_path) == s2
+
+        # Corrupt the main file -> load falls back to .bak and repairs main at once
+        state_path.write_text("this is not json {{{", encoding="utf-8")
+        assert auto_join.load_state(state_path) == s1
+        assert auto_join._read_state_file(state_path) == s1, "main must be repaired from .bak on load"
+        assert auto_join._read_state_file(bak_path) == s1, ".bak must stay intact during restore"
+
+        # Shape-broken main (valid JSON, missing keys) is also invalid -> .bak fallback
+        state_path.write_text("{}", encoding="utf-8")
+        state, source = auto_join.load_state_with_status(state_path)
+        assert source == "bak" and state == s1, (source, state)
+
+    return ".bak退避(正常時のみ)・破損時の.bak復旧＆本体即修復・空dict化した本体のfallbackを確認"
+
+
+def test_auto_join_state_both_corrupt_failsafe() -> str:
+    """57. auto_join .bak fail-safe: 本体・.bak両方読めない場合は空開始せずStateLoadErrorで自動参加を止める・初回(両方なし)は空開始"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "auto_join_state.json"
+        bak_path = auto_join._bak_path(state_path)
+
+        # First run: neither file exists -> empty state is fine
+        assert auto_join.load_state(state_path) == {"known_member": [], "opted_out": []}
+
+        state_path.write_text("garbage", encoding="utf-8")
+        bak_path.write_text("also garbage", encoding="utf-8")
+        try:
+            auto_join.load_state(state_path)
+            raise AssertionError("load_state must raise StateLoadError when both files are unreadable")
+        except auto_join.StateLoadError:
+            pass
+
+        # run_auto_join aborts before listing/joining anything
+        class GuardClient:
+            def __init__(self) -> None:
+                self.list_calls = 0
+
+            def conversations_list(self, **kwargs: Any) -> Dict[str, Any]:
+                self.list_calls += 1
+                return {"ok": True, "channels": [], "response_metadata": {"next_cursor": ""}}
+
+        client = GuardClient()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            summary = auto_join.run_auto_join(
+                db_path=Path(tmp) / "db.sqlite", env_path=Path(tmp) / ".env",
+                state_path=state_path, client=client, dry_run=False,
+                now=1797100000.0, sleep_fn=lambda _s: None,
+            )
+        assert summary.get("state_error") is True and summary["errors"] >= 1, summary
+        assert summary["joined"] == [] and client.list_calls == 0, summary
+        assert "auto-join aborted" in out.getvalue(), out.getvalue()
+
+    return "両方破損時は空開始せず停止(StateLoadError・list未実行・state_error記録)・初回は空開始を確認"
+
+
+def test_auto_join_state_bak_not_overwritten_by_corrupt_main() -> str:
+    """58. auto_join .bak ガード: 壊れた本体を保存しても良い.bakを上書きしない(04d9ade型の穴の再現防止)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "auto_join_state.json"
+        bak_path = auto_join._bak_path(state_path)
+        s1 = {"known_member": ["C_A"], "opted_out": ["C_X"]}
+        s2 = {"known_member": ["C_A", "C_B"], "opted_out": ["C_X"]}
+        s3 = {"known_member": ["C_A", "C_B", "C_C"], "opted_out": ["C_X"]}
+
+        auto_join.save_state(s1, state_path)
+        auto_join.save_state(s2, state_path)
+        assert auto_join._read_state_file(bak_path) == s1
+
+        # Main breaks, then a save happens: rotation must be skipped, .bak preserved
+        state_path.write_text("\x00\x01 broken", encoding="utf-8")
+        auto_join.save_state(s3, state_path)
+        assert auto_join._read_state_file(bak_path) == s1, "corrupt main must not overwrite good .bak"
+        assert auto_join.load_state(state_path) == s3
+
+    return "破損した本体の保存で.bakが潰れないこと・保存自体は新しい状態で完了することを確認"
+
+
+def test_curl_read_fallback() -> str:
+    """59. 読み取りcurlフォールバック: SDK接続エラー時のみcurlで読み直し・curlも失敗したら元の例外が伝播・正常時はcurl未使用・POST経路は非オーバーライド"""
+    from slack_sdk import WebClient
+
+    client = agent_tools._CurlFallbackWebClient(token="xoxb-dummy-token-for-test")
+    assert isinstance(client, WebClient)
+    # POST (chat_postMessage) must not be overridden by the subclass
+    assert "chat_postMessage" not in agent_tools._CurlFallbackWebClient.__dict__
+
+    def sdk_boom(self: Any, **kwargs: Any) -> Any:
+        raise http.client.IncompleteRead(b"partial")
+
+    curl_calls: List[Tuple[str, str]] = []
+
+    def curl_ok(token: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        curl_calls.append((token, method))
+        return {"ok": True, "messages": [{"ts": "1795006461.907139", "text": "hi"}]}
+
+    with patch.object(WebClient, "conversations_replies", sdk_boom), patch.object(
+        agent_tools, "_curl_api_read", curl_ok
+    ):
+        resp = client.conversations_replies(channel="C_X", ts="1795006461.907139", limit=5)
+        assert resp.get("ok") is True and resp["messages"][0]["text"] == "hi"
+        assert curl_calls == [("xoxb-dummy-token-for-test", "conversations.replies")], curl_calls
+
+    def curl_fail(token: str, method: str, params: Dict[str, Any]) -> Any:
+        raise RuntimeError("curl failed")
+
+    with patch.object(WebClient, "conversations_replies", sdk_boom), patch.object(
+        agent_tools, "_curl_api_read", curl_fail
+    ):
+        try:
+            client.conversations_replies(channel="C_X", ts="1795006461.907139")
+            raise AssertionError("original IncompleteRead must propagate when curl also fails")
+        except http.client.IncompleteRead:
+            pass
+
+    def sdk_ok(self: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"ok": True, "messages": []}
+
+    curl_calls.clear()
+    with patch.object(WebClient, "conversations_history", sdk_ok), patch.object(
+        agent_tools, "_curl_api_read", curl_ok
+    ):
+        resp2 = client.conversations_history(channel="C_X", limit=3)
+        assert resp2.get("ok") is True
+        assert curl_calls == [], "curl must not be used when the SDK read succeeds"
+
+    # _curl_api_read itself: token goes via stdin config (never argv), booleans
+    # serialize as true/false, None params are dropped, result is a SlackResponse
+    captured: Dict[str, Any] = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = '{"ok": true, "messages": [{"ts": "1.5"}]}'
+        stderr = ""
+
+    def fake_run(argv: Any, **kwargs: Any) -> Any:
+        captured["argv"] = argv
+        captured["input"] = kwargs.get("input", "")
+        return FakeProc()
+
+    with patch.object(agent_tools.subprocess, "run", fake_run):
+        resp3 = agent_tools._curl_api_read(
+            "xoxb-dummy-token-for-test",
+            "conversations.replies",
+            {"channel": "C_X", "ts": "1.5", "include_all_metadata": True, "cursor": None},
+        )
+    assert captured["argv"] == ["curl", "-K", "-"], captured["argv"]
+    assert "xoxb-dummy-token-for-test" not in " ".join(captured["argv"])
+    assert "Authorization: Bearer xoxb-dummy-token-for-test" in captured["input"]
+    assert "include_all_metadata=true" in captured["input"], captured["input"]
+    assert "cursor" not in captured["input"], captured["input"]
+    assert resp3.get("ok") is True and resp3["messages"][0]["ts"] == "1.5"
+    assert resp3.data["ok"] is True and resp3.status_code == 200
+
+    return "SDK接続エラー時のみcurl発動・curl失敗時は元の例外を維持・正常時はcurl未使用・POST非対象・トークンは標準入力経由・SlackResponseで返却を確認"
+
+
+def test_watchdog_threshold_recheck_cooldown() -> str:
+    """60. Watchdog 120秒しきい値＆再確認＆クールダウン (150秒停止で再起動・同一heartbeatへの再起動は60秒抑止・再確認中に回復すれば再起動しない)"""
+    import threading
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        hb_path = state_dir / "heartbeat.json"
+        log_path = state_dir / "watchdog.log"
+        trace_file = tmp_path / "restart_calls.log"
+        mock_restart = tmp_path / "mock_restart.sh"
+        mock_restart.write_text(
+            f"#!/usr/bin/env bash\necho RESTART >> \"{trace_file}\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        mock_restart.chmod(0o755)
+
+        def run_wd(extra_env: Dict[str, str]) -> Any:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "YAMA_STATE_DIR": str(state_dir),
+                    "YAMA_HEARTBEAT_PATH": str(hb_path),
+                    "YAMA_WATCHDOG_LOG": str(log_path),
+                    "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+                    "YAMA_RESTART_CMD": str(mock_restart),
+                    "YAMA_WATCHDOG_RECHECK_SEC": "0",
+                }
+            )
+            env.update(extra_env)
+            return subprocess.run(
+                ["bash", str(WATCHDOG_SH)], env=env, capture_output=True, text=True
+            )
+
+        # 1) 150s stale: below the old 180s threshold but >= new 120s -> restart fires
+        stale_ts = time.time() - 150
+        hb_path.write_text(
+            json.dumps({"timestamp": stale_ts, "connected": True, "bot_user_id": "U_YAMA_BOT"}),
+            encoding="utf-8",
+        )
+        res1 = run_wd({})
+        assert res1.returncode == 0, res1.stderr
+        assert trace_file.read_text(encoding="utf-8").count("RESTART") == 1
+        assert "threshold=120s" in log_path.read_text(encoding="utf-8")
+
+        # 2) Same unchanged heartbeat immediately after: cooldown suppresses re-restart
+        res2 = run_wd({})
+        assert res2.returncode == 0, res2.stderr
+        assert trace_file.read_text(encoding="utf-8").count("RESTART") == 1, "cooldown must suppress the second restart"
+        assert "suppressed by cooldown" in log_path.read_text(encoding="utf-8")
+
+        # 3) Recheck: heartbeat recovers during the recheck wait -> no restart
+        state2 = tmp_path / "state2"
+        state2.mkdir(parents=True, exist_ok=True)
+        hb2 = state2 / "heartbeat.json"
+        log2 = state2 / "watchdog.log"
+        hb2.write_text(
+            json.dumps({"timestamp": time.time() - 200, "connected": False, "bot_user_id": "U_YAMA_BOT"}),
+            encoding="utf-8",
+        )
+
+        def recover() -> None:
+            time.sleep(1)
+            hb2.write_text(
+                json.dumps({"timestamp": time.time(), "connected": True, "bot_user_id": "U_YAMA_BOT"}),
+                encoding="utf-8",
+            )
+
+        timer = threading.Timer(0.5, recover)
+        timer.start()
+        try:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "YAMA_STATE_DIR": str(state2),
+                    "YAMA_HEARTBEAT_PATH": str(hb2),
+                    "YAMA_WATCHDOG_LOG": str(log2),
+                    "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+                    "YAMA_RESTART_CMD": str(mock_restart),
+                    "YAMA_WATCHDOG_RECHECK_SEC": "3",
+                }
+            )
+            res3 = subprocess.run(
+                ["bash", str(WATCHDOG_SH)], env=env, capture_output=True, text=True
+            )
+        finally:
+            timer.join()
+        assert res3.returncode == 0, res3.stderr
+        assert trace_file.read_text(encoding="utf-8").count("RESTART") == 1, "recheck recovery must not restart"
+        assert "recovered on recheck" in log2.read_text(encoding="utf-8")
+
+    return "120秒しきい値で150秒停止を検知・同一heartbeatへの再起動を60秒抑止・再確認中の回復で再起動回避を確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -8324,6 +8591,11 @@ def main() -> int:
         ("53. auto_join 参加判定 (オーナー在籍＆未参加で参加・1人でも参加・オーナー不在/opted_out/参加済みは不参加)", test_auto_join_should_join_decision),
         ("54. auto_join 状態遷移 (参加済み→未参加でopted_out移動・手動再参加で解除・状態ファイル原子的保存)", test_auto_join_state_transitions),
         ("55. auto_join 実行 (ドライラン副作用なし・参加＆シードPENDING保存・join失敗で継続・平穏回は無出力)", test_auto_join_run_with_mock_client),
+        ("56. auto_join .bak退避＆復旧 (正常時のみ退避・破損時は.bak復旧＆本体即修復・空dict化もfallback)", test_auto_join_state_bak_rotation_and_restore),
+        ("57. auto_join .bak fail-safe (本体・.bak両方破損時は空開始せず自動参加を停止・初回は空開始)", test_auto_join_state_both_corrupt_failsafe),
+        ("58. auto_join .bak上書きガード (壊れた本体の保存で良い.bakを潰さない)", test_auto_join_state_bak_not_overwritten_by_corrupt_main),
+        ("59. 読み取りcurlフォールバック (SDK接続エラー時のみ発動・失敗時は元の例外維持・POST非対象・SlackResponse返却)", test_curl_read_fallback),
+        ("60. Watchdog 120秒しきい値＆再確認＆クールダウン (150秒停止で再起動・同一heartbeat再起動抑止・再確認中の回復で回避)", test_watchdog_threshold_recheck_cooldown),
     ]
 
     print("=" * 72)
