@@ -29,6 +29,7 @@ sys.path.insert(0, str(BASE_DIR))
 from slack_sdk.errors import SlackApiError  # noqa: E402
 
 import agent_tools  # noqa: E402
+import auto_join  # noqa: E402
 import backfill  # noqa: E402
 from agent_tools import (  # noqa: E402
     cmd_history,
@@ -8049,6 +8050,223 @@ def test_reply_post_no_retry_on_timeout_and_server_error() -> str:
         return "TimeoutError直撃時はPOST1回のみ・回復確認履歴読み取り実施・未着地でambiguous_post_outcome＋intended_text保存、HTTP 500 SlackApiError時はPOST1回のみ・回復確認なしで即失敗(error=internal_error)を確認"
 
 
+def test_auto_join_should_join_decision() -> str:
+    """53. auto_join 参加判定: オーナー在籍＆未参加なら参加(オーナー1人でも)・オーナー不在/opted_out/参加済み/アーカイブは不参加"""
+    owner = auto_join.OWNER_USER_ID
+    assert owner == "U_OWNER"
+    ch = {"id": "C_NEW", "name": "new", "is_member": False, "is_archived": False}
+
+    # オーナーがメンバーで未参加 → 入る（オーナー1人だけでも入る）
+    assert auto_join.should_join(ch, [], [owner]) is True, "owner-only channel must be joined"
+    assert auto_join.should_join(ch, [], [owner, "U_OTHER"]) is True
+
+    # オーナーがメンバーでない → 入らない
+    assert auto_join.should_join(ch, [], ["U_OTHER", "U_OTHER2"]) is False
+    assert auto_join.should_join(ch, [], []) is False
+
+    # opted_out に含まれる → オーナーがメンバーでも入らない
+    assert auto_join.should_join(ch, ["C_NEW"], [owner]) is False
+
+    # 既に参加済み → 入らない
+    joined = dict(ch, is_member=True)
+    assert auto_join.should_join(joined, [], [owner]) is False
+
+    # アーカイブ済み（防御的確認）→ 入らない
+    archived = dict(ch, is_archived=True)
+    assert auto_join.should_join(archived, [], [owner]) is False
+
+    return "オーナー在籍＆未参加で参加(1人でも)・オーナー不在/opted_out/参加済み/アーカイブで不参加を確認"
+
+
+def test_auto_join_state_transitions() -> str:
+    """54. auto_join 状態遷移: 参加済み→未参加でopted_outへ移動・手動再参加でopted_out解除・未知の未参加chは変化なし・入力非破壊"""
+    state0 = {"known_member": [], "opted_out": []}
+
+    # 参加済みを観測 → known_member に入る
+    s1, opted1, cleared1 = auto_join.update_membership_state(
+        state0,
+        [
+            {"id": "C_A", "is_member": True},
+            {"id": "C_B", "is_member": False},
+        ],
+    )
+    assert s1 == {"known_member": ["C_A"], "opted_out": []}, s1
+    assert opted1 == [] and cleared1 == []
+    assert state0 == {"known_member": [], "opted_out": []}, "input state must not be mutated"
+
+    # 参加済みだった C_A が未参加になった → opted_out に移る（C_B は known でないので変化なし）
+    s2, opted2, cleared2 = auto_join.update_membership_state(
+        s1,
+        [
+            {"id": "C_A", "is_member": False},
+            {"id": "C_B", "is_member": False},
+        ],
+    )
+    assert s2 == {"known_member": [], "opted_out": ["C_A"]}, s2
+    assert opted2 == ["C_A"] and cleared2 == []
+
+    # opted_out になった C_A は、オーナーがいても参加対象外
+    ch_a = {"id": "C_A", "name": "a", "is_member": False, "is_archived": False}
+    assert auto_join.should_join(ch_a, s2["opted_out"], [auto_join.OWNER_USER_ID]) is False
+
+    # 同じ観測が続いても opted_out は重複しない
+    s2b, opted2b, _ = auto_join.update_membership_state(s2, [{"id": "C_A", "is_member": False}])
+    assert s2b == s2 and opted2b == []
+
+    # 手動で再び参加済み → opted_out から外れ known_member に戻る
+    s3, opted3, cleared3 = auto_join.update_membership_state(
+        s2, [{"id": "C_A", "is_member": True}]
+    )
+    assert s3 == {"known_member": ["C_A"], "opted_out": []}, s3
+    assert opted3 == [] and cleared3 == ["C_A"]
+
+    # 状態ファイルの原子的保存＆読み戻し
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state" / "auto_join_state.json"
+        assert auto_join.load_state(state_path) == {"known_member": [], "opted_out": []}
+        auto_join.save_state(s2, state_path)
+        assert auto_join.load_state(state_path) == s2
+        leftovers = [p.name for p in state_path.parent.iterdir() if p.name != state_path.name]
+        assert leftovers == [], f"temp files must not remain: {leftovers}"
+
+    return "参加済み→未参加でopted_out移動・重複なし・手動再参加で解除・入力非破壊・状態ファイル原子的保存/読み戻しを確認"
+
+
+def test_auto_join_run_with_mock_client() -> str:
+    """55. auto_join 実行: 参加＆シード(トップレベルのみ・join/自分/既存ts/窓外除外でPENDING保存)・join失敗でも継続・ドライランは副作用なし"""
+    owner = auto_join.OWNER_USER_ID
+    bot_uid = "U_YAMA_BOT"
+    base_now = 1797100000.0
+
+    class MockAutoJoinClient:
+        def __init__(self) -> None:
+            self.join_calls: List[str] = []
+            self.history_calls: List[Dict[str, Any]] = []
+
+        def conversations_list(self, **kwargs: Any) -> Dict[str, Any]:
+            assert kwargs.get("types") == "public_channel"
+            assert kwargs.get("exclude_archived") is True
+            return {
+                "ok": True,
+                "channels": [
+                    {"id": "C_SOLO", "name": "solo", "is_member": False, "is_archived": False},
+                    {"id": "C_NOOWNER", "name": "noowner", "is_member": False, "is_archived": False},
+                    {"id": "C_DENIED", "name": "denied", "is_member": False, "is_archived": False},
+                    {"id": "C_IN", "name": "in", "is_member": True, "is_archived": False},
+                    {"id": "C_KICKED", "name": "kicked", "is_member": False, "is_archived": False},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+
+        def conversations_members(self, **kwargs: Any) -> Dict[str, Any]:
+            members = {
+                "C_SOLO": [owner],
+                "C_NOOWNER": ["U_OTHER"],
+                "C_DENIED": [owner, "U_OTHER"],
+                "C_KICKED": [owner],
+            }[kwargs["channel"]]
+            return {"ok": True, "members": members, "response_metadata": {"next_cursor": ""}}
+
+        def conversations_join(self, **kwargs: Any) -> Dict[str, Any]:
+            self.join_calls.append(kwargs["channel"])
+            if kwargs["channel"] == "C_DENIED":
+                raise RuntimeError("method_not_supported_for_channel_type")
+            return {"ok": True}
+
+        def auth_test(self) -> Dict[str, Any]:
+            return {"ok": True, "user_id": bot_uid}
+
+        def conversations_history(self, **kwargs: Any) -> Dict[str, Any]:
+            self.history_calls.append(dict(kwargs))
+            assert float(kwargs["oldest"]) == base_now - auto_join.SEED_WINDOW_SECS
+            assert kwargs["limit"] == auto_join.SEED_LIMIT
+            return {
+                "ok": True,
+                "messages": [
+                    {"type": "message", "subtype": "channel_join", "user": bot_uid, "text": "joined", "ts": "1797099990.000100"},
+                    {"type": "message", "user": bot_uid, "text": "yama self", "ts": "1797099980.000100"},
+                    {"type": "message", "user": owner, "text": "reply in thread", "ts": "1797099970.000100", "thread_ts": "1797099900.000100"},
+                    {"type": "message", "user": owner, "text": "parent", "ts": "1797099900.000100", "thread_ts": "1797099900.000100", "reply_count": 1},
+                    {"type": "message", "user": owner, "text": "already stored", "ts": "1797099800.000100"},
+                    {"type": "message", "user": owner, "text": "first post", "ts": "1797099700.000100", "client_msg_id": "abc"},
+                    {"type": "message", "user": owner, "text": "too old", "ts": "1797098000.000100"},
+                ],
+            }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        state_path = Path(tmp) / "auto_join_state.json"
+        env_path = Path(tmp) / ".env"
+        init_db(db_path)
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                "INSERT INTO events (event_id, channel_id, user_id, text, ts, status) VALUES (?, ?, ?, ?, ?, ?)",
+                ("Ev_EXISTING", "C_SOLO", owner, "already stored", "1797099800.000100", "DONE"),
+            )
+            conn.commit()
+        auto_join.save_state({"known_member": ["C_KICKED"], "opted_out": []}, state_path)
+
+        # Dry run: no join / seed / state save
+        dry_client = MockAutoJoinClient()
+        out_dry = io.StringIO()
+        with redirect_stdout(out_dry):
+            dry = auto_join.run_auto_join(
+                db_path=db_path, env_path=env_path, state_path=state_path,
+                client=dry_client, dry_run=True, now=base_now, sleep_fn=lambda _s: None,
+            )
+        assert dry_client.join_calls == [] and dry_client.history_calls == [], "dry-run must not join/seed"
+        assert sorted(dry["would_join"]) == ["C_DENIED", "C_SOLO"], dry
+        assert "would join #solo (C_SOLO)" in out_dry.getvalue(), out_dry.getvalue()
+        assert auto_join.load_state(state_path) == {"known_member": ["C_KICKED"], "opted_out": []}, "dry-run must not save state"
+        assert count_events(db_path) == 1
+
+        # Real run with mock client
+        client = MockAutoJoinClient()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            summary = auto_join.run_auto_join(
+                db_path=db_path, env_path=env_path, state_path=state_path,
+                client=client, dry_run=False, now=base_now, sleep_fn=lambda _s: None,
+            )
+        log = out.getvalue()
+        assert sorted(client.join_calls) == ["C_DENIED", "C_SOLO"], client.join_calls
+        assert "C_KICKED" not in client.join_calls and "C_NOOWNER" not in client.join_calls
+        assert summary["joined"] == ["C_SOLO"], summary
+        assert summary["errors"] == 1 and "join failed #denied" in log, log
+        assert summary["seeded"] == 2, summary
+        assert "opt-out added #kicked (C_KICKED)" in log, log
+
+        with get_db_connection(db_path) as conn:
+            rows = conn.execute(
+                "SELECT event_id, text, status FROM events WHERE channel_id = 'C_SOLO' AND status = 'PENDING' ORDER BY ts"
+            ).fetchall()
+        texts = [r["text"] for r in rows]
+        assert texts == ["first post", "parent"], texts
+        assert all(r["event_id"].startswith("C_SOLO_") for r in rows), [r["event_id"] for r in rows]
+
+        st = auto_join.load_state(state_path)
+        assert st == {"known_member": ["C_IN", "C_SOLO"], "opted_out": ["C_KICKED"]}, st
+
+        # 何も起きない回は無出力（C_DENIED の失敗は残るので、ここでは参加対象なしの状況を作る）
+        class QuietClient(MockAutoJoinClient):
+            def conversations_list(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "channels": [
+                    {"id": "C_IN", "name": "in", "is_member": True, "is_archived": False},
+                    {"id": "C_SOLO", "name": "solo", "is_member": True, "is_archived": False},
+                    {"id": "C_KICKED", "name": "kicked", "is_member": False, "is_archived": False},
+                ]}
+
+        out_quiet = io.StringIO()
+        with redirect_stdout(out_quiet):
+            auto_join.run_auto_join(
+                db_path=db_path, env_path=env_path, state_path=state_path,
+                client=QuietClient(), dry_run=False, now=base_now, sleep_fn=lambda _s: None,
+            )
+        assert out_quiet.getvalue() == "", out_quiet.getvalue()
+
+    return "ドライランは副作用なし・オーナー1人chへ参加＆シード2件(PENDING/fallback event_id)・join失敗で継続・外されたchはopted_out・平穏回は無出力を確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -8103,6 +8321,9 @@ def main() -> int:
         ("50. 投稿前チェックの台帳照合によるparroting防止 (同一スレッド一致抑止・別スレッド送信・正規化一致抑止・文面なし送信)", test_pre_post_thread_ledger_parroting_prevention),
         ("51. 遅延再送の答え済み確認1ページ上限＆fail-closed (ページ内回答で抑止・後続なしで送信・後続ありは未完として送信せず)", test_delayed_retry_answered_check_single_page_cap),
         ("52. 送信の再送なし確認 (TimeoutError直撃でPOST1回・回復確認→ambiguous_post_outcome＋intended_text保存／HTTP 500 SlackApiErrorでPOST1回・回復確認なし即失敗)", test_reply_post_no_retry_on_timeout_and_server_error),
+        ("53. auto_join 参加判定 (オーナー在籍＆未参加で参加・1人でも参加・オーナー不在/opted_out/参加済みは不参加)", test_auto_join_should_join_decision),
+        ("54. auto_join 状態遷移 (参加済み→未参加でopted_out移動・手動再参加で解除・状態ファイル原子的保存)", test_auto_join_state_transitions),
+        ("55. auto_join 実行 (ドライラン副作用なし・参加＆シードPENDING保存・join失敗で継続・平穏回は無出力)", test_auto_join_run_with_mock_client),
     ]
 
     print("=" * 72)

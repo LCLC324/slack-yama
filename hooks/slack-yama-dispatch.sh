@@ -103,6 +103,26 @@ if (( now_epoch - last_reconcile >= 3600 )); then
   } || true
 fi
 
+# Auto-join: periodically (at most once per 5 minutes) join public channels the
+# owner is a member of (skipping channels Yama was removed from) and seed their
+# recent top-level posts as PENDING. Best-effort; never affects dispatch.
+{
+  AUTO_JOIN_LAST_RUN_FILE="$PROJECT_DIR/state/auto_join_last_run"
+  aj_now_epoch=$(date +%s)
+  last_auto_join=0
+  if [[ -f "$AUTO_JOIN_LAST_RUN_FILE" ]]; then
+    raw_aj_last=$(cat "$AUTO_JOIN_LAST_RUN_FILE" 2>/dev/null || echo 0)
+    if [[ "$raw_aj_last" =~ ^[0-9]+$ ]]; then
+      last_auto_join="$raw_aj_last"
+    fi
+  fi
+  if (( aj_now_epoch - last_auto_join >= 300 )); then
+    mkdir -p "$PROJECT_DIR/state" 2>/dev/null || true
+    echo "$aj_now_epoch" > "$AUTO_JOIN_LAST_RUN_FILE" 2>/dev/null || true
+    "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/auto_join.py" >> "$PROJECT_DIR/state/auto_join.log" 2>&1 || true
+  fi
+} || true
+
 # Keep the listener's proxy credentials fresh: the egress proxy credentials
 # rotate, and the systemd service can only read config/.env. This hook runs
 # with the current environment, so sync the proxy lines into .env whenever
