@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Hook: poll for PENDING Slack events collected by the Yama listener.
+# NOTE: the platform executes this file directly every 30s and bash reads it
+# incrementally. Edit it only via tmp-file in this directory + bash -n + mv
+# (never overwrite it in place: a half-written file could be executed).
 # - Real run: invoke the project dispatcher (moves PENDING -> PROCESSING under
 #   flock and writes state/payload.json), then wake the agent with the payload.
 # - Dry run: only count PENDING events; never consume state.
@@ -146,11 +149,27 @@ fi
 
 # Best-effort listener watchdog: restarts the listener only when its
 # heartbeat has been stale for more than 3 minutes. Silent when healthy.
-"$PROJECT_DIR/watchdog.sh" >/dev/null 2>&1 || true
+# Guard: never execute a child script whose syntax is broken (e.g. mid-edit
+# or a bad save). bash reads scripts incrementally, so a torn file could
+# otherwise run half-old/half-new code. Skip this cycle and log it; the
+# next 30s poll retries. (Python children fail fast on their own, so no guard.)
+if bash -n "$PROJECT_DIR/watchdog.sh" 2>/dev/null; then
+  "$PROJECT_DIR/watchdog.sh" >/dev/null 2>&1 || true
+else
+  mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Watchdog skipped: watchdog.sh failed bash -n" >> "$WATCHDOG_LOG" 2>/dev/null || true
+fi
 
 set +e
-output=$("$PROJECT_DIR/dispatcher.sh" 2>/dev/null)
-code=$?
+if bash -n "$PROJECT_DIR/dispatcher.sh" 2>/dev/null; then
+  output=$("$PROJECT_DIR/dispatcher.sh" 2>/dev/null)
+  code=$?
+else
+  mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Dispatcher skipped: dispatcher.sh failed bash -n" >> "$WATCHDOG_LOG" 2>/dev/null || true
+  output="NO_EVENTS"
+  code=1
+fi
 set -e
 
 case "$code" in

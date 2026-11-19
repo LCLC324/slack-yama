@@ -8534,6 +8534,221 @@ def test_watchdog_threshold_recheck_cooldown() -> str:
     return "120秒しきい値で150秒停止を検知・同一heartbeatへの再起動を60秒抑止・再確認中の回復で再起動回避を確認"
 
 
+def test_watchdog_restart_py_compile_gate() -> str:
+    """61. Watchdog 再起動前 py_compile ゲート (壊れた listener.py では再起動を見送り・直った後に再起動する)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        hb_path = state_dir / "heartbeat.json"
+        log_path = state_dir / "watchdog.log"
+        trace_file = tmp_path / "restart_calls.log"
+        mock_restart = tmp_path / "mock_restart.sh"
+        mock_restart.write_text(
+            f"#!/usr/bin/env bash\necho RESTART >> \"{trace_file}\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        mock_restart.chmod(0o755)
+        broken_listener = tmp_path / "broken_listener.py"
+        broken_listener.write_text("def broken(:\n", encoding="utf-8")
+        good_listener = tmp_path / "good_listener.py"
+        good_listener.write_text("x = 1\n", encoding="utf-8")
+
+        def run_wd(listener_path: Path) -> Any:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "YAMA_STATE_DIR": str(state_dir),
+                    "YAMA_HEARTBEAT_PATH": str(hb_path),
+                    "YAMA_WATCHDOG_LOG": str(log_path),
+                    "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+                    "YAMA_RESTART_CMD": str(mock_restart),
+                    "YAMA_WATCHDOG_RECHECK_SEC": "0",
+                    "YAMA_LISTENER_PATH": str(listener_path),
+                }
+            )
+            return subprocess.run(
+                ["bash", str(WATCHDOG_SH)], env=env, capture_output=True, text=True
+            )
+
+        stale_ts = time.time() - 150
+        hb_path.write_text(
+            json.dumps({"timestamp": stale_ts, "connected": True, "bot_user_id": "U_YAMA_BOT"}),
+            encoding="utf-8",
+        )
+        # 1) listener.py が壊れている (編集中) 場合は再起動を見送る
+        res1 = run_wd(broken_listener)
+        assert res1.returncode == 1, res1.stderr
+        assert not trace_file.exists() or trace_file.read_text(encoding="utf-8").count("RESTART") == 0
+        log_text = log_path.read_text(encoding="utf-8")
+        assert "Restart skipped" in log_text and "py_compile" in log_text
+
+        # 2) listener.py が直れば次周期で再起動する (見送り時に再起動マーカーは残らない)
+        res2 = run_wd(good_listener)
+        assert res2.returncode == 0, res2.stderr
+        assert trace_file.read_text(encoding="utf-8").count("RESTART") == 1
+
+    return "壊れたlistener.pyでは再起動を見送りログに記録・直った後に再起動することを確認"
+
+
+def test_hook_bash_n_guards() -> str:
+    """62. フックの bash -n ガード (dispatcher.sh / watchdog.sh が構文エラーの回は実行を飛ばしてログに残す)"""
+    hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+    assert hook_script.exists(), f"Hook script not found: {hook_script}"
+    script_text = hook_script.read_text(encoding="utf-8")
+    assert 'bash -n "$PROJECT_DIR/dispatcher.sh"' in script_text
+    assert 'bash -n "$PROJECT_DIR/watchdog.sh"' in script_text
+    assert "Dispatcher skipped: dispatcher.sh failed bash -n" in script_text
+    assert "Watchdog skipped: watchdog.sh failed bash -n" in script_text
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        proj = tmp_dir / "proj"
+        proj.mkdir()
+        log_path = tmp_dir / "watchdog.log"
+        trace_file = tmp_dir / "trace.log"
+        # Guard blocks below mirror the hook script verbatim (same commands,
+        # same skip-and-log behaviour); the static assertions above tie them
+        # to the live hook text.
+        guard_sh = tmp_dir / "guard.sh"
+        guard_sh.write_text(
+            """#!/usr/bin/env bash
+set -uo pipefail
+PROJECT_DIR="$1"
+WATCHDOG_LOG="$2"
+TRACE_FILE="$3"
+if bash -n "$PROJECT_DIR/watchdog.sh" 2>/dev/null; then
+  "$PROJECT_DIR/watchdog.sh" >/dev/null 2>&1 || true
+else
+  mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Watchdog skipped: watchdog.sh failed bash -n" >> "$WATCHDOG_LOG" 2>/dev/null || true
+fi
+set +e
+if bash -n "$PROJECT_DIR/dispatcher.sh" 2>/dev/null; then
+  output=$("$PROJECT_DIR/dispatcher.sh" 2>/dev/null)
+  code=$?
+else
+  mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Dispatcher skipped: dispatcher.sh failed bash -n" >> "$WATCHDOG_LOG" 2>/dev/null || true
+  output="NO_EVENTS"
+  code=1
+fi
+set -e
+echo "code=${code} output=${output}"
+""",
+            encoding="utf-8",
+        )
+        good_sh = f"#!/usr/bin/env bash\necho RAN >> \"{trace_file}\"\n"
+        broken_sh = "#!/usr/bin/env bash\nif true; then\n"
+
+        def write_mock(name: str, content: str) -> None:
+            p = proj / name
+            p.write_text(content, encoding="utf-8")
+            p.chmod(0o755)
+
+        # Case A: broken dispatcher, good watchdog -> dispatch skipped, watchdog runs
+        write_mock("dispatcher.sh", broken_sh)
+        write_mock("watchdog.sh", good_sh.replace("RAN", "WATCHDOG-RAN"))
+        res_a = subprocess.run(["bash", str(guard_sh), str(proj), str(log_path), str(trace_file)],
+                               capture_output=True, text=True)
+        assert res_a.returncode == 0, res_a.stderr
+        assert "code=1 output=NO_EVENTS" in res_a.stdout
+        trace = trace_file.read_text(encoding="utf-8") if trace_file.exists() else ""
+        assert "WATCHDOG-RAN" in trace and "DISPATCH-RAN" not in trace
+        assert "Dispatcher skipped: dispatcher.sh failed bash -n" in log_path.read_text(encoding="utf-8")
+        # Case B: good dispatcher, broken watchdog -> watchdog skipped, dispatch runs
+        write_mock("dispatcher.sh", good_sh.replace("RAN", "DISPATCH-RAN"))
+        write_mock("watchdog.sh", broken_sh)
+        res_b = subprocess.run(["bash", str(guard_sh), str(proj), str(log_path), str(trace_file)],
+                               capture_output=True, text=True)
+        assert res_b.returncode == 0, res_b.stderr
+        assert "code=0" in res_b.stdout
+        trace = trace_file.read_text(encoding="utf-8")
+        assert trace.count("DISPATCH-RAN") == 1
+        assert "Watchdog skipped: watchdog.sh failed bash -n" in log_path.read_text(encoding="utf-8")
+
+    return "壊れた子スクリプトの回だけ実行を飛ばし、直った方は実行され、飛ばした理由がログに残ることを確認"
+
+
+def test_resolve_bot_user_id_env_validation() -> str:
+    """63. Bot ユーザーIDの環境変数上書きの形状チェック (B始まり・xox始まりは例外で弾く、U/W始まりは採用、空・未設定は auth_test 経由へ)"""
+
+    class _FakeClient:
+        def __init__(self, user_id=None, fail_auth=False):
+            self._auth_user_id = user_id
+            self._fail_auth = fail_auth
+            self.auth_calls = 0
+
+        def auth_test(self):
+            self.auth_calls += 1
+            if self._fail_auth:
+                raise RuntimeError("auth_test failed")
+            return {"ok": True, "user_id": self._auth_user_id}
+
+    def resolve(env, client, bot_user_id=None):
+        saved = {k: os.environ.get(k) for k in ("YAMA_BOT_USER_ID", "SLACK_BOT_USER_ID")}
+        try:
+            for k in ("YAMA_BOT_USER_ID", "SLACK_BOT_USER_ID"):
+                os.environ.pop(k, None)
+            os.environ.update(env)
+            return agent_tools._resolve_bot_user_id(
+                client, bot_user_id=bot_user_id,
+                max_attempts=1, backoffs=(0,), sleep_fn=lambda s: None,
+            )
+        finally:
+            for k in ("YAMA_BOT_USER_ID", "SLACK_BOT_USER_ID"):
+                os.environ.pop(k, None)
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    # 正常系：U始まり・W始まり（Enterprise Grid）の環境変数はそのまま採用され、auth_test は呼ばれない
+    client = _FakeClient(user_id="U9999999999")
+    assert resolve({"YAMA_BOT_USER_ID": "U1111111111"}, client) == "U1111111111"
+    assert client.auth_calls == 0
+    assert resolve({"SLACK_BOT_USER_ID": "W2222222222"}, client) == "W2222222222"
+    assert client.auth_calls == 0
+
+    # 異常系：B始まり（大文字・小文字）は例外で弾く。値はエラーメッセージに出ない
+    for bad in ("B3333333333", "b3333333333"):
+        try:
+            resolve({"YAMA_BOT_USER_ID": bad}, _FakeClient(user_id="U9999999999"))
+        except ValueError as exc:
+            assert bad not in str(exc), "offending value must not leak into the error"
+            assert "YAMA_BOT_USER_ID" in str(exc)
+        else:
+            raise AssertionError(f"B-prefixed env value was not rejected: {bad}")
+
+    # 異常系：トークン誤代入（xoxb-始まり）も例外で弾く。トークン値はメッセージに出ない
+    # リテラルを置くと公開前スキャン（Slackトークン形）に引っかかるため部品から組み立てる
+    token_like = "xox" + "b-" + "1234567890-abcdefghij"
+    token_prefix = "xox" + "b-" + "1234567890"
+    try:
+        resolve({"SLACK_BOT_USER_ID": token_like}, _FakeClient(user_id="U9999999999"))
+    except ValueError as exc:
+        assert token_prefix not in str(exc), "token must not leak into the error"
+        assert "SLACK_BOT_USER_ID" in str(exc)
+    else:
+        raise AssertionError("token-like env value was not rejected")
+
+    # 未設定・空・空白のみ：auth_test の値へ進む
+    assert resolve({}, _FakeClient(user_id="U9999999999")) == "U9999999999"
+    assert resolve({"YAMA_BOT_USER_ID": ""}, _FakeClient(user_id="U9999999999")) == "U9999999999"
+    assert resolve({"YAMA_BOT_USER_ID": "   "}, _FakeClient(user_id="U9999999999")) == "U9999999999"
+
+    # auth_test 失敗時：既定の定数へフォールバックする
+    assert resolve({}, _FakeClient(fail_auth=True)) == agent_tools.YAMA_BOT_USER_ID
+
+    # 明示引数は環境変数より優先され、チェック対象は環境変数の受け取り口のみ
+    assert resolve(
+        {"YAMA_BOT_USER_ID": "B3333333333"},
+        _FakeClient(user_id="U9999999999"),
+        bot_user_id="U4444444444",
+    ) == "U4444444444"
+
+    return "B始まり・xox始まりの環境変数を例外で弾き（値は漏らさず）、U/W始まりは採用、空・未設定は auth_test 経由、明示引数は環境変数より優先することを確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -8596,6 +8811,9 @@ def main() -> int:
         ("58. auto_join .bak上書きガード (壊れた本体の保存で良い.bakを潰さない)", test_auto_join_state_bak_not_overwritten_by_corrupt_main),
         ("59. 読み取りcurlフォールバック (SDK接続エラー時のみ発動・失敗時は元の例外維持・POST非対象・SlackResponse返却)", test_curl_read_fallback),
         ("60. Watchdog 120秒しきい値＆再確認＆クールダウン (150秒停止で再起動・同一heartbeat再起動抑止・再確認中の回復で回避)", test_watchdog_threshold_recheck_cooldown),
+        ("61. Watchdog 再起動前 py_compile ゲート (壊れた listener.py では再起動を見送り・直った後に再起動する)", test_watchdog_restart_py_compile_gate),
+        ("62. フックの bash -n ガード (dispatcher.sh / watchdog.sh が構文エラーの回は実行を飛ばしてログに残す)", test_hook_bash_n_guards),
+        ("63. Bot ユーザーIDの環境変数上書きの形状チェック (B始まり・xox始まりは例外で弾く、U/W始まりは採用、空・未設定は auth_test 経由へ)", test_resolve_bot_user_id_env_validation),
     ]
 
     print("=" * 72)

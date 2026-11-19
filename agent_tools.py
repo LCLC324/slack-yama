@@ -2370,6 +2370,22 @@ def _resolve_bot_user_id(
         or os.environ.get("SLACK_BOT_USER_ID", "").strip()
     )
     if env_uid:
+        # A Bot ID (B...) or a token (xox...) in the user-ID slot is a
+        # configuration mistake: Slack user IDs start with U (or W on
+        # Enterprise Grid). Refuse loudly instead of silently falling back
+        # to another ID, whose intent we cannot know. The offending value
+        # is never included in the message (it could be a token).
+        upper_uid = env_uid.upper()
+        if upper_uid.startswith("B") or upper_uid.startswith("XOX"):
+            env_name = (
+                "YAMA_BOT_USER_ID"
+                if os.environ.get("YAMA_BOT_USER_ID", "").strip()
+                else "SLACK_BOT_USER_ID"
+            )
+            raise ValueError(
+                f"{env_name} に Bot ID またはトークンらしき値が設定されています。"
+                "Bot ユーザーID（U始まり／W始まり）を設定してください。"
+            )
         return env_uid
     cached_uid = getattr(client, "_cached_bot_user_id", None)
     if isinstance(cached_uid, str) and cached_uid.strip():

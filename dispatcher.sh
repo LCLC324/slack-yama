@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Yama Slack Event Dispatcher (Layer 2)
+# NOTE: the dispatch hook executes this file every 30s and bash reads it
+# incrementally. Edit it only via tmp-file + bash -n + mv in this directory.
 # - Uses flock to prevent concurrent execution
 # - Fetches up to 10 oldest PENDING events from SQLite, transitions them to PROCESSING,
 #   and writes them to state/payload.json

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Yama Listener Watchdog (Layer 4)
+# NOTE: this file is executed every 30s by the dispatch hook, and bash reads
+# it incrementally. Edit it only via tmp-file + bash -n + mv in this directory.
 # - Checks if state/heartbeat.json has not been updated for >= 120 seconds
 #   (restart threshold; the escalation/warning threshold is restart + 60s = 180s,
 #   recorded in IMPROVEMENTS.md - the warning itself is not implemented here)
@@ -26,6 +28,9 @@ RESTART_COOLDOWN_SEC="${YAMA_WATCHDOG_RESTART_COOLDOWN_SEC:-60}"
 RESTART_STATE_PATH="${YAMA_RESTART_STATE_PATH:-${STATE_DIR}/last_restart.json}"
 PYTHON_BIN="${YAMA_PYTHON_BIN:-${BASE_DIR}/venv/bin/python}"
 RESTART_CMD="${YAMA_RESTART_CMD:-systemctl restart yama-listener}"
+# Recompile-check target for the restart gate below (YAMA_LISTENER_PATH is a
+# test-only override; default is the listener next to this script).
+LISTENER_PATH="${YAMA_LISTENER_PATH:-${BASE_DIR}/listener.py}"
 
 UNIT_SOURCE="${YAMA_UNIT_SOURCE:-${BASE_DIR}/yama-listener.service}"
 UNIT_DEST="${YAMA_UNIT_DEST:-/etc/systemd/system/yama-listener.service}"
@@ -321,6 +326,14 @@ PYEOF
 restart_listener() {
     local reason="$1"
     local hb_ts="${2:-}"
+    # Gate: never restart into a listener that cannot even compile (e.g. it is
+    # being edited right now). Skip this cycle; the next 30s poll re-checks.
+    # Without this, systemd would restart-loop on the broken file until the
+    # edit finishes.
+    if ! "${PYTHON_BIN}" -m py_compile "${LISTENER_PATH}" 2>/dev/null; then
+        log_msg "[ERROR] Restart skipped: listener.py fails py_compile (${LISTENER_PATH}); will retry next cycle"
+        return 1
+    fi
     log_msg "[WARN] Heartbeat check failed (${reason}). Attempting: ${RESTART_CMD}"
     local output
     if output=$(${RESTART_CMD} 2>&1); then
