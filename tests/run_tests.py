@@ -8360,6 +8360,94 @@ def test_auto_join_state_bak_not_overwritten_by_corrupt_main() -> str:
     return "破損した本体の保存で.bakが潰れないこと・保存自体は新しい状態で完了することを確認"
 
 
+def test_auto_join_last_status_and_transient_retries() -> str:
+    """65. auto_join statusファイル＆transient_retries: 実行ごとにlast_statusを上書き・吸収されたリトライだけを数え最終失敗は二重計上しない・ドライランは書かない・状態エラー時もerrorで記録"""
+    owner = auto_join.OWNER_USER_ID
+    base_now = 1797200000.0
+
+    class FlakyClient:
+        def __init__(self) -> None:
+            self.list_calls = 0
+            self.member_calls: Dict[str, int] = {}
+
+        def conversations_list(self, **kwargs: Any) -> Dict[str, Any]:
+            self.list_calls += 1
+            if self.list_calls == 1:
+                raise ConnectionResetError("closed once")
+            return {"ok": True, "channels": [
+                {"id": "C_IN", "name": "in", "is_member": True, "is_archived": False},
+                {"id": "C_CHECK", "name": "check", "is_member": False, "is_archived": False},
+                {"id": "C_DEAD", "name": "dead", "is_member": False, "is_archived": False},
+            ], "response_metadata": {"next_cursor": ""}}
+
+        def conversations_members(self, **kwargs: Any) -> Dict[str, Any]:
+            cid = kwargs["channel"]
+            self.member_calls[cid] = self.member_calls.get(cid, 0) + 1
+            if cid == "C_DEAD":
+                raise ConnectionResetError("always down")
+            if cid == "C_CHECK" and self.member_calls[cid] <= 2:
+                raise ConnectionResetError("flaky members")
+            return {"ok": True, "members": ["U_OTHER"], "response_metadata": {"next_cursor": ""}}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        state_path = Path(tmp) / "auto_join_state.json"
+        env_path = Path(tmp) / ".env"
+        status_path = auto_join.status_path_for(state_path)
+        init_db(db_path)
+
+        # list: 1 retry absorbed; members(C_CHECK): 2 retries absorbed; members(C_DEAD): always fails -> errors only
+        summary = auto_join.run_auto_join(
+            db_path=db_path, env_path=env_path, state_path=state_path,
+            client=FlakyClient(), dry_run=False, now=base_now, sleep_fn=lambda _s: None,
+        )
+        assert summary["checked_channels"] == 3, summary
+        assert summary["errors"] == 1, summary
+        assert summary["transient_retries"] == 3, summary
+        assert status_path.exists(), "status file must be written on a real run"
+        st = json.loads(status_path.read_text(encoding="utf-8"))
+        assert st["status"] == "error" and st["errors"] == 1, st
+        assert st["checked_channels"] == 3 and st["transient_retries"] == 3, st
+        assert st["joined"] == 0 and st["opted_out_added"] == 0, st
+        assert st["finished_at"], st
+
+        # Clean run overwrites and resets transient_retries to 0
+        class CleanClient:
+            def conversations_list(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "channels": [
+                    {"id": "C_IN", "name": "in", "is_member": True, "is_archived": False},
+                ], "response_metadata": {"next_cursor": ""}}
+
+        summary2 = auto_join.run_auto_join(
+            db_path=db_path, env_path=env_path, state_path=state_path,
+            client=CleanClient(), dry_run=False, now=base_now, sleep_fn=lambda _s: None,
+        )
+        assert summary2["transient_retries"] == 0 and summary2["errors"] == 0, summary2
+        st2 = json.loads(status_path.read_text(encoding="utf-8"))
+        assert st2["status"] == "success" and st2["transient_retries"] == 0 and st2["checked_channels"] == 1, st2
+
+        # Dry run must not overwrite the status file
+        before = status_path.read_text(encoding="utf-8")
+        auto_join.run_auto_join(
+            db_path=db_path, env_path=env_path, state_path=state_path,
+            client=CleanClient(), dry_run=True, now=base_now, sleep_fn=lambda _s: None,
+        )
+        assert status_path.read_text(encoding="utf-8") == before, "dry-run must not write status"
+
+        # State load error: status=error is recorded and the run aborts
+        state_path.write_text("{broken", encoding="utf-8")
+        auto_join._bak_path(state_path).write_text("{also broken", encoding="utf-8")
+        summary3 = auto_join.run_auto_join(
+            db_path=db_path, env_path=env_path, state_path=state_path,
+            client=CleanClient(), dry_run=False, now=base_now, sleep_fn=lambda _s: None,
+        )
+        assert summary3.get("state_error") is True and summary3["errors"] == 1, summary3
+        st3 = json.loads(status_path.read_text(encoding="utf-8"))
+        assert st3["status"] == "error" and st3["errors"] == 1 and st3["checked_channels"] == 0, st3
+
+    return "statusファイルの毎回上書き・吸収リトライ3件の計上(最終失敗はerrorsのみ)・正常回での0リセット・ドライラン無書込・状態エラー時のerror記録を確認"
+
+
 def test_curl_read_fallback() -> str:
     """59. 読み取りcurlフォールバック: SDK接続エラー時のみcurlで読み直し・curlも失敗したら元の例外が伝播・正常時はcurl未使用・POST経路は非オーバーライド"""
     from slack_sdk import WebClient
@@ -8914,6 +9002,7 @@ def main() -> int:
         ("62. フックの bash -n ガード (dispatcher.sh / watchdog.sh が構文エラーの回は実行を飛ばしてログに残す)", test_hook_bash_n_guards),
         ("63. Bot ユーザーIDの環境変数上書きの形状チェック (B始まり・xox始まりは例外で弾く、U/W始まりは採用、空・未設定は auth_test 経由へ)", test_resolve_bot_user_id_env_validation),
         ("64. 構文ガードの10分エスカレーション (10分未満は静か・10分で警告1回・重複なし・直ったら復旧1回・対象ごとに独立・破損状態でも落ちない)", test_hook_syntax_guard_escalation),
+        ("65. auto_join statusファイル＆transient_retries (毎回上書き・吸収リトライのみ計上・最終失敗は二重計上なし・ドライラン無書込・状態エラー時error記録)", test_auto_join_last_status_and_transient_retries),
     ]
 
     print("=" * 72)

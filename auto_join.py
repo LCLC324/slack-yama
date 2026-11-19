@@ -10,6 +10,13 @@ Yama Slack auto-join script
   up to SEED_LIMIT) into the events DB as PENDING via the same path as backfill.py.
 - State: state/auto_join_state.json {"known_member": [...], "opted_out": [...]}
   saved atomically (temp file + rename).
+- Last-run status: state/auto_join_last_status.json is overwritten on every
+  (non-dry-run) run with a 1-run summary (finished_at, status, checked_channels,
+  joined, seeded, opted_out_added, errors, transient_retries). "transient_retries"
+  counts only retries absorbed by _call_with_retry in calls that eventually
+  succeeded (attempts - 1 per call); retries of a call that ultimately failed are
+  NOT counted (that failure is counted once in errors), and retries inside the
+  Slack SDK itself are not visible here and are not included.
 - Prints only "happenings" (joins, seed counts, opt-outs, errors). Silent otherwise.
 - AUTO_JOIN_DRY_RUN=1: no join / seed / state save; prints the decisions only.
 - Always exits 0 (callers treat this as best-effort).
@@ -43,6 +50,7 @@ SEED_LIMIT = 20
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_STATE_PATH = BASE_DIR / "state" / "auto_join_state.json"
+DEFAULT_STATUS_PATH = BASE_DIR / "state" / "auto_join_last_status.json"
 
 SEED_EXCLUDED_SUBTYPES = {
     "channel_join",
@@ -58,6 +66,87 @@ MAX_PAGES = 50
 
 def _log(message: str) -> None:
     print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] [auto_join] {message}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Last-run status + recovered-retry counting
+# ---------------------------------------------------------------------------
+
+
+class _RecoveredRetryCounter:
+    """Accumulates retries absorbed by _call_with_retry in calls that succeeded.
+
+    Only the retry layer in agent_tools._call_with_retry is counted; retries
+    performed inside the Slack SDK itself are invisible and excluded."""
+
+    def __init__(self) -> None:
+        self.total = 0
+
+    def add(self, retries: int) -> None:
+        if retries > 0:
+            self.total += retries
+
+
+def _call_counted(
+    func: Callable[[], Any],
+    counter: Optional[_RecoveredRetryCounter],
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> Any:
+    """Call func through _call_with_retry, counting (attempts - 1) into counter
+    only when the call eventually succeeds. A call that ultimately fails adds
+    nothing: its failure is counted once in errors by the caller instead."""
+    if counter is None:
+        return _call_with_retry(func, sleep_fn=sleep_fn)
+    attempts = {"n": 0}
+
+    def _counting() -> Any:
+        attempts["n"] += 1
+        return func()
+
+    result = _call_with_retry(_counting, sleep_fn=sleep_fn)
+    counter.add(attempts["n"] - 1)
+    return result
+
+
+def status_path_for(state_path: Path) -> Path:
+    return Path(state_path).with_name("auto_join_last_status.json")
+
+
+def write_last_status(
+    summary: Dict[str, Any],
+    status_path: Path,
+    now: Optional[float] = None,
+) -> None:
+    """Atomically overwrite the last-run status file (temp file + os.replace)."""
+    status_path = Path(status_path)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    finished = now if now is not None else time.time()
+    data = {
+        "finished_at": datetime.fromtimestamp(finished).astimezone().isoformat(timespec="seconds"),
+        "status": "error" if int(summary.get("errors", 0) or 0) > 0 else "success",
+        "checked_channels": int(summary.get("checked_channels", 0) or 0),
+        "joined": len(summary.get("joined", []) or []),
+        "seeded": int(summary.get("seeded", 0) or 0),
+        "opted_out_added": len(summary.get("opted_out_added", []) or []),
+        "errors": int(summary.get("errors", 0) or 0),
+        "transient_retries": int(summary.get("transient_retries", 0) or 0),
+    }
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{status_path.name}.tmp.", dir=str(status_path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, status_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +359,7 @@ def _next_cursor(resp: Any) -> str:
     return (meta.get("next_cursor") or "").strip()
 
 
-def list_public_channels(client: Any, sleep_fn: Optional[Callable[[float], None]] = None) -> List[Dict[str, Any]]:
+def list_public_channels(client: Any, sleep_fn: Optional[Callable[[float], None]] = None, counter: Optional[_RecoveredRetryCounter] = None) -> List[Dict[str, Any]]:
     channels: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
     for _page in range(MAX_PAGES):
@@ -281,7 +370,7 @@ def list_public_channels(client: Any, sleep_fn: Optional[Callable[[float], None]
         }
         if cursor:
             kwargs["cursor"] = cursor
-        resp = _call_with_retry(lambda kw=kwargs: client.conversations_list(**kw), sleep_fn=sleep_fn)
+        resp = _call_counted(lambda kw=kwargs: client.conversations_list(**kw), counter, sleep_fn=sleep_fn)
         channels.extend(c for c in (resp.get("channels", []) or []) if isinstance(c, dict))
         cursor = _next_cursor(resp)
         if not cursor:
@@ -294,13 +383,14 @@ def channel_has_member(
     channel_id: str,
     user_id: str,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    counter: Optional[_RecoveredRetryCounter] = None,
 ) -> bool:
     cursor: Optional[str] = None
     for _page in range(MAX_PAGES):
         kwargs: Dict[str, Any] = {"channel": channel_id, "limit": MEMBERS_PAGE_LIMIT}
         if cursor:
             kwargs["cursor"] = cursor
-        resp = _call_with_retry(lambda kw=kwargs: client.conversations_members(**kw), sleep_fn=sleep_fn)
+        resp = _call_counted(lambda kw=kwargs: client.conversations_members(**kw), counter, sleep_fn=sleep_fn)
         if user_id in (resp.get("members", []) or []):
             return True
         cursor = _next_cursor(resp)
@@ -368,13 +458,15 @@ def seed_channel(
     ignored_user_ids: Optional[Set[str]] = None,
     now: Optional[float] = None,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    counter: Optional[_RecoveredRetryCounter] = None,
 ) -> int:
     current_now = now if now is not None else time.time()
     oldest_ts = current_now - SEED_WINDOW_SECS
-    resp = _call_with_retry(
+    resp = _call_counted(
         lambda: client.conversations_history(
             channel=channel_id, limit=SEED_LIMIT, oldest=str(oldest_ts)
         ),
+        counter,
         sleep_fn=sleep_fn,
     )
     messages = list(resp.get("messages", []) or [])
@@ -407,7 +499,18 @@ def run_auto_join(
     now: Optional[float] = None,
     sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
-    summary: Dict[str, Any] = {"joined": [], "would_join": [], "seeded": 0, "opted_out_added": [], "errors": 0}
+    summary: Dict[str, Any] = {"joined": [], "would_join": [], "seeded": 0, "opted_out_added": [], "errors": 0, "checked_channels": 0, "transient_retries": 0}
+    counter = _RecoveredRetryCounter()
+    status_path = status_path_for(state_path)
+
+    def _finish() -> Dict[str, Any]:
+        summary["transient_retries"] = counter.total
+        if not dry_run:
+            try:
+                write_last_status(summary, status_path, now=now)
+            except Exception:
+                pass  # status recording is best-effort; never break the run
+        return summary
 
     load_env_file(Path(env_path))
     active_client = client if client is not None else get_web_client(Path(env_path))
@@ -420,7 +523,7 @@ def run_auto_join(
         _log(f"error: {exc}; auto-join aborted")
         summary["errors"] += 1
         summary["state_error"] = True
-        return summary
+        return _finish()
     if load_source == "bak":
         if dry_run:
             _log("dry-run: state main file unreadable; would restore from .bak backup")
@@ -428,7 +531,8 @@ def run_auto_join(
             save_state(loaded_state, state_path, _rotate=False)
             _log("state restored from .bak backup (main file was unreadable)")
 
-    channels = list_public_channels(active_client, sleep_fn=sleep_fn)
+    channels = list_public_channels(active_client, sleep_fn=sleep_fn, counter=counter)
+    summary["checked_channels"] = len(channels)
     names = {c.get("id"): c.get("name", "") for c in channels}
 
     state, newly_opted, cleared = update_membership_state(loaded_state, channels)
@@ -446,7 +550,7 @@ def run_auto_join(
             continue
         cid = ch["id"]
         try:
-            members = [OWNER_USER_ID] if channel_has_member(active_client, cid, OWNER_USER_ID, sleep_fn=sleep_fn) else []
+            members = [OWNER_USER_ID] if channel_has_member(active_client, cid, OWNER_USER_ID, sleep_fn=sleep_fn, counter=counter) else []
         except Exception as exc:
             summary["errors"] += 1
             _log(f"error: conversations_members failed for #{ch.get('name', '')} ({cid}): {exc}")
@@ -460,13 +564,13 @@ def run_auto_join(
             summary["would_join"].append(ch["id"])
         if not targets:
             _log("dry-run: no join targets")
-        return summary
+        return _finish()
 
     state_dirty = state != loaded_state
 
     if targets:
         init_db(Path(db_path))
-        auth_resp = _call_with_retry(lambda: active_client.auth_test(), sleep_fn=sleep_fn)
+        auth_resp = _call_counted(lambda: active_client.auth_test(), counter, sleep_fn=sleep_fn)
         bot_user_id = auth_resp.get("user_id") if auth_resp else None
         extra_ignored_str = os.environ.get("IGNORED_USER_IDS", "")
         ignored_user_ids: Set[str] = {u.strip() for u in extra_ignored_str.split(",") if u.strip()}
@@ -493,6 +597,7 @@ def run_auto_join(
                     ignored_user_ids=ignored_user_ids,
                     now=now,
                     sleep_fn=sleep_fn,
+                    counter=counter,
                 )
                 summary["seeded"] += seeded
                 _log(f"joined #{cname} ({cid}); seeded {seeded} event(s)")
@@ -503,10 +608,11 @@ def run_auto_join(
     if state_dirty or not Path(state_path).exists():
         save_state(state, state_path)
 
-    return summary
+    return _finish()
 
 
 def main() -> int:
+    dry_run = False
     try:
         dry_run = os.environ.get("AUTO_JOIN_DRY_RUN", "") == "1"
         db_path = Path(os.environ.get("YAMA_DB_PATH", str(DEFAULT_DB_PATH)))
@@ -516,6 +622,11 @@ def main() -> int:
             _log(f"error: {type(exc).__name__}: {exc}")
         except Exception:
             pass
+        if not dry_run:
+            try:
+                write_last_status({"errors": 1}, DEFAULT_STATUS_PATH)
+            except Exception:
+                pass
     return 0
 
 
