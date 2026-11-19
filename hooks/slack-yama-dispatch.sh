@@ -153,14 +153,29 @@ fi
 # or a bad save). bash reads scripts incrementally, so a torn file could
 # otherwise run half-old/half-new code. Skip this cycle and log it; the
 # next 30s poll retries. (Python children fail fast on their own, so no guard.)
+WD_OK=1
 if bash -n "$PROJECT_DIR/watchdog.sh" 2>/dev/null; then
   "$PROJECT_DIR/watchdog.sh" >/dev/null 2>&1 || true
 else
   mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Watchdog skipped: watchdog.sh failed bash -n" >> "$WATCHDOG_LOG" 2>/dev/null || true
+  WD_OK=0
+fi
+
+# Listener syntax check (same cycle, for the escalation clock below): the
+# watchdog only py_compiles listener.py when a restart is attempted, so a
+# broken save can sit unnoticed while the running listener still looks
+# healthy. Check here every cycle; the result only feeds the escalation
+# below and the log line (never blocks dispatch).
+LISTENER_OK=1
+if ! "$PYTHON_BIN" -m py_compile "$PROJECT_DIR/listener.py" 2>/dev/null; then
+  LISTENER_OK=0
+  mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Listener skipped: listener.py failed py_compile" >> "$WATCHDOG_LOG" 2>/dev/null || true
 fi
 
 set +e
+DISP_OK=1
 if bash -n "$PROJECT_DIR/dispatcher.sh" 2>/dev/null; then
   output=$("$PROJECT_DIR/dispatcher.sh" 2>/dev/null)
   code=$?
@@ -169,8 +184,81 @@ else
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Dispatcher skipped: dispatcher.sh failed bash -n" >> "$WATCHDOG_LOG" 2>/dev/null || true
   output="NO_EVENTS"
   code=1
+  DISP_OK=0
 fi
 set -e
+
+# --- syntax-guard escalation: begin (extracted verbatim by tests/run_tests.py test 64) ---
+# Neiro's 10-minute split, mapped onto Yama's receivers: a target that keeps
+# failing its syntax check is skipped quietly per cycle, but once it has been
+# broken for >= SYNTAX_GUARD_WARN_SEC (default 600s) the hook wakes the
+# parent agent once so the breakage is seen (it lands in the Slack-ops chat).
+# Exit 2 is deliberately NOT used: Yama has no systemd-timer receiver for it,
+# and hook `log` only prints to stderr, so `wake` is the only channel that
+# actually reaches anyone. State lives in the hook runtime state
+# (hook_state_get/set: atomic tmp+mv, dry-run safe) under "syntax_guard".
+# Recovery wakes once too, but only if a warning was previously sent.
+SYNTAX_GUARD_WARN_SEC="${YAMA_SYNTAX_GUARD_WARN_SEC:-600}"
+syntax_guard_now() {
+  if [[ -n "${YAMA_SYNTAX_GUARD_NOW:-}" ]]; then printf '%s' "${YAMA_SYNTAX_GUARD_NOW}"; else date +%s; fi
+}
+syntax_guard_eval() {
+  # $1 = target name, $2 = 1 if broken this cycle else 0.
+  # Echoes "warn:<target>" when the warning is due, "recovered:<target>"
+  # when a previously warned target is fixed, nothing otherwise.
+  # Best-effort by design: never fails the hook.
+  local target="$1" broken="$2"
+  local now state first_fail warned age new_state
+  now="$(syntax_guard_now)"
+  state="$(hook_state_get 2>/dev/null || echo '{}')"
+  first_fail="$(printf '%s' "$state" | jq -r --arg t "$target" '.syntax_guard[$t].first_fail // 0' 2>/dev/null || echo 0)"
+  warned="$(printf '%s' "$state" | jq -r --arg t "$target" '.syntax_guard[$t].warned // false' 2>/dev/null || echo false)"
+  if [[ "$broken" == "1" ]]; then
+    if [[ "$first_fail" == "0" ]]; then
+      first_fail="$now"
+      new_state="$(printf '%s' "$state" | jq --arg t "$target" --argjson ff "$first_fail" '.syntax_guard[$t] = {"first_fail": $ff, "warned": false}' 2>/dev/null || echo '')"
+      [[ -n "$new_state" ]] && hook_state_set "$new_state" 2>/dev/null || true
+    fi
+    age=$((now - first_fail))
+    if [[ "$warned" != "true" && "$age" -ge "$SYNTAX_GUARD_WARN_SEC" ]]; then
+      new_state="$(printf '%s' "$state" | jq --arg t "$target" --argjson ff "$first_fail" '.syntax_guard[$t] = {"first_fail": $ff, "warned": true}' 2>/dev/null || echo '')"
+      [[ -n "$new_state" ]] && hook_state_set "$new_state" 2>/dev/null || true
+      echo "warn:${target}"
+    fi
+  else
+    if [[ "$first_fail" != "0" ]]; then
+      new_state="$(printf '%s' "$state" | jq --arg t "$target" 'del(.syntax_guard[$t])' 2>/dev/null || echo '')"
+      [[ -n "$new_state" ]] && hook_state_set "$new_state" 2>/dev/null || true
+      if [[ "$warned" == "true" ]]; then
+        echo "recovered:${target}"
+      fi
+    fi
+  fi
+  return 0
+}
+# --- syntax-guard escalation: end ---
+
+# Evaluate the three syntax-guard targets and escalate if any has been broken
+# for 10+ minutes (or report a recovery). A warning wake takes this cycle;
+# pending events wait one 30s cycle, which is acceptable for a warning.
+SYNTAX_WARN_TARGETS=()
+SYNTAX_RECOVERED_TARGETS=()
+for _sg in "watchdog.sh:${WD_OK:-1}" "dispatcher.sh:${DISP_OK:-1}" "listener.py:${LISTENER_OK:-1}"; do
+  _sg_target="${_sg%%:*}"
+  _sg_ok="${_sg##*:}"
+  if [[ "$_sg_ok" == "0" ]]; then _sg_res="$(syntax_guard_eval "$_sg_target" 1 || true)"; else _sg_res="$(syntax_guard_eval "$_sg_target" 0 || true)"; fi
+  case "$_sg_res" in
+    warn:*) SYNTAX_WARN_TARGETS+=("${_sg_res#warn:}") ;;
+    recovered:*) SYNTAX_RECOVERED_TARGETS+=("${_sg_res#recovered:}") ;;
+  esac
+done
+if [[ "${#SYNTAX_WARN_TARGETS[@]}" -gt 0 ]]; then
+  _sg_first="$(printf '%s' "$(hook_state_get 2>/dev/null || echo '{}')" | jq -r '[.syntax_guard[] | .first_fail] | min // 0' 2>/dev/null || echo 0)"
+  wake "Syntax guard: target(s) broken for 10+ min" "{"syntax_guard_warning": true, "targets": $(printf '%s\n' "${SYNTAX_WARN_TARGETS[@]}" | jq -R . | jq -s -c .), "first_failed_at_epoch": ${_sg_first}, "warn_seconds": ${SYNTAX_GUARD_WARN_SEC}}"
+fi
+if [[ "${#SYNTAX_RECOVERED_TARGETS[@]}" -gt 0 ]]; then
+  wake "Syntax guard: target(s) recovered" "{"syntax_guard_recovered": true, "targets": $(printf '%s\n' "${SYNTAX_RECOVERED_TARGETS[@]}" | jq -R . | jq -s -c .)}"
+fi
 
 case "$code" in
   0)

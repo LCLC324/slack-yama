@@ -8749,6 +8749,105 @@ def test_resolve_bot_user_id_env_validation() -> str:
     return "B始まり・xox始まりの環境変数を例外で弾き（値は漏らさず）、U/W始まりは採用、空・未設定は auth_test 経由、明示引数は環境変数より優先することを確認"
 
 
+def test_hook_syntax_guard_escalation() -> str:
+    """64. 構文ガードの10分エスカレーション (10分未満は静か・10分で警告1回・重複なし・直ったら復旧1回・対象ごとに独立・破損状態でも落ちない)"""
+    hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+    assert hook_script.exists(), f"Hook script not found: {hook_script}"
+    script_text = hook_script.read_text(encoding="utf-8")
+    for needle in (
+        "syntax_guard_eval",
+        "SYNTAX_GUARD_WARN_SEC",
+        '"syntax_guard_warning"',
+        '"syntax_guard_recovered"',
+        'wake "Syntax guard: target(s) broken for 10+ min"',
+        'wake "Syntax guard: target(s) recovered"',
+        "hook_state_get",
+        "hook_state_set",
+    ):
+        assert needle in script_text, f"missing in live hook: {needle}"
+    # Extract the eval functions verbatim from the live hook so the test can
+    # never drift from the shipped code; the wake calls are covered by the
+    # static assertions above.
+    begin = script_text.index("# --- syntax-guard escalation: begin")
+    end = script_text.index("# --- syntax-guard escalation: end ---")
+    guard_src = script_text[begin:end]
+    fn_start = guard_src.index("syntax_guard_now()")
+    fn_text = guard_src[fn_start:]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        state_file = tmp_dir / "hook_state.json"
+        stub = tmp_dir / "guard_stub.sh"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -uo pipefail\n"
+            "STATE_FILE=\"$1\"\n"
+            "TARGET=\"$2\"\n"
+            "BROKEN=\"$3\"\n"
+            "SYNTAX_GUARD_WARN_SEC=600\n"
+            "hook_state_get() {\n"
+            "  if [[ -f \"$STATE_FILE\" ]]; then\n"
+            "    jq -ce 'select(type == \"object\")' <\"$STATE_FILE\" 2>/dev/null || printf '{}'\n"
+            "  else\n"
+            "    printf '{}'\n"
+            "  fi\n"
+            "}\n"
+            "hook_state_set() {\n"
+            "  local value=\"$1\" tmp\n"
+            "  value=\"$(printf '%s' \"$value\" | jq -ce 'select(type == \"object\")')\" || return 1\n"
+            "  tmp=\"${STATE_FILE}.tmp.$$\"\n"
+            "  printf '%s\\n' \"$value\" >\"$tmp\" || return 1\n"
+            "  mv -f \"$tmp\" \"$STATE_FILE\"\n"
+            "}\n"
+            + fn_text
+            + "\nsyntax_guard_eval \"$TARGET\" \"$BROKEN\"\n",
+            encoding="utf-8",
+        )
+
+        def run_eval(target: str, broken: int, now: int) -> str:
+            env = os.environ.copy()
+            env["YAMA_SYNTAX_GUARD_NOW"] = str(now)
+            res = subprocess.run(
+                ["bash", str(stub), str(state_file), target, str(broken)],
+                env=env, capture_output=True, text=True,
+            )
+            assert res.returncode == 0, res.stderr
+            return res.stdout.strip()
+
+        def read_state() -> Any:
+            if not state_file.exists():
+                return {}
+            return json.loads(state_file.read_text(encoding="utf-8"))
+
+        # 10分未満は静か：初回失敗を記録するだけ
+        assert run_eval("dispatcher.sh", 1, 1000) == ""
+        st = read_state()["syntax_guard"]["dispatcher.sh"]
+        assert st["first_fail"] == 1000 and st["warned"] is False
+        # 599秒経過でもまだ警告なし
+        assert run_eval("dispatcher.sh", 1, 1599) == ""
+        assert read_state()["syntax_guard"]["dispatcher.sh"]["warned"] is False
+        # ちょうど600秒で警告1回
+        assert run_eval("dispatcher.sh", 1, 1600) == "warn:dispatcher.sh"
+        assert read_state()["syntax_guard"]["dispatcher.sh"]["warned"] is True
+        # 壊れたままが続いても警告は繰り返さない
+        assert run_eval("dispatcher.sh", 1, 1900) == ""
+        # 直ったら復旧を1回だけ知らせる
+        assert run_eval("dispatcher.sh", 0, 2000) == "recovered:dispatcher.sh"
+        assert "dispatcher.sh" not in read_state().get("syntax_guard", {})
+        assert run_eval("dispatcher.sh", 0, 2100) == ""
+        # 対象ごとに時計は独立：watchdog.sh は自分の600秒で警告する
+        assert run_eval("watchdog.sh", 1, 3000) == ""
+        assert run_eval("watchdog.sh", 1, 3599) == ""
+        assert run_eval("watchdog.sh", 1, 3600) == "warn:watchdog.sh"
+        # 破損した状態ファイルでも落ちず、時計を仕切り直す
+        state_file.write_text("{not json", encoding="utf-8")
+        assert run_eval("listener.py", 1, 5000) == ""
+        st = read_state()["syntax_guard"]["listener.py"]
+        assert st["first_fail"] == 5000 and st["warned"] is False
+
+    return "10分未満は静か・600秒で警告1回・重複なし・直ったら復旧1回・対象ごとに独立・破損状態でも落ちないことを確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -8814,6 +8913,7 @@ def main() -> int:
         ("61. Watchdog 再起動前 py_compile ゲート (壊れた listener.py では再起動を見送り・直った後に再起動する)", test_watchdog_restart_py_compile_gate),
         ("62. フックの bash -n ガード (dispatcher.sh / watchdog.sh が構文エラーの回は実行を飛ばしてログに残す)", test_hook_bash_n_guards),
         ("63. Bot ユーザーIDの環境変数上書きの形状チェック (B始まり・xox始まりは例外で弾く、U/W始まりは採用、空・未設定は auth_test 経由へ)", test_resolve_bot_user_id_env_validation),
+        ("64. 構文ガードの10分エスカレーション (10分未満は静か・10分で警告1回・重複なし・直ったら復旧1回・対象ごとに独立・破損状態でも落ちない)", test_hook_syntax_guard_escalation),
     ]
 
     print("=" * 72)
