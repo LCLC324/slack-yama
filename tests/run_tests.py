@@ -31,6 +31,7 @@ from slack_sdk.errors import SlackApiError  # noqa: E402
 import agent_tools  # noqa: E402
 import auto_join  # noqa: E402
 import backfill  # noqa: E402
+import owner_dm_poll  # noqa: E402
 from agent_tools import (  # noqa: E402
     cmd_history,
     cmd_reply,
@@ -8838,12 +8839,13 @@ def test_resolve_bot_user_id_env_validation() -> str:
 
 
 def test_hook_syntax_guard_escalation() -> str:
-    """64. 構文ガードの10分エスカレーション (10分未満は静か・10分で警告1回・重複なし・直ったら復旧1回・対象ごとに独立・破損状態でも落ちない)"""
+    """64. 構文ガードの10分エスカレーション＆警告wake (jq組立てJSON検証・wake失敗時はwarned未保存で再試行＆後段処理続行・成功時のみwarned保存・10分未満静観・復旧・対象独立・破損状態耐性)"""
     hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
     assert hook_script.exists(), f"Hook script not found: {hook_script}"
     script_text = hook_script.read_text(encoding="utf-8")
     for needle in (
         "syntax_guard_eval",
+        "syntax_guard_mark_warned",
         "SYNTAX_GUARD_WARN_SEC",
         '"syntax_guard_warning"',
         '"syntax_guard_recovered"',
@@ -8851,89 +8853,456 @@ def test_hook_syntax_guard_escalation() -> str:
         'wake "Syntax guard: target(s) recovered"',
         "hook_state_get",
         "hook_state_set",
+        "jq -n",
     ):
         assert needle in script_text, f"missing in live hook: {needle}"
-    # Extract the eval functions verbatim from the live hook so the test can
-    # never drift from the shipped code; the wake calls are covered by the
-    # static assertions above.
+    # Extract the entire syntax-guard escalation block (eval + mark_warned +
+    # wake dispatch) verbatim from the live hook so the test executes the real
+    # shipped logic including wake invocation and error handling.
     begin = script_text.index("# --- syntax-guard escalation: begin")
     end = script_text.index("# --- syntax-guard escalation: end ---")
     guard_src = script_text[begin:end]
-    fn_start = guard_src.index("syntax_guard_now()")
-    fn_text = guard_src[fn_start:]
+    assert 'wake "Syntax guard: target(s) broken for 10+ min"' in guard_src, (
+        "warning wake dispatch must be inside begin..end markers"
+    )
+    assert 'wake "Syntax guard: target(s) recovered"' in guard_src, (
+        "recovery wake dispatch must be inside begin..end markers"
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         state_file = tmp_dir / "hook_state.json"
-        stub = tmp_dir / "guard_stub.sh"
+        wake_log = tmp_dir / "wake_calls.jsonl"
+        watchdog_log = tmp_dir / "watchdog.log"
+        after_log = tmp_dir / "after_guard.log"
+        stub = tmp_dir / "guard_block_stub.sh"
         stub.write_text(
             "#!/usr/bin/env bash\n"
-            "set -uo pipefail\n"
-            "STATE_FILE=\"$1\"\n"
-            "TARGET=\"$2\"\n"
-            "BROKEN=\"$3\"\n"
-            "SYNTAX_GUARD_WARN_SEC=600\n"
+            "set -euo pipefail\n"
+            'STATE_FILE="$1"\n'
+            'WAKE_LOG="$2"\n'
+            'WATCHDOG_LOG="$3"\n'
+            'AFTER_LOG="$4"\n'
+            'WD_OK="$5"\n'
+            'DISP_OK="$6"\n'
+            'LISTENER_OK="$7"\n'
             "hook_state_get() {\n"
-            "  if [[ -f \"$STATE_FILE\" ]]; then\n"
-            "    jq -ce 'select(type == \"object\")' <\"$STATE_FILE\" 2>/dev/null || printf '{}'\n"
+            '  if [[ -f "$STATE_FILE" ]]; then\n'
+            '    jq -ce \'select(type == "object")\' <"$STATE_FILE" 2>/dev/null || printf \'{}\'\n'
             "  else\n"
             "    printf '{}'\n"
             "  fi\n"
             "}\n"
             "hook_state_set() {\n"
-            "  local value=\"$1\" tmp\n"
-            "  value=\"$(printf '%s' \"$value\" | jq -ce 'select(type == \"object\")')\" || return 1\n"
-            "  tmp=\"${STATE_FILE}.tmp.$$\"\n"
-            "  printf '%s\\n' \"$value\" >\"$tmp\" || return 1\n"
-            "  mv -f \"$tmp\" \"$STATE_FILE\"\n"
+            '  local value="$1" tmp\n'
+            '  value="$(printf \'%s\' "$value" | jq -ce \'select(type == "object")\')" || return 1\n'
+            '  tmp="${STATE_FILE}.tmp.$$"\n'
+            '  printf \'%s\\n\' "$value" >"$tmp" || return 1\n'
+            '  mv -f "$tmp" "$STATE_FILE"\n'
             "}\n"
-            + fn_text
-            + "\nsyntax_guard_eval \"$TARGET\" \"$BROKEN\"\n",
+            "wake() {\n"
+            '  local title="$1" payload="$2"\n'
+            '  jq -n -c --arg t "$title" --arg p "$payload" \'{"title": $t, "payload": $p}\' >>"$WAKE_LOG"\n'
+            '  if [[ "${STUB_WAKE_FAIL:-0}" == "1" ]]; then\n'
+            "    return 1\n"
+            "  fi\n"
+            "  return 0\n"
+            "}\n"
+            + guard_src
+            + '\necho "AFTER_GUARD_OK" >>"$AFTER_LOG"\n',
             encoding="utf-8",
         )
 
-        def run_eval(target: str, broken: int, now: int) -> str:
+        def run_cycle(
+            now: int,
+            *,
+            wd_ok: int = 1,
+            disp_ok: int = 1,
+            listener_ok: int = 1,
+            wake_fail: int = 0,
+        ) -> Tuple[List[Dict[str, str]], bool]:
+            before_wakes = (
+                len(wake_log.read_text(encoding="utf-8").splitlines())
+                if wake_log.exists()
+                else 0
+            )
+            before_after = (
+                len(after_log.read_text(encoding="utf-8").splitlines())
+                if after_log.exists()
+                else 0
+            )
             env = os.environ.copy()
             env["YAMA_SYNTAX_GUARD_NOW"] = str(now)
+            env["STUB_WAKE_FAIL"] = str(wake_fail)
             res = subprocess.run(
-                ["bash", str(stub), str(state_file), target, str(broken)],
-                env=env, capture_output=True, text=True,
+                [
+                    "bash",
+                    str(stub),
+                    str(state_file),
+                    str(wake_log),
+                    str(watchdog_log),
+                    str(after_log),
+                    str(wd_ok),
+                    str(disp_ok),
+                    str(listener_ok),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
             )
-            assert res.returncode == 0, res.stderr
-            return res.stdout.strip()
+            assert res.returncode == 0, f"guard block failed (rc={res.returncode}): {res.stderr}"
+            lines = (
+                wake_log.read_text(encoding="utf-8").splitlines()
+                if wake_log.exists()
+                else []
+            )
+            new_wakes = [json.loads(line) for line in lines[before_wakes:]]
+            after_lines = (
+                after_log.read_text(encoding="utf-8").splitlines()
+                if after_log.exists()
+                else []
+            )
+            downstream_ran = (
+                len(after_lines) == before_after + 1
+                and after_lines[-1] == "AFTER_GUARD_OK"
+            )
+            return new_wakes, downstream_ran
 
         def read_state() -> Any:
             if not state_file.exists():
                 return {}
             return json.loads(state_file.read_text(encoding="utf-8"))
 
-        # 10分未満は静か：初回失敗を記録するだけ
-        assert run_eval("dispatcher.sh", 1, 1000) == ""
+        def jq_assert(payload_str: str, expr: str) -> None:
+            chk = subprocess.run(
+                ["jq", "-e", expr],
+                input=payload_str,
+                capture_output=True,
+                text=True,
+            )
+            assert chk.returncode == 0, (
+                f"jq validation failed for payload={payload_str!r} expr={expr!r}: {chk.stderr}"
+            )
+
+        # (e) 10分未満は静か：初回失敗を記録するだけ
+        wakes, ran = run_cycle(1000, disp_ok=0)
+        assert wakes == [] and ran is True
         st = read_state()["syntax_guard"]["dispatcher.sh"]
         assert st["first_fail"] == 1000 and st["warned"] is False
         # 599秒経過でもまだ警告なし
-        assert run_eval("dispatcher.sh", 1, 1599) == ""
+        wakes, ran = run_cycle(1599, disp_ok=0)
+        assert wakes == [] and ran is True
         assert read_state()["syntax_guard"]["dispatcher.sh"]["warned"] is False
-        # ちょうど600秒で警告1回
-        assert run_eval("dispatcher.sh", 1, 1600) == "warn:dispatcher.sh"
-        assert read_state()["syntax_guard"]["dispatcher.sh"]["warned"] is True
-        # 壊れたままが続いても警告は繰り返さない
-        assert run_eval("dispatcher.sh", 1, 1900) == ""
-        # 直ったら復旧を1回だけ知らせる
-        assert run_eval("dispatcher.sh", 0, 2000) == "recovered:dispatcher.sh"
-        assert "dispatcher.sh" not in read_state().get("syntax_guard", {})
-        assert run_eval("dispatcher.sh", 0, 2100) == ""
-        # 対象ごとに時計は独立：watchdog.sh は自分の600秒で警告する
-        assert run_eval("watchdog.sh", 1, 3000) == ""
-        assert run_eval("watchdog.sh", 1, 3599) == ""
-        assert run_eval("watchdog.sh", 1, 3600) == "warn:watchdog.sh"
-        # 破損した状態ファイルでも落ちず、時計を仕切り直す
-        state_file.write_text("{not json", encoding="utf-8")
-        assert run_eval("listener.py", 1, 5000) == ""
-        st = read_state()["syntax_guard"]["listener.py"]
-        assert st["first_fail"] == 5000 and st["warned"] is False
 
-    return "10分未満は静か・600秒で警告1回・重複なし・直ったら復旧1回・対象ごとに独立・破損状態でも落ちないことを確認"
+        # (a)(b)(d) ちょうど600秒で警告 wake 試行、wake 失敗時：
+        #  - 第2引数は jq 検証可能な妥当 JSON で型も正しい
+        #  - warned は保存されない
+        #  - watchdog.log に失敗記録が書かれる
+        #  - ブロック後段のダミー処理が実行される
+        wakes, ran = run_cycle(1600, disp_ok=0, wake_fail=1)
+        assert len(wakes) == 1, f"expected 1 wake attempt, got {wakes}"
+        assert ran is True, "downstream step must still execute after warning wake failure"
+        assert wakes[0]["title"] == "Syntax guard: target(s) broken for 10+ min"
+        payload_str = wakes[0]["payload"]
+        jq_assert(
+            payload_str,
+            '.syntax_guard_warning == true '
+            'and (.targets | type == "array") and (.targets == ["dispatcher.sh"]) '
+            'and (.first_failed_at_epoch | type == "number") and (.first_failed_at_epoch == 1000) '
+            'and (.warn_seconds | type == "number") and (.warn_seconds == 600)',
+        )
+        parsed = json.loads(payload_str)
+        assert parsed["syntax_guard_warning"] is True
+        assert parsed["targets"] == ["dispatcher.sh"]
+        assert type(parsed["first_failed_at_epoch"]) is int and parsed["first_failed_at_epoch"] == 1000
+        assert type(parsed["warn_seconds"]) is int and parsed["warn_seconds"] == 600
+        st_after_fail = read_state()["syntax_guard"]["dispatcher.sh"]
+        assert st_after_fail["warned"] is False and st_after_fail["first_fail"] == 1000, st_after_fail
+        assert watchdog_log.exists() and "Syntax guard warning wake failed" in watchdog_log.read_text(encoding="utf-8")
+
+        # (b)(c) 次の実行で再度 wake が試みられ、成功した場合のみ warned=true が保存される
+        wakes, ran = run_cycle(1630, disp_ok=0, wake_fail=0)
+        assert len(wakes) == 1 and ran is True, wakes
+        assert wakes[0]["title"] == "Syntax guard: target(s) broken for 10+ min"
+        jq_assert(
+            wakes[0]["payload"],
+            '.syntax_guard_warning == true and .targets == ["dispatcher.sh"] '
+            'and (.first_failed_at_epoch | type == "number") and .first_failed_at_epoch == 1000 '
+            'and (.warn_seconds | type == "number") and .warn_seconds == 600',
+        )
+        st_after_ok = read_state()["syntax_guard"]["dispatcher.sh"]
+        assert st_after_ok["warned"] is True and st_after_ok["first_fail"] == 1000, st_after_ok
+
+        # (c) 壊れたままの2回目実行では wake しない
+        wakes, ran = run_cycle(1900, disp_ok=0, wake_fail=0)
+        assert wakes == [] and ran is True
+
+        # (e) 直ったら復旧 wake を1回だけ送り、状態から消える
+        wakes, ran = run_cycle(2000, disp_ok=1, wake_fail=0)
+        assert len(wakes) == 1 and ran is True
+        assert wakes[0]["title"] == "Syntax guard: target(s) recovered"
+        jq_assert(
+            wakes[0]["payload"],
+            '.syntax_guard_recovered == true and (.targets | type == "array") and .targets == ["dispatcher.sh"]',
+        )
+        assert "dispatcher.sh" not in read_state().get("syntax_guard", {})
+        wakes, ran = run_cycle(2100, disp_ok=1, wake_fail=0)
+        assert wakes == [] and ran is True
+
+        # (e) 対象ごとに独立：watchdog.sh は自分の600秒で警告、復旧 wake 失敗でも後段続行
+        wakes, ran = run_cycle(3000, wd_ok=0)
+        assert wakes == [] and ran is True
+        wakes, ran = run_cycle(3599, wd_ok=0)
+        assert wakes == [] and ran is True
+        wakes, ran = run_cycle(3600, wd_ok=0)
+        assert len(wakes) == 1 and ran is True
+        jq_assert(
+            wakes[0]["payload"],
+            '.syntax_guard_warning == true and .targets == ["watchdog.sh"] '
+            'and .first_failed_at_epoch == 3000 and .warn_seconds == 600',
+        )
+        assert read_state()["syntax_guard"]["watchdog.sh"]["warned"] is True
+        wakes, ran = run_cycle(3700, wd_ok=1, wake_fail=1)
+        assert len(wakes) == 1 and ran is True
+        assert wakes[0]["title"] == "Syntax guard: target(s) recovered"
+        assert "watchdog.sh" not in read_state().get("syntax_guard", {})
+        assert "Syntax guard recovery wake failed" in watchdog_log.read_text(encoding="utf-8")
+
+        # (e) 破損した状態ファイルでも落ちず、時計を仕切り直す
+        state_file.write_text("{not json", encoding="utf-8")
+        wakes, ran = run_cycle(5000, listener_ok=0)
+        assert wakes == [] and ran is True
+        st_l = read_state()["syntax_guard"]["listener.py"]
+        assert st_l["first_fail"] == 5000 and st_l["warned"] is False
+
+    return "begin〜end全体を実行し、jq検証済みJSONペイロード・wake失敗時のwarned未保存＆再試行＆後段処理続行・成功時のみwarned保存＆重複抑止・復旧・対象独立・破損状態耐性を確認"
+
+
+def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
+    """66. DM代行 auto_streak・proxy_ts・排他制御 (代行3連続で1→2→3到達しsend拒否・本人投稿で0リセット・resolve --reply-ts予備経路・50件上限切捨て・ts文字列完全一致)"""
+    uid = "U_NEIRO"  # Neiro
+    owner = owner_dm_poll.OWNER_ID
+
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "slack-owner-dm.json"
+        lock_path = Path(str(state_path) + ".lock")
+
+        # Backward-compat initial state WITHOUT "proxy_ts" key
+        init_data = {
+            "convs": {
+                "U_YANAYANA": {"top_ts": "1795000000.000000", "threads": {}, "handled": [], "auto_streak": 0},
+                uid: {"top_ts": "1795000000.000000", "threads": {}, "handled": [], "auto_streak": 0},
+                "U_ATA": {"top_ts": "1795000000.000000", "threads": {}, "handled": [], "auto_streak": 0},
+            },
+            "pending": [],
+            "last_wake_at": 0,
+        }
+        state_path.write_text(json.dumps(init_data), encoding="utf-8")
+
+        dm_feeds: Dict[str, List[Dict[str, Any]]] = {
+            "U_YANAYANA": [],
+            uid: [],
+            "U_ATA": [],
+        }
+        send_calls: List[Tuple[str, str, Optional[str]]] = []
+        send_responses: List[Optional[str]] = []
+
+        def fake_read_dm(user_id: str, limit: int = 6) -> List[Dict[str, Any]]:
+            return list(dm_feeds.get(user_id, []))
+
+        def fake_send_dm(user_id: str, message: str, thread_ts: Optional[str] = None) -> Optional[str]:
+            send_calls.append((user_id, message, thread_ts))
+            return send_responses.pop(0)
+
+        def read_st() -> Dict[str, Any]:
+            return json.loads(state_path.read_text(encoding="utf-8"))
+
+        def call_resolve(item_id: str, action: str, reply_ts: Optional[str] = None) -> Dict[str, Any]:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                owner_dm_poll.resolve(item_id, action, reply_ts=reply_ts)
+            return json.loads(buf.getvalue())
+
+        with patch.object(owner_dm_poll, "STATE_PATH", str(state_path)), patch.object(
+            owner_dm_poll, "read_dm", fake_read_dm
+        ), patch.object(owner_dm_poll, "send_dm", fake_send_dm):
+            # (a) 代行返信3回連続: send -> resolve(replied) -> poll で streak が 1 -> 2 -> 3 と上がり戻らない
+            # Round 1: result.content[0].text 内 JSON の "ts" 形式
+            dm_feeds[uid] = [{"author": uid, "ts": "1795000001.100000", "thread_latest": None}]
+            p1 = owner_dm_poll.poll()
+            assert lock_path.exists(), "state_lock must create STATE_PATH + '.lock'"
+            assert p1["wake"] is True and len(p1["pending"]) == 1
+            item1 = p1["pending"][0]["id"]
+
+            send_responses.append(
+                json.dumps({
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps({"ok": True, "ts": "1795000002.100000"})}]
+                    }
+                })
+            )
+            s1 = owner_dm_poll.send(uid, "返信1")
+            assert s1 == {"ok": True, "ts": "1795000002.100000"}, s1
+            assert read_st()["convs"][uid]["auto_streak"] == 0, "send must not increment auto_streak"
+            assert "1795000002.100000" in read_st()["convs"][uid]["proxy_ts"]
+
+            r1 = call_resolve(item1, "replied")
+            assert r1["ok"] is True and r1["auto_streak"] == 1
+
+            # Poll sees proxy reply + new counterpart msg -> streak stays 1
+            dm_feeds[uid] = [
+                {"author": uid, "ts": "1795000003.100000", "thread_latest": None},
+                {"author": owner, "ts": "1795000002.100000", "thread_latest": None},
+            ]
+            p2 = owner_dm_poll.poll()
+            assert read_st()["convs"][uid]["auto_streak"] == 1
+            assert len(p2["pending"]) == 1
+            item2 = p2["pending"][0]["id"]
+
+            # Round 2: "Message TS: ..." 表記 + thread_ts 指定
+            send_responses.append(
+                json.dumps({
+                    "result": {
+                        "content": [{"type": "text", "text": "Message sent!\nMessage TS: 1795000004.200000"}]
+                    }
+                })
+            )
+            s2 = owner_dm_poll.send(uid, "返信2", thread_ts="1795000003.100000")
+            assert s2 == {"ok": True, "ts": "1795000004.200000"}, s2
+            assert send_calls[-1] == (uid, "返信2", "1795000003.100000")
+            r2 = call_resolve(item2, "replied")
+            assert r2["ok"] is True and r2["auto_streak"] == 2
+
+            # Poll sees proxy reply + new counterpart msg -> streak stays 2
+            dm_feeds[uid] = [
+                {"author": uid, "ts": "1795000005.100000", "thread_latest": None},
+                {"author": owner, "ts": "1795000004.200000", "thread_latest": None},
+            ]
+            p3 = owner_dm_poll.poll()
+            assert read_st()["convs"][uid]["auto_streak"] == 2
+            item3 = p3["pending"][0]["id"]
+
+            # ts_not_found check (while streak < 3)
+            send_responses.append(
+                json.dumps({"result": {"content": [{"type": "text", "text": "sent without ts"}]}})
+            )
+            s_missing = owner_dm_poll.send(uid, "ts欠落テスト")
+            assert s_missing["ok"] is False and s_missing["error"] == "ts_not_found", s_missing
+            assert s_missing.get("message"), "ts_not_found should include explanation message"
+
+            # Round 3 -> streak reaches 3
+            send_responses.append(
+                json.dumps({
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps({"ts": "1795000006.300000"})}]
+                    }
+                })
+            )
+            s3 = owner_dm_poll.send(uid, "返信3")
+            assert s3 == {"ok": True, "ts": "1795000006.300000"}, s3
+            r3 = call_resolve(item3, "replied")
+            assert r3["ok"] is True and r3["auto_streak"] == 3
+
+            # Poll sees proxy reply only -> streak stays 3
+            dm_feeds[uid] = [{"author": owner, "ts": "1795000006.300000", "thread_latest": None}]
+            owner_dm_poll.poll()
+            assert read_st()["convs"][uid]["auto_streak"] == 3
+
+            # Attempt 4 at streak == 3 -> rejected with auto_streak_limit without calling send_dm
+            calls_before = len(send_calls)
+            s4 = owner_dm_poll.send(uid, "4回目は拒否")
+            assert s4 == {"ok": False, "error": "auto_streak_limit"}, s4
+            assert len(send_calls) == calls_before, "send_dm must not be called when auto_streak >= 3"
+
+            # Verify CLI exits with code 1 on auto_streak_limit
+            cli_chk = subprocess.run(
+                [
+                    str(PYTHON_BIN),
+                    "-c",
+                    (
+                        "import sys, json, owner_dm_poll; "
+                        f"owner_dm_poll.STATE_PATH = {str(state_path)!r}; "
+                        "res = owner_dm_poll.send('U_NEIRO', 'blocked'); "
+                        "print(json.dumps(res)); "
+                        "sys.exit(0 if res.get('ok') else 1)"
+                    ),
+                ],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                text=True,
+            )
+            assert cli_chk.returncode == 1
+            assert json.loads(cli_chk.stdout) == {"ok": False, "error": "auto_streak_limit"}
+
+            # (b) オーナー本人の実投稿（proxy_ts に無い ts）が水位より後にあれば（最新1件目でなくても）streak が 0 に戻る
+            dm_feeds[uid] = [
+                {"author": uid, "ts": "1795000008.000000", "thread_latest": None},
+                {"author": owner, "ts": "1795000007.500000", "thread_latest": None},  # real owner post
+                {"author": owner, "ts": "1795000006.300000", "thread_latest": None},
+            ]
+            p_reset = owner_dm_poll.poll()
+            assert read_st()["convs"][uid]["auto_streak"] == 0, "real owner post must reset auto_streak to 0"
+            assert len(p_reset["pending"]) == 1
+            item_after_reset = p_reset["pending"][0]["id"]
+
+            # (c) resolve --reply-ts の予備経路でも proxy_ts に記録され、次回 poll でリセットされない
+            r_fb = call_resolve(item_after_reset, "replied", reply_ts="1795000009.400000")
+            assert r_fb["ok"] is True and r_fb["auto_streak"] == 1
+            assert "1795000009.400000" in read_st()["convs"][uid]["proxy_ts"]
+            dm_feeds[uid] = [{"author": owner, "ts": "1795000009.400000", "thread_latest": None}]
+            owner_dm_poll.poll()
+            assert read_st()["convs"][uid]["auto_streak"] == 1, (
+                "reply_ts recorded via resolve --reply-ts must prevent streak reset"
+            )
+
+            # (e) ts は文字列のまま完全一致で扱われる（末尾ゼロ落ちなし）
+            send_responses.append(
+                json.dumps({
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps({"ts": "1795000100.100000"})}]
+                    }
+                })
+            )
+            s_zero = owner_dm_poll.send(uid, "末尾ゼロ保持確認")
+            assert s_zero == {"ok": True, "ts": "1795000100.100000"}
+            assert "1795000100.100000" in read_st()["convs"][uid]["proxy_ts"]
+            # Exact string match -> does NOT reset streak
+            dm_feeds[uid] = [{"author": owner, "ts": "1795000100.100000", "thread_latest": None}]
+            owner_dm_poll.poll()
+            assert read_st()["convs"][uid]["auto_streak"] == 1
+            # Numerically equal string without trailing zeros -> must NOT match, so resets streak!
+            st_mod = read_st()
+            st_mod["convs"][uid]["top_ts"] = "1795000099.000000"
+            state_path.write_text(json.dumps(st_mod), encoding="utf-8")
+            dm_feeds[uid] = [{"author": owner, "ts": "1795000100.1", "thread_latest": None}]
+            owner_dm_poll.poll()
+            assert read_st()["convs"][uid]["auto_streak"] == 0, (
+                "proxy_ts matching must be exact string equality without float normalization"
+            )
+
+            # (d) proxy_ts が50件を超えたら古いものから落ちる
+            st_cap = read_st()
+            st_cap["convs"][uid]["auto_streak"] = 0
+            st_cap["convs"][uid]["proxy_ts"] = []
+            state_path.write_text(json.dumps(st_cap), encoding="utf-8")
+            for i in range(55):
+                ts_val = f"1795001{i:03d}.100000"
+                send_responses.append(
+                    json.dumps({
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps({"ts": ts_val})}]
+                        }
+                    })
+                )
+                res_i = owner_dm_poll.send(uid, f"msg-{i}")
+                assert res_i == {"ok": True, "ts": ts_val}
+            final_proxy_ts = read_st()["convs"][uid]["proxy_ts"]
+            assert len(final_proxy_ts) == 50, f"expected 50 proxy_ts entries, got {len(final_proxy_ts)}"
+            assert final_proxy_ts[0] == "1795001005.100000"
+            assert final_proxy_ts[-1] == "1795001054.100000"
+            assert "1795001000.100000" not in final_proxy_ts
+
+    return "代行3連続でstreak 1→2→3＆auto_streak_limit拒否・本人実投稿(非最新含む)で0リセット・resolve --reply-ts記録・50件上限切捨て・ts末尾ゼロ文字列完全一致・flockロック生成を確認"
 
 
 def main() -> int:
@@ -9001,8 +9370,9 @@ def main() -> int:
         ("61. Watchdog 再起動前 py_compile ゲート (壊れた listener.py では再起動を見送り・直った後に再起動する)", test_watchdog_restart_py_compile_gate),
         ("62. フックの bash -n ガード (dispatcher.sh / watchdog.sh が構文エラーの回は実行を飛ばしてログに残す)", test_hook_bash_n_guards),
         ("63. Bot ユーザーIDの環境変数上書きの形状チェック (B始まり・xox始まりは例外で弾く、U/W始まりは採用、空・未設定は auth_test 経由へ)", test_resolve_bot_user_id_env_validation),
-        ("64. 構文ガードの10分エスカレーション (10分未満は静か・10分で警告1回・重複なし・直ったら復旧1回・対象ごとに独立・破損状態でも落ちない)", test_hook_syntax_guard_escalation),
+        ("64. 構文ガードの10分エスカレーション＆警告wake (jq組立てJSON検証・wake失敗時はwarned未保存＆後段続行・成功時のみwarned保存・復旧・対象独立・破損耐性)", test_hook_syntax_guard_escalation),
         ("65. auto_join statusファイル＆transient_retries (毎回上書き・吸収リトライのみ計上・最終失敗は二重計上なし・ドライラン無書込・状態エラー時error記録)", test_auto_join_last_status_and_transient_retries),
+        ("66. DM代行 auto_streak・proxy_ts・排他制御 (代行3連続で1→2→3＆send拒否・本人投稿で0リセット・resolve --reply-ts・50件上限・ts文字列完全一致)", test_owner_dm_poll_proxy_ts_and_auto_streak),
     ]
 
     print("=" * 72)

@@ -199,6 +199,7 @@ set -e
 # (hook_state_get/set: atomic tmp+mv, dry-run safe) under "syntax_guard".
 # Recovery wakes once too, but only if a warning was previously sent.
 SYNTAX_GUARD_WARN_SEC="${YAMA_SYNTAX_GUARD_WARN_SEC:-600}"
+_SG_WATCHDOG_LOG="${WATCHDOG_LOG:-${YAMA_WATCHDOG_LOG:-${PROJECT_DIR:-/home/hatch/workspace/slack-yama}/state/watchdog.log}}"
 syntax_guard_now() {
   if [[ -n "${YAMA_SYNTAX_GUARD_NOW:-}" ]]; then printf '%s' "${YAMA_SYNTAX_GUARD_NOW}"; else date +%s; fi
 }
@@ -206,7 +207,8 @@ syntax_guard_eval() {
   # $1 = target name, $2 = 1 if broken this cycle else 0.
   # Echoes "warn:<target>" when the warning is due, "recovered:<target>"
   # when a previously warned target is fixed, nothing otherwise.
-  # Best-effort by design: never fails the hook.
+  # Does not persist warned=true; caller calls syntax_guard_mark_warned only
+  # after the warning wake succeeds. Best-effort by design: never fails the hook.
   local target="$1" broken="$2"
   local now state first_fail warned age new_state
   now="$(syntax_guard_now)"
@@ -221,8 +223,6 @@ syntax_guard_eval() {
     fi
     age=$((now - first_fail))
     if [[ "$warned" != "true" && "$age" -ge "$SYNTAX_GUARD_WARN_SEC" ]]; then
-      new_state="$(printf '%s' "$state" | jq --arg t "$target" --argjson ff "$first_fail" '.syntax_guard[$t] = {"first_fail": $ff, "warned": true}' 2>/dev/null || echo '')"
-      [[ -n "$new_state" ]] && hook_state_set "$new_state" 2>/dev/null || true
       echo "warn:${target}"
     fi
   else
@@ -236,7 +236,20 @@ syntax_guard_eval() {
   fi
   return 0
 }
-# --- syntax-guard escalation: end ---
+syntax_guard_mark_warned() {
+  # $1 = target name. Marks syntax_guard[target].warned = true while
+  # preserving first_fail. Best-effort by design.
+  local target="$1"
+  local state first_fail new_state
+  state="$(hook_state_get 2>/dev/null || echo '{}')"
+  first_fail="$(printf '%s' "$state" | jq -r --arg t "$target" '.syntax_guard[$t].first_fail // 0' 2>/dev/null || echo 0)"
+  if [[ ! "$first_fail" =~ ^[0-9]+$ || "$first_fail" == "0" ]]; then
+    first_fail="$(syntax_guard_now)"
+  fi
+  new_state="$(printf '%s' "$state" | jq --arg t "$target" --argjson ff "$first_fail" '.syntax_guard[$t] = {"first_fail": $ff, "warned": true}' 2>/dev/null || echo '')"
+  [[ -n "$new_state" ]] && hook_state_set "$new_state" 2>/dev/null || true
+  return 0
+}
 
 # Evaluate the three syntax-guard targets and escalate if any has been broken
 # for 10+ minutes (or report a recovery). A warning wake takes this cycle;
@@ -253,12 +266,41 @@ for _sg in "watchdog.sh:${WD_OK:-1}" "dispatcher.sh:${DISP_OK:-1}" "listener.py:
   esac
 done
 if [[ "${#SYNTAX_WARN_TARGETS[@]}" -gt 0 ]]; then
-  _sg_first="$(printf '%s' "$(hook_state_get 2>/dev/null || echo '{}')" | jq -r '[.syntax_guard[] | .first_fail] | min // 0' 2>/dev/null || echo 0)"
-  wake "Syntax guard: target(s) broken for 10+ min" "{"syntax_guard_warning": true, "targets": $(printf '%s\n' "${SYNTAX_WARN_TARGETS[@]}" | jq -R . | jq -s -c .), "first_failed_at_epoch": ${_sg_first}, "warn_seconds": ${SYNTAX_GUARD_WARN_SEC}}"
+  if _sg_targets_json="$(printf '%s\n' "${SYNTAX_WARN_TARGETS[@]}" | jq -R . | jq -s -c . 2>/dev/null)" \
+    && _sg_first="$(printf '%s' "$(hook_state_get 2>/dev/null || echo '{}')" | jq -r --argjson targets "$_sg_targets_json" '[(.syntax_guard // {}) as $sg | $targets[] | $sg[.].first_fail | select(type == "number")] | min // 0' 2>/dev/null)" \
+    && _sg_payload="$(jq -n -c \
+      --argjson targets "$_sg_targets_json" \
+      --argjson first "$_sg_first" \
+      --argjson warn_sec "$SYNTAX_GUARD_WARN_SEC" \
+      '{"syntax_guard_warning": true, "targets": $targets, "first_failed_at_epoch": $first, "warn_seconds": $warn_sec}' 2>/dev/null)"; then
+    if wake "Syntax guard: target(s) broken for 10+ min" "$_sg_payload"; then
+      for _sg_t in "${SYNTAX_WARN_TARGETS[@]}"; do
+        syntax_guard_mark_warned "$_sg_t"
+      done
+    else
+      mkdir -p "$(dirname "$_SG_WATCHDOG_LOG")" 2>/dev/null || true
+      echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Syntax guard warning wake failed (targets=${SYNTAX_WARN_TARGETS[*]})" >> "$_SG_WATCHDOG_LOG" 2>/dev/null || true
+    fi
+  else
+    mkdir -p "$(dirname "$_SG_WATCHDOG_LOG")" 2>/dev/null || true
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Syntax guard warning payload build failed (targets=${SYNTAX_WARN_TARGETS[*]})" >> "$_SG_WATCHDOG_LOG" 2>/dev/null || true
+  fi
 fi
 if [[ "${#SYNTAX_RECOVERED_TARGETS[@]}" -gt 0 ]]; then
-  wake "Syntax guard: target(s) recovered" "{"syntax_guard_recovered": true, "targets": $(printf '%s\n' "${SYNTAX_RECOVERED_TARGETS[@]}" | jq -R . | jq -s -c .)}"
+  if _sg_rec_targets_json="$(printf '%s\n' "${SYNTAX_RECOVERED_TARGETS[@]}" | jq -R . | jq -s -c . 2>/dev/null)" \
+    && _sg_rec_payload="$(jq -n -c \
+      --argjson targets "$_sg_rec_targets_json" \
+      '{"syntax_guard_recovered": true, "targets": $targets}' 2>/dev/null)"; then
+    if ! wake "Syntax guard: target(s) recovered" "$_sg_rec_payload"; then
+      mkdir -p "$(dirname "$_SG_WATCHDOG_LOG")" 2>/dev/null || true
+      echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Syntax guard recovery wake failed (targets=${SYNTAX_RECOVERED_TARGETS[*]})" >> "$_SG_WATCHDOG_LOG" 2>/dev/null || true
+    fi
+  else
+    mkdir -p "$(dirname "$_SG_WATCHDOG_LOG")" 2>/dev/null || true
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Syntax guard recovery payload build failed (targets=${SYNTAX_RECOVERED_TARGETS[*]})" >> "$_SG_WATCHDOG_LOG" 2>/dev/null || true
+  fi
 fi
+# --- syntax-guard escalation: end ---
 
 case "$code" in
   0)
