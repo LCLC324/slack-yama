@@ -9945,6 +9945,238 @@ def test_listener_freeze_guards_and_sd_notify() -> str:
     return "pong途絶は接続中かつ90秒以上だけで終了・pong未受信や切断中は対象外・sd_notifyの送信/未設定no-op/抽象ソケット/送信失敗OSError・ユニットのWatchdogSec(>=180)とNotifyAccess=mainを確認"
 
 
+def test_history_compact_view_and_text_bounds() -> str:
+    """72. 長文バースト対策: history の文量上限 (コンパクト表示・1投稿の切り詰め・合計上限で古い順に省略・これ以前ありの明記・--limit上限・--raw)"""
+    parent_ts = "1700009000.000000"
+    calls: List[Dict[str, Any]] = []
+
+    def _bot_msg(i: int, text: str) -> Dict[str, Any]:
+        return {
+            "type": "message",
+            "user": f"U_{i:03d}",
+            "bot_id": "B_NEIRO",
+            "app_id": "A_X",
+            "team": "T_X",
+            "text": text,
+            "ts": f"17000090{i:02d}.000100",
+            "thread_ts": parent_ts,
+            "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_section",
+                                                           "elements": [{"type": "text", "text": text}]}]}],
+            "bot_profile": {"name": "Neiro", "icons": {"image_72": "https://x/" + "i" * 200}},
+            "attachments": [{"title": "GitHub - repo", "text": "d" * 1000,
+                             "from_url": "https://github.com/x/y", "service_icon": "https://x/icon.png"}],
+            "metadata": {"event_type": "neiro_reply", "event_payload": {"event_id": f"Ev{i}"}},
+        }
+
+    class ThreadClient:
+        def __init__(self, messages: List[Dict[str, Any]]) -> None:
+            self.messages = messages
+
+        def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+            calls.append(kw)
+            return {"ok": True, "messages": self.messages, "has_more": True}
+
+        def conversations_history(self, **kw: Any) -> Dict[str, Any]:
+            calls.append(kw)
+            return {"ok": True, "messages": self.messages, "has_more": True}
+
+    parent = {"type": "message", "user": "U_OWNER", "text": "親投稿", "ts": parent_ts,
+              "thread_ts": parent_ts, "reply_count": 120, "reply_users": ["U_1"] * 50,
+              "blocks": [{"type": "rich_text", "elements": []}]}
+
+    def run(args: Namespace) -> Dict[str, Any]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cmd_history(args)
+        assert rc == 0
+        return json.loads(buf.getvalue())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "x.db")
+
+        # 1) Compact view: render-only fields dropped, judgement fields kept, size shrinks.
+        replies = [_bot_msg(i, f"返信{i} " + "あ" * 200) for i in range(1, 21)]
+        client = ThreadClient([parent] + replies)
+        args = Namespace(channel="C_T", thread_ts=parent_ts, limit=20, db=db)
+        with patch.object(agent_tools, "get_web_client", return_value=client):
+            out = run(args)
+            raw = run(Namespace(channel="C_T", thread_ts=parent_ts, limit=20, db=db, raw=True))
+        m = out["messages"][1]
+        for k in ("blocks", "bot_profile", "app_id", "team"):
+            assert k not in m, f"{k} must be dropped: {m.keys()}"
+        assert m["user"] == "U_001" and m["bot_id"] == "B_NEIRO" and m["is_bot"] == 1
+        assert m["bot_name"] == "Neiro" and m["metadata"]["event_type"] == "neiro_reply"
+        assert m["text"] == replies[0]["text"] and m["thread_ts"] == parent_ts
+        att = m["attachments"][0]
+        assert att["title"] == "GitHub - repo" and att["url"] == "https://github.com/x/y"
+        assert att["text"].startswith("d" * 300) and "省略あり" in att["text"] and "service_icon" not in att
+        assert "reply_users" not in out["messages"][0] and out["messages"][0]["reply_count"] == 120
+        assert "blocks" in raw["messages"][1], "--raw must keep the unmodified messages"
+        compact_bytes = len(json.dumps(out, ensure_ascii=False, indent=2))
+        raw_bytes = len(json.dumps(raw, ensure_ascii=False, indent=2))
+        assert compact_bytes * 2 < raw_bytes, (compact_bytes, raw_bytes)
+        # "これ以前あり": 120 replies in thread, 20 returned -> 100 older omitted.
+        assert out["older_omitted"] == 100 and "これ以前のスレッド返信 100 件は省略" in out["note"]
+
+        # 2) Per-message cap: one huge post is cut with an explicit marker.
+        huge = "い" * (agent_tools.HISTORY_MESSAGE_TEXT_LIMIT + 5000)
+        client2 = ThreadClient([parent, _bot_msg(1, huge), _bot_msg(2, "短い返信")])
+        with patch.object(agent_tools, "get_web_client", return_value=client2):
+            out2 = run(Namespace(channel="C_T", thread_ts=parent_ts, limit=20, db=db))
+        hm = out2["messages"][1]
+        assert hm["text_truncated"] is True and hm["text_length"] == len(huge)
+        assert hm["text"].startswith("い" * agent_tools.HISTORY_MESSAGE_TEXT_LIMIT)
+        assert f"全{len(huge)}字中 先頭{agent_tools.HISTORY_MESSAGE_TEXT_LIMIT}字" in hm["text"]
+        assert out2["text_truncated_count"] == 1 and "切り詰め" in out2["note"]
+        assert out2["messages"][2]["text"] == "短い返信" and "text_truncated" not in out2["messages"][2]
+
+        # 3) Total budget: oldest replies dropped first; parent and newest always kept.
+        n_long = 30
+        long_replies = [_bot_msg(i, f"R{i:02d}" + "う" * 2500) for i in range(1, n_long + 1)]
+        client3 = ThreadClient([dict(parent, reply_count=n_long)] + long_replies)
+        with patch.object(agent_tools, "get_web_client", return_value=client3):
+            out3 = run(Namespace(channel="C_T", thread_ts=parent_ts, limit=50, db=db))
+        assert out3["text_chars"] <= agent_tools.HISTORY_TOTAL_TEXT_BUDGET
+        assert out3["messages"][0]["ts"] == parent_ts
+        assert out3["messages"][-1]["text"].startswith(f"R{n_long:02d}")
+        kept = out3["count"] - 1
+        assert out3["older_omitted"] == n_long - kept and kept < n_long
+        assert out3["messages"][1]["text"].startswith(f"R{n_long - kept + 1:02d}"), "must drop oldest first"
+        assert "文量上限" in out3["note"]
+
+        # 4) --limit is clamped to HISTORY_MAX_LIMIT (and the clamp is reported).
+        calls.clear()
+        with patch.object(agent_tools, "get_web_client", return_value=ThreadClient([parent])):
+            out4 = run(Namespace(channel="C_T", thread_ts=parent_ts, limit=500, db=db))
+        assert calls[-1]["limit"] == agent_tools.HISTORY_MAX_LIMIT
+        assert out4["limit_clamped_from"] == 500 and out4["limit"] == agent_tools.HISTORY_MAX_LIMIT
+
+        # 5) Channel history: has_more -> "これ以前あり" note; empty text falls back to blocks.
+        blk = {"type": "message", "user": "U_A", "text": "", "ts": "1700009100.000000",
+               "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "ブロックだけの本文"}}]}
+        with patch.object(agent_tools, "get_web_client", return_value=ThreadClient([blk])):
+            out5 = run(Namespace(channel="C_T", thread_ts=None, limit=20, db=db))
+        assert out5["messages"][0]["text"] == "ブロックだけの本文" and out5["messages"][0]["text_from_blocks"]
+        assert "これ以前のチャンネル投稿あり" in out5["note"] and "older_omitted" not in out5
+
+    return (
+        f"blocks/bot_profile等を除去し判断材料(user/bot名/本文/metadata/リンク題)は維持・サイズ{raw_bytes}→{compact_bytes}字、"
+        f"1投稿{agent_tools.HISTORY_MESSAGE_TEXT_LIMIT}字で省略明記、合計{agent_tools.HISTORY_TOTAL_TEXT_BUDGET}字超は古い順に省略(親と最新は維持)、"
+        f"これ以前あり件数の明記、--limit {agent_tools.HISTORY_MAX_LIMIT}上限、--raw、blocksのみ本文の救済を確認"
+    )
+
+
+def test_dispatcher_batch_weight_budget_and_payload_text_cap() -> str:
+    """73. 長文バースト対策: dispatcher の重さ予算 (重い回は件数を減らし残りはPENDINGで次回・順序維持・先頭は必ず取る・payload本文の切り詰めとevent-textで全文)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        db_path = state_dir / "slack_events.db"
+        payload_path = state_dir / "payload.json"
+        mode_file = Path(tmp) / "mode.txt"
+        mode_file.write_text("shadow\n", encoding="utf-8")
+        init_db(db_path)
+        env = os.environ.copy()
+        for k in ("YAMA_PAYLOAD_TEXT_LIMIT", "YAMA_EVENT_WEIGHT_OVERHEAD", "YAMA_BATCH_WEIGHT_BUDGET"):
+            env.pop(k, None)
+        env.update({
+            "YAMA_STATE_DIR": str(state_dir),
+            "YAMA_DB_PATH": str(db_path),
+            "YAMA_PAYLOAD_PATH": str(payload_path),
+            "YAMA_LOCK_PATH": str(state_dir / "dispatcher.lock"),
+            "YAMA_MODE_FILE": str(mode_file),
+            "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+            "YAMA_OPS_ALERTS_PATH": str(state_dir / "ops_alerts.jsonl"),
+        })
+
+        def add(i: int, text: str) -> None:
+            handle_event_payload(
+                {"event_id": f"Ev_W_{i:02d}",
+                 "event": {"type": "message", "channel": "C_BOARD", "user": f"U_{i:02d}",
+                           "text": text, "ts": f"17000002{i:02d}.000000"}},
+                bot_user_id="U_YAMA_BOT", db_path=db_path,
+            )
+
+        def dispatch() -> Dict[str, Any]:
+            res = subprocess.run(["bash", str(DISPATCHER_SH)], env=env, capture_output=True, text=True)
+            assert res.returncode == 0, f"rc={res.returncode} out={res.stdout} err={res.stderr}"
+            return json.loads(payload_path.read_text(encoding="utf-8"))
+
+        def finish(payload: Dict[str, Any]) -> None:
+            for ev in payload["events"]:
+                commit_event(ev["event_id"], "DONE", db_path=db_path)
+
+        # 1) Ten 1,500-char posts (weight 2,500 each, budget 15,000) -> 6 now, 4 deferred (PENDING), FIFO.
+        for i in range(1, 11):
+            add(i, f"#{i:02d} " + "え" * 1496)
+        p1 = dispatch()
+        ids1 = [e["event_id"] for e in p1["events"]]
+        assert ids1 == [f"Ev_W_{i:02d}" for i in range(1, 7)], ids1
+        assert p1["count"] == 6 and p1["batch_weight"] == 6 * 2500
+        assert p1["deferred"]["count"] == 4 and p1["deferred"]["reason"] == "batch_weight_budget"
+        assert count_events(db_path, "PROCESSING") == 6 and count_events(db_path, "PENDING") == 4
+        finish(p1)
+        p2 = dispatch()
+        assert [e["event_id"] for e in p2["events"]] == [f"Ev_W_{i:02d}" for i in range(7, 11)]
+        assert "deferred" not in p2, "nothing left -> no deferred block"
+        finish(p2)
+        assert count_events(db_path, "PENDING") == 0 and count_events(db_path, "DONE") == 10
+
+        # 2) A single huge post is always taken first (no starvation), and its payload text is capped;
+        #    the next (small) post waits for the following cycle rather than jumping ahead.
+        #    (Default budget: capped weight 5,000 + 1,006 fits, so both go together.)
+        huge = "お" * 20000
+        add(20, huge)
+        add(21, "短い質問です")
+        env["YAMA_BATCH_WEIGHT_BUDGET"] = "3000"  # below the huge event's own weight
+        p3 = dispatch()
+        env.pop("YAMA_BATCH_WEIGHT_BUDGET")
+        assert [e["event_id"] for e in p3["events"]] == ["Ev_W_20"]
+        ev = p3["events"][0]
+        assert ev["text_truncated"] is True and ev["text_length"] == 20000
+        assert ev["text"].startswith("お" * 4000) and len(ev["text"]) < 4200
+        assert "event-text --event-id Ev_W_20" in ev["text"]
+        assert p3["deferred"]["count"] == 1
+        payload_bytes = len(payload_path.read_bytes())
+        # Full text remains in the DB and is readable via event-text.
+        res_t = subprocess.run(
+            [str(PYTHON_BIN), str(AGENT_TOOLS_PY), "--db", str(db_path), "event-text", "--event-id", "Ev_W_20"],
+            capture_output=True, text=True,
+        )
+        assert res_t.returncode == 0, res_t.stderr
+        full = json.loads(res_t.stdout)
+        assert full["text"] == huge and full["text_length"] == 20000
+        res_nf = subprocess.run(
+            [str(PYTHON_BIN), str(AGENT_TOOLS_PY), "--db", str(db_path), "event-text", "--event-id", "Ev_NOPE"],
+            capture_output=True, text=True,
+        )
+        assert res_nf.returncode == 1 and "event_not_found" in res_nf.stderr
+        finish(p3)
+        p4 = dispatch()
+        assert [e["event_id"] for e in p4["events"]] == ["Ev_W_21"] and "text_truncated" not in p4["events"][0]
+        finish(p4)
+
+        # 3) Typical light batch (12 short posts) is unchanged: 10 + 2 (reason batch_max_events).
+        for i in range(30, 42):
+            add(i, f"普通の投稿 {i}")
+        p5 = dispatch()
+        assert p5["count"] == 10 and p5["deferred"] == {**p5["deferred"], "count": 2, "reason": "batch_max_events"}
+
+        # 4) Budget is tunable via env (0 disables the weight cap).
+        finish(p5)
+        finish(dispatch())
+        for i in range(50, 55):
+            add(i, "か" * 3000)
+        env["YAMA_BATCH_WEIGHT_BUDGET"] = "0"
+        p6 = dispatch()
+        assert p6["count"] == 5 and "deferred" not in p6
+
+    return (
+        f"1,500字x10件→6件+残4件PENDING(次回4件・FIFO)、2万字1件は予算超でも先頭で必ず取り後続は次回・payload本文を4,000字に切詰め"
+        f"(payload {payload_bytes}B・event-textで全文20,000字取得・未存在はexit 1)、軽い12件は従来通り10+2、予算0で無効化を確認"
+    )
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -10018,6 +10250,8 @@ def main() -> int:
         ("69. Reaper差し戻し上限 (reap_count後方互換追加・3回目でFAILED reaped_too_many_times・retry_count不変・実行ごと集約アラート・手動requeueのみ0リセット)", test_reaper_reap_count_cap_and_requeue),
         ("70. Backfill履歴ページング (30件x最大3ページ・打ち切り警告をstderr＋outboxにエッジ通知・解消時1回・書込失敗時は次回再試行)", test_backfill_history_paging_and_truncation_alert),
         ("71. リスナー凍結対策 (pong途絶90秒判定・sd_notify WATCHDOG=1・ユニットWatchdogSec/NotifyAccess)", test_listener_freeze_guards_and_sd_notify),
+        ("72. 長文バースト対策: history の文量上限 (コンパクト表示・1投稿3,000字・合計40,000字・これ以前あり明記・--limit 50上限・--raw)", test_history_compact_view_and_text_bounds),
+        ("73. 長文バースト対策: dispatcher の重さ予算 (重い回は件数を減らし残りPENDING・FIFO・先頭必取・payload本文4,000字＋event-text)", test_dispatcher_batch_weight_budget_and_payload_text_cap),
     ]
 
     print("=" * 72)

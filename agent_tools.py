@@ -73,6 +73,20 @@ HISTORY_RETRY_BACKOFFS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
 CHANNEL_HISTORY_BOUND_LIMIT: int = 50
 THREAD_REPLIES_PAGE_LIMIT: int = 50
 THREAD_REPLIES_MAX_PAGES: int = 20
+# Burst cap (2026-11-22): bound how much text one `history` call hands the worker.
+# Measured on the largest real thread (189 msgs): the raw Slack JSON for --limit 20
+# was 67,980 bytes for only 7,662 chars of message text (blocks / bot_profile /
+# attachments dominated), and --limit 200 was 658,266 bytes. The compact view keeps
+# the judgement material (who / when / text / thread / metadata / link titles) and
+# drops the render-only fields. Limits:
+#   HISTORY_MAX_LIMIT          : --limit is clamped to this (Slack's per-call max is 1000)
+#   HISTORY_MESSAGE_TEXT_LIMIT : per-message text cap (longest stored post so far: 2,121 chars)
+#   HISTORY_TOTAL_TEXT_BUDGET  : total text cap per call; oldest non-parent messages are
+#                                dropped first and counted in older_omitted
+HISTORY_MAX_LIMIT: int = 50
+HISTORY_MESSAGE_TEXT_LIMIT: int = 3000
+HISTORY_TOTAL_TEXT_BUDGET: int = 40000
+HISTORY_ATTACHMENT_TEXT_LIMIT: int = 300
 # Delayed-retry answered check: read at most one page of this many replies from the
 # scan start (event ts - 60s). If no qualifying answer is in that page and more
 # replies remain, the check is incomplete and the resend is refused (fail-closed).
@@ -672,7 +686,7 @@ def fetch_history(
             sleep_fn=sleep_fn,
         )
         messages = resp.get("messages", [])
-        return {
+        result = {
             "ok": True,
             "source": "slack_api",
             "channel": channel,
@@ -680,6 +694,12 @@ def fetch_history(
             "count": len(messages),
             "messages": messages,
         }
+        try:
+            if resp.get("has_more"):
+                result["has_more"] = True
+        except Exception:
+            pass
+        return result
     except SlackApiError as exc:
         if not _is_transient_slack_api_error(exc):
             raise
@@ -714,14 +734,172 @@ def fetch_history(
         }
 
 
+def truncate_text_for_worker(text: Any, limit: int) -> Tuple[str, bool, int]:
+    """Cap text at `limit` chars. Returns (text, truncated, original_length).
+    A truncated text keeps its head and ends with an explicit omission marker so the
+    worker never mistakes it for the whole post."""
+    s = "" if text is None else str(text)
+    n = len(s)
+    if limit <= 0 or n <= limit:
+        return s, False, n
+    return f"{s[:limit]}…［省略あり：全{n}字中 先頭{limit}字のみ表示］", True, n
+
+
+def _blocks_plain_text(blocks: Any) -> str:
+    """Collect visible text from Slack blocks (rich_text / section / context).
+    Used only when a message's top-level `text` is empty."""
+    parts: List[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            t = node.get("text")
+            if isinstance(t, str) and node.get("type") in ("text", "mrkdwn", "plain_text"):
+                parts.append(t)
+            elif node.get("type") == "link" and isinstance(node.get("url"), str):
+                parts.append(node.get("text") or node["url"])
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+
+    _walk(blocks)
+    return "".join(parts).strip()
+
+
+_COMPACT_KEEP_KEYS: Tuple[str, ...] = (
+    "user", "username", "bot_id", "subtype", "text", "ts", "thread_ts", "is_bot",
+    "reply_count", "metadata",
+)
+
+
+def compact_history_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce one Slack message to the fields the worker judges with.
+    Drops render-only fields (blocks, bot_profile icons, team, app_id, reply_users, ...).
+    Keeps who/when/text/thread/metadata, the bot display name, link-unfurl titles
+    (capped) and file names. Text is capped at HISTORY_MESSAGE_TEXT_LIMIT."""
+    if not isinstance(msg, dict):
+        return msg
+    out: Dict[str, Any] = {k: msg[k] for k in _COMPACT_KEEP_KEYS if k in msg}
+    if "is_bot" not in out and (msg.get("bot_id") or msg.get("subtype") == "bot_message"):
+        out["is_bot"] = 1
+    bp = msg.get("bot_profile")
+    if isinstance(bp, dict) and bp.get("name"):
+        out["bot_name"] = bp["name"]
+    if not str(out.get("text") or "").strip() and msg.get("blocks"):
+        from_blocks = _blocks_plain_text(msg.get("blocks"))
+        if from_blocks:
+            out["text"] = from_blocks
+            out["text_from_blocks"] = True
+    if "text" in out:
+        t, truncated, n = truncate_text_for_worker(out["text"], HISTORY_MESSAGE_TEXT_LIMIT)
+        out["text"] = t
+        if truncated:
+            out["text_truncated"] = True
+            out["text_length"] = n
+    atts = msg.get("attachments")
+    if isinstance(atts, list) and atts:
+        compact_atts: List[Dict[str, Any]] = []
+        for a in atts:
+            if not isinstance(a, dict):
+                continue
+            ca: Dict[str, Any] = {}
+            if a.get("title"):
+                ca["title"] = truncate_text_for_worker(a["title"], HISTORY_ATTACHMENT_TEXT_LIMIT)[0]
+            body = a.get("text") or a.get("pretext") or ("" if a.get("title") else a.get("fallback"))
+            if body:
+                ca["text"] = truncate_text_for_worker(body, HISTORY_ATTACHMENT_TEXT_LIMIT)[0]
+            url = a.get("from_url") or a.get("original_url") or a.get("title_link")
+            if url:
+                ca["url"] = url
+            if ca:
+                compact_atts.append(ca)
+        if compact_atts:
+            out["attachments"] = compact_atts
+    files = msg.get("files")
+    if isinstance(files, list) and files:
+        out["files"] = [
+            {k: f[k] for k in ("name", "title", "mimetype") if isinstance(f, dict) and f.get(k)}
+            for f in files
+            if isinstance(f, dict)
+        ]
+    return out
+
+
+def compact_history_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Bound one history result for the worker.
+    1) every message is compacted (compact_history_message);
+    2) if the total text exceeds HISTORY_TOTAL_TEXT_BUDGET, the oldest messages are
+       dropped first (the thread parent and the newest message are always kept);
+    3) replies older than what was returned are counted in `older_omitted` and
+       described in `note`, so the worker knows earlier context exists."""
+    out = dict(result)
+    messages = [compact_history_message(m) for m in (result.get("messages") or [])]
+    thread_ts = result.get("thread_ts")
+
+    parent: Optional[Dict[str, Any]] = None
+    rest = messages
+    if thread_ts and messages and str(messages[0].get("ts")) == str(thread_ts):
+        parent, rest = messages[0], messages[1:]
+
+    slack_omitted = 0
+    if parent is not None:
+        try:
+            reply_count = int(parent.get("reply_count") or 0)
+        except (TypeError, ValueError):
+            reply_count = 0
+        slack_omitted = max(0, reply_count - len(rest))
+
+    def _tlen(m: Dict[str, Any]) -> int:
+        return len(str(m.get("text") or ""))
+
+    total = sum(_tlen(m) for m in messages)
+    budget_omitted = 0
+    while total > HISTORY_TOTAL_TEXT_BUDGET and len(rest) > 1:
+        dropped = rest.pop(0)
+        total -= _tlen(dropped)
+        budget_omitted += 1
+
+    messages = ([parent] if parent is not None else []) + rest
+    out["messages"] = messages
+    out["count"] = len(messages)
+    out["text_chars"] = total
+    truncated_count = sum(1 for m in messages if m.get("text_truncated"))
+    if truncated_count:
+        out["text_truncated_count"] = truncated_count
+
+    older = slack_omitted + budget_omitted
+    notes: List[str] = []
+    if older > 0:
+        out["older_omitted"] = older
+        notes.append(f"これ以前のスレッド返信 {older} 件は省略（親投稿と直近の返信のみ表示）")
+    elif not thread_ts and result.get("has_more"):
+        notes.append("これ以前のチャンネル投稿あり（直近分のみ表示）")
+    if budget_omitted:
+        notes.append(f"うち {budget_omitted} 件は文量上限（合計{HISTORY_TOTAL_TEXT_BUDGET}字）による省略")
+    if truncated_count:
+        notes.append(f"長文 {truncated_count} 件は先頭{HISTORY_MESSAGE_TEXT_LIMIT}字で切り詰め（省略あり）")
+    if notes:
+        out["note"] = "。".join(notes)
+    return out
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     try:
+        requested = int(args.limit) if args.limit is not None else 20
+        limit = max(1, min(requested, HISTORY_MAX_LIMIT))
         output = fetch_history(
             channel=args.channel,
             thread_ts=args.thread_ts,
-            limit=args.limit,
+            limit=limit,
             db_path=Path(args.db),
         )
+        if not getattr(args, "raw", False):
+            output = compact_history_result(output)
+        if limit != requested:
+            output["limit_clamped_from"] = requested
+            output["limit"] = limit
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
     except SlackApiError as exc:
@@ -1714,6 +1892,20 @@ def get_event_by_id(
             (event_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def cmd_event_text(args: argparse.Namespace) -> int:
+    """Full text of one event. The dispatcher caps event text in payload.json
+    (text_truncated / text_length); this is how the worker reads the rest."""
+    row = get_event_by_id(args.event_id, db_path=Path(args.db))
+    if row is None:
+        print(json.dumps({"ok": False, "error": "event_not_found", "event_id": args.event_id},
+                         ensure_ascii=False), file=sys.stderr)
+        return 1
+    text = row.get("text") or ""
+    print(json.dumps({"ok": True, "event_id": args.event_id, "text_length": len(text), "text": text},
+                     ensure_ascii=False, indent=2))
+    return 0
 
 
 def format_delayed_retry_prefix(first_unverifiable_at: Any) -> Optional[str]:
@@ -2813,8 +3005,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_history = subparsers.add_parser("history", help="Read channel or thread conversation history")
     p_history.add_argument("--channel", required=True, help="Slack channel ID")
     p_history.add_argument("--thread-ts", default=None, help="Thread parent timestamp (optional)")
-    p_history.add_argument("--limit", type=int, default=20, help="Number of messages to fetch (default: 20)")
+    p_history.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help=f"Number of messages to fetch (default: 20, clamped to {HISTORY_MAX_LIMIT})",
+    )
+    p_history.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print the unmodified Slack messages (debug only; default is the bounded compact view)",
+    )
     p_history.set_defaults(func=cmd_history)
+
+    # event-text
+    p_event_text = subparsers.add_parser(
+        "event-text",
+        help="Print the full stored text of one event (payload text may be truncated)",
+    )
+    p_event_text.add_argument("--event-id", required=True, help="Event ID")
+    p_event_text.set_defaults(func=cmd_event_text)
 
     # reply
     p_reply = subparsers.add_parser("reply", help="Post a message or reply as Yama bot")
