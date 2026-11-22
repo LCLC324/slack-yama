@@ -5,6 +5,15 @@
 # - Uses flock to prevent concurrent execution
 # - Fetches up to 10 oldest PENDING events from SQLite, transitions them to PROCESSING,
 #   and writes them to state/payload.json
+# - Burst cap (2026-11-22): the batch also stops early once the summed event
+#   weight (min(len(text), PAYLOAD_TEXT_LIMIT) + EVENT_WEIGHT_OVERHEAD per event)
+#   would exceed BATCH_WEIGHT_BUDGET. The oldest event is always taken, and
+#   order is never skipped, so a heavy event cannot starve. Deferred events stay
+#   PENDING (picked up next cycle; ops_monitor's PENDING-stale alert covers
+#   them if they linger) and are counted in payload.deferred.
+#   Event text longer than PAYLOAD_TEXT_LIMIT is cut in the payload only (DB
+#   keeps the full text) with text_truncated/text_length and a marker telling
+#   the worker to run `agent_tools.py event-text --event-id <id>`.
 # - Exit codes & stdout for hook/caller decision:
 #     0 / "DISPATCHED:<N>" : N events transitioned to PROCESSING and written to state/payload.json
 #     1 / "NO_EVENTS"      : No PENDING events found (do not wake agent)
@@ -31,6 +40,11 @@ PROCESSING_TIMEOUT_SEC="${YAMA_PROCESSING_TIMEOUT_SEC:-900}"
 # which the dispatch hook delivers to the ops chat via wake.
 REAP_LIMIT="${YAMA_REAP_LIMIT:-3}"
 OPS_ALERTS_PATH="${YAMA_OPS_ALERTS_PATH:-${STATE_DIR}/ops_alerts.jsonl}"
+# Burst cap (see header). Defaults: 10 typical events (avg 363 chars measured)
+# weigh ~13.6k and pass unchanged; ten 1,500-char posts are split 6 + 4.
+PAYLOAD_TEXT_LIMIT="${YAMA_PAYLOAD_TEXT_LIMIT:-4000}"
+EVENT_WEIGHT_OVERHEAD="${YAMA_EVENT_WEIGHT_OVERHEAD:-1000}"
+BATCH_WEIGHT_BUDGET="${YAMA_BATCH_WEIGHT_BUDGET:-15000}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN="python3"
@@ -55,7 +69,7 @@ if [[ ! -f "${DB_PATH}" ]]; then
     exit 1
 fi
 
-"${PYTHON_BIN}" - "${DB_PATH}" "${PAYLOAD_PATH}" "${MODE_FILE}" "${PROCESSING_TIMEOUT_SEC}" "${REAP_LIMIT}" "${OPS_ALERTS_PATH}" <<'PYEOF'
+"${PYTHON_BIN}" - "${DB_PATH}" "${PAYLOAD_PATH}" "${MODE_FILE}" "${PROCESSING_TIMEOUT_SEC}" "${REAP_LIMIT}" "${OPS_ALERTS_PATH}" "${PAYLOAD_TEXT_LIMIT}" "${EVENT_WEIGHT_OVERHEAD}" "${BATCH_WEIGHT_BUDGET}" <<'PYEOF'
 import fcntl
 import json
 import os
@@ -77,6 +91,17 @@ processing_timeout_sec = (
 )
 reap_limit = int(sys.argv[5]) if len(sys.argv) > 5 else 3
 ops_alerts_path = Path(sys.argv[6]) if len(sys.argv) > 6 else db_path.parent / "ops_alerts.jsonl"
+payload_text_limit = int(sys.argv[7]) if len(sys.argv) > 7 else 4000
+event_weight_overhead = int(sys.argv[8]) if len(sys.argv) > 8 else 1000
+batch_weight_budget = int(sys.argv[9]) if len(sys.argv) > 9 else 15000
+BATCH_MAX_EVENTS = 10
+
+
+def event_weight(row):
+    text_len = len(row["text"] or "")
+    if payload_text_limit > 0:
+        text_len = min(text_len, payload_text_limit)
+    return text_len + event_weight_overhead
 
 
 def append_ops_alert(entry):
@@ -261,13 +286,25 @@ try:
     ).fetchall()
 
     rows = []
+    eligible_count = 0
+    batch_weight = 0
+    budget_stopped = False
     for r in pending_rows:
         retry_dt = parse_utc_timestamp(r["next_retry_at"])
         if retry_dt is not None and retry_dt > now_utc:
             continue
+        eligible_count += 1
+        if budget_stopped or len(rows) >= BATCH_MAX_EVENTS:
+            continue
+        w = event_weight(r)
+        # Burst cap: keep FIFO order; stop (never skip ahead) once the next event
+        # would overflow the budget. The first event is always taken.
+        if rows and batch_weight_budget > 0 and batch_weight + w > batch_weight_budget:
+            budget_stopped = True
+            continue
         rows.append(r)
-        if len(rows) >= 10:
-            break
+        batch_weight += w
+    deferred_count = eligible_count - len(rows)
 
     if not rows:
         conn.commit()
@@ -295,6 +332,14 @@ try:
         item = dict(r)
         item["status"] = "PROCESSING"
         item["next_retry_at"] = None
+        full_text = item.get("text") or ""
+        if payload_text_limit > 0 and len(full_text) > payload_text_limit:
+            item["text"] = (
+                f"{full_text[:payload_text_limit]}…［省略あり：全{len(full_text)}字中 先頭{payload_text_limit}字のみ。"
+                f"全文は ./venv/bin/python agent_tools.py event-text --event-id {item['event_id']}］"
+            )
+            item["text_truncated"] = True
+            item["text_length"] = len(full_text)
         events_data.append(item)
 
     payload = {
@@ -302,7 +347,15 @@ try:
         "mode": mode,
         "count": len(events_data),
         "events": events_data,
+        "batch_weight": batch_weight,
     }
+    if deferred_count > 0:
+        payload["deferred"] = {
+            "count": deferred_count,
+            "reason": "batch_weight_budget" if budget_stopped else "batch_max_events",
+            "budget": batch_weight_budget,
+            "note": f"未処理 {deferred_count} 件は PENDING のまま次回以降に回した（取りこぼしではない）",
+        }
 
     payload_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = payload_path.with_suffix(".json.tmp")
