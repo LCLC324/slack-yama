@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Yama Slack Backfill Script
-- Fetches recent messages (latest 30) and thread replies (up to 30 when reply_count > 0)
-  for target channels via Slack Web API
+- Fetches recent messages (30 per page, up to HISTORY_MAX_PAGES=3 pages = ~90 via
+  cursor paging) and thread replies (paged, when reply_count > 0) for target channels
+  via Slack Web API. If more history remains after the page cap, the channel is
+  marked truncated: logged to stderr and, edge-triggered (once when truncation
+  starts, once when it clears), appended to the ops alert outbox
+  (state/ops_alerts.jsonl) that the dispatch hook delivers to the ops chat.
 - Filters messages with listener.should_ignore_event and persists missing messages
   via listener.save_event (using default channel_ts fallback event_id)
 - Restricts scope to messages newer than (channel max ts in DB - 3600s),
@@ -15,6 +19,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -38,6 +43,9 @@ TARGET_CHANNELS: Tuple[str, ...] = (
 )
 
 HISTORY_LIMIT = 30
+HISTORY_MAX_PAGES = 3
+TRUNCATION_STATE_FILENAME = "backfill_truncation.json"
+OPS_ALERTS_FILENAME = "ops_alerts.jsonl"
 REPLIES_LIMIT = 30
 MAX_TS_LOOKBACK_SEC = 3600.0
 EMPTY_DB_LOOKBACK_SEC = 86400.0
@@ -99,10 +107,14 @@ def backfill_channel(
     ignored_user_ids: Optional[Set[str]] = None,
     now: Optional[float] = None,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    page_info: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
     Fetch history and thread replies for a single channel, filter and insert missing
     messages into SQLite, and return the number of newly inserted rows.
+    If page_info (a dict) is given, it is filled with {"pages": N, "truncated": bool,
+    "oldest_fetched_ts": ...}; truncated=True means more history remained after
+    HISTORY_MAX_PAGES pages.
     """
     current_now = now if now is not None else time.time()
     max_ts, existing_other_ids_ts = _get_channel_db_baseline(channel_id, db_path)
@@ -111,13 +123,53 @@ def backfill_channel(
     else:
         cutoff_ts = current_now - EMPTY_DB_LOOKBACK_SEC
 
-    hist_resp = _call_with_retry(
-        lambda: client.conversations_history(
-            channel=channel_id, limit=HISTORY_LIMIT, oldest=str(cutoff_ts)
-        ),
-        sleep_fn=sleep_fn,
-    )
-    history_messages: List[Dict[str, Any]] = list(hist_resp.get("messages", []) or [])
+    history_messages: List[Dict[str, Any]] = []
+    hist_cursor: Optional[str] = None
+    pages_read = 0
+    truncated = False
+    for hist_page in range(1, HISTORY_MAX_PAGES + 1):
+        hist_kwargs: Dict[str, Any] = {
+            "channel": channel_id,
+            "limit": HISTORY_LIMIT,
+            "oldest": str(cutoff_ts),
+        }
+        if hist_cursor:
+            hist_kwargs["cursor"] = hist_cursor
+        hist_resp = _call_with_retry(
+            lambda kw=hist_kwargs: client.conversations_history(**kw),
+            sleep_fn=sleep_fn,
+        )
+        pages_read = hist_page
+        history_messages.extend(list(hist_resp.get("messages", []) or []))
+        hist_meta = hist_resp.get("response_metadata") or {}
+        hist_next = (
+            (hist_meta.get("next_cursor") or "").strip()
+            if isinstance(hist_meta, dict)
+            else ""
+        )
+        if not hist_next or hist_resp.get("has_more") is False:
+            break
+        if hist_page >= HISTORY_MAX_PAGES:
+            truncated = True
+            break
+        hist_cursor = hist_next
+    if page_info is not None:
+        oldest_fetched: Optional[str] = None
+        for m in history_messages:
+            mts = m.get("ts") if isinstance(m, dict) else None
+            try:
+                if mts and (oldest_fetched is None or float(mts) < float(oldest_fetched)):
+                    oldest_fetched = str(mts)
+            except (TypeError, ValueError):
+                continue
+        page_info.update(
+            {
+                "pages": pages_read,
+                "truncated": truncated,
+                "oldest_fetched_ts": oldest_fetched,
+                "cutoff_ts": f"{cutoff_ts:.6f}",
+            }
+        )
 
     collected_messages: List[Dict[str, Any]] = list(history_messages)
 
@@ -210,6 +262,87 @@ def backfill_channel(
     return inserted_count
 
 
+def _ops_alerts_path(db_path: Path) -> Path:
+    env_path = os.environ.get("YAMA_OPS_ALERTS_PATH", "").strip()
+    return Path(env_path) if env_path else Path(db_path).parent / OPS_ALERTS_FILENAME
+
+
+def _append_ops_alert(entry: Dict[str, Any], path: Path) -> None:
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
+    with open(path, "a", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def update_truncation_alerts(
+    page_infos: Dict[str, Dict[str, Any]],
+    db_path: Path,
+) -> List[Dict[str, Any]]:
+    """Edge-triggered truncation alerts: append one outbox entry when a channel
+    starts being truncated and one when it stops. Returns the entries written.
+    The state file is only updated after the outbox write succeeds, so a failed
+    write is retried on the next run."""
+    state_path = Path(db_path).parent / TRUNCATION_STATE_FILENAME
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+    written: List[Dict[str, Any]] = []
+    outbox = _ops_alerts_path(db_path)
+    changed = False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for channel_id, info in page_infos.items():
+        was = bool(state.get(channel_id, {}).get("truncated"))
+        is_now = bool(info.get("truncated"))
+        if is_now == was:
+            continue
+        if is_now:
+            entry = {
+                "kind": "backfill_truncated",
+                "at": now_iso,
+                "channel": channel_id,
+                "pages": info.get("pages"),
+                "max_pages": HISTORY_MAX_PAGES,
+                "per_page": HISTORY_LIMIT,
+                "oldest_fetched_ts": info.get("oldest_fetched_ts"),
+                "cutoff_ts": info.get("cutoff_ts"),
+            }
+            print(
+                f"[backfill] WARNING: history page cap reached for channel={channel_id} "
+                f"({HISTORY_MAX_PAGES} pages x {HISTORY_LIMIT}); older posts in the window were not read",
+                file=sys.stderr,
+            )
+        else:
+            entry = {"kind": "backfill_truncation_recovered", "at": now_iso, "channel": channel_id}
+            print(f"[backfill] history page cap cleared for channel={channel_id}", file=sys.stderr)
+        try:
+            _append_ops_alert(entry, outbox)
+        except Exception as exc:
+            print(
+                f"[backfill] ERROR: could not write ops alert ({entry['kind']} channel={channel_id}): {exc}",
+                file=sys.stderr,
+            )
+            continue
+        written.append(entry)
+        state[channel_id] = {"truncated": is_now, "changed_at": now_iso}
+        changed = True
+    if changed:
+        tmp = state_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(state_path)
+    return written
+
+
 def run_backfill(
     db_path: Path = DEFAULT_DB_PATH,
     env_path: Path = DEFAULT_ENV_PATH,
@@ -228,7 +361,9 @@ def run_backfill(
     result: Dict[str, Any] = {
         "inserted": 0,
         "channels": channels_map,
+        "truncated": [],
     }
+    page_infos: Dict[str, Dict[str, Any]] = {}
 
     try:
         load_env_file(env_path)
@@ -248,6 +383,7 @@ def run_backfill(
 
         total_inserted = 0
         for channel_id in channels:
+            info: Dict[str, Any] = {}
             try:
                 ch_inserted = backfill_channel(
                     channel_id=channel_id,
@@ -257,7 +393,11 @@ def run_backfill(
                     ignored_user_ids=ignored_user_ids,
                     now=now,
                     sleep_fn=sleep_fn,
+                    page_info=info,
                 )
+                page_infos[channel_id] = info
+                if info.get("truncated"):
+                    result["truncated"].append(channel_id)
                 channels_map[channel_id] = ch_inserted
                 total_inserted += ch_inserted
             except Exception as ch_exc:
@@ -267,6 +407,10 @@ def run_backfill(
                 )
 
         result["inserted"] = total_inserted
+        try:
+            update_truncation_alerts(page_infos, db_path)
+        except Exception as trunc_exc:
+            print(f"[backfill] ERROR: truncation alert update failed: {trunc_exc}", file=sys.stderr)
     except Exception as exc:
         print(f"[backfill] Fatal error: {exc}", file=sys.stderr)
 

@@ -83,7 +83,13 @@ fi
 
 # Backfill: recover any posts the listener missed (e.g. while it was down)
 # by diffing Slack history against the local events DB. Best-effort.
-"$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/backfill.py" >/dev/null 2>&1 || true
+# Its stderr is scanned (not stored) only for ops-alert write failures, which
+# are forwarded by the ops alert block below (OPS_EXTRA_ALERTS).
+OPS_EXTRA_ALERTS='[]'
+BACKFILL_ERR="$("$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/backfill.py" 2>&1 >/dev/null || true)"
+if _bf_alert_err="$(printf '%s\n' "$BACKFILL_ERR" | grep -E 'could not write ops alert|truncation alert update failed' | head -n 5)" && [[ -n "$_bf_alert_err" ]]; then
+  OPS_EXTRA_ALERTS="$(jq -c --arg e "$_bf_alert_err" '. + [{"kind": "alert_write_failed", "source": "backfill.py", "stderr": $e}]' <<<"$OPS_EXTRA_ALERTS" 2>/dev/null || echo "$OPS_EXTRA_ALERTS")"
+fi
 
 # Reconcile: periodically (at most once per hour) scan candidate threads for
 # late-landed Yama replies and record them into the replies ledger. Best-effort.
@@ -177,8 +183,21 @@ fi
 set +e
 DISP_OK=1
 if bash -n "$PROJECT_DIR/dispatcher.sh" 2>/dev/null; then
-  output=$("$PROJECT_DIR/dispatcher.sh" 2>/dev/null)
+  # stderr is kept (appended to state/dispatcher_stderr.log when non-empty) and
+  # scanned for REAPER_ALERT_WRITE_FAILED, forwarded by the ops alert block.
+  _disp_err_file="$(mktemp "$PROJECT_DIR/state/.dispatcher_stderr.XXXXXX" 2>/dev/null || echo /dev/null)"
+  output=$("$PROJECT_DIR/dispatcher.sh" 2>"$_disp_err_file")
   code=$?
+  if [[ "$_disp_err_file" != "/dev/null" ]]; then
+    if [[ -s "$_disp_err_file" ]]; then
+      { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] exit=${code}"; cat "$_disp_err_file"; } >> "$PROJECT_DIR/state/dispatcher_stderr.log" 2>/dev/null
+      _disp_alert_err="$(grep -E 'REAPER_ALERT_WRITE_FAILED' "$_disp_err_file" | head -n 5)"
+      if [[ -n "$_disp_alert_err" ]]; then
+        OPS_EXTRA_ALERTS="$(jq -c --arg e "$_disp_alert_err" '. + [{"kind": "alert_write_failed", "source": "dispatcher.sh", "stderr": $e}]' <<<"${OPS_EXTRA_ALERTS:-[]}" 2>/dev/null || echo "${OPS_EXTRA_ALERTS:-[]}")"
+      fi
+    fi
+    rm -f "$_disp_err_file"
+  fi
 else
   mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Dispatcher skipped: dispatcher.sh failed bash -n" >> "$WATCHDOG_LOG" 2>/dev/null || true
@@ -254,9 +273,16 @@ syntax_guard_mark_warned() {
 # Evaluate the three syntax-guard targets and escalate if any has been broken
 # for 10+ minutes (or report a recovery). A warning wake takes this cycle;
 # pending events wait one 30s cycle, which is acceptable for a warning.
+# Not evaluated on a cycle whose dispatcher run moved a batch to PROCESSING
+# (code 0): `wake` exits the hook, so a guard wake there would drop the batch
+# payload and strand those events until the Reaper. The next cycle evaluates.
 SYNTAX_WARN_TARGETS=()
 SYNTAX_RECOVERED_TARGETS=()
-for _sg in "watchdog.sh:${WD_OK:-1}" "dispatcher.sh:${DISP_OK:-1}" "listener.py:${LISTENER_OK:-1}"; do
+_sg_eval_targets=()
+if [[ "${code:-1}" != "0" ]]; then
+  _sg_eval_targets=("watchdog.sh:${WD_OK:-1}" "dispatcher.sh:${DISP_OK:-1}" "listener.py:${LISTENER_OK:-1}")
+fi
+for _sg in "${_sg_eval_targets[@]}"; do
   _sg_target="${_sg%%:*}"
   _sg_ok="${_sg##*:}"
   if [[ "$_sg_ok" == "0" ]]; then _sg_res="$(syntax_guard_eval "$_sg_target" 1 || true)"; else _sg_res="$(syntax_guard_eval "$_sg_target" 0 || true)"; fi
@@ -273,11 +299,17 @@ if [[ "${#SYNTAX_WARN_TARGETS[@]}" -gt 0 ]]; then
       --argjson first "$_sg_first" \
       --argjson warn_sec "$SYNTAX_GUARD_WARN_SEC" \
       '{"syntax_guard_warning": true, "targets": $targets, "first_failed_at_epoch": $first, "warn_seconds": $warn_sec}' 2>/dev/null)"; then
+    # `wake` exits the hook on success, so warned=true is saved before it and
+    # rolled back only if wake returns (= failed). Saving it after a successful
+    # wake would never run, and the warning would repeat every 30s cycle.
+    _sg_state_before="$(hook_state_get 2>/dev/null || echo '{}')"
+    for _sg_t in "${SYNTAX_WARN_TARGETS[@]}"; do
+      syntax_guard_mark_warned "$_sg_t"
+    done
     if wake "Syntax guard: target(s) broken for 10+ min" "$_sg_payload"; then
-      for _sg_t in "${SYNTAX_WARN_TARGETS[@]}"; do
-        syntax_guard_mark_warned "$_sg_t"
-      done
+      :
     else
+      hook_state_set "$_sg_state_before" 2>/dev/null || true
       mkdir -p "$(dirname "$_SG_WATCHDOG_LOG")" 2>/dev/null || true
       echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Syntax guard warning wake failed (targets=${SYNTAX_WARN_TARGETS[*]})" >> "$_SG_WATCHDOG_LOG" 2>/dev/null || true
     fi
@@ -301,6 +333,120 @@ if [[ "${#SYNTAX_RECOVERED_TARGETS[@]}" -gt 0 ]]; then
   fi
 fi
 # --- syntax-guard escalation: end ---
+
+# --- ops alerts: begin (extracted verbatim by tests/run_tests.py test 67) ---
+# Stale-PENDING warning (candidates 1/11) and delivery of the ops alert outbox
+# (aggregated Reaper re-queue/FAILED lines from dispatcher.sh, backfill page-cap
+# truncation edges from backfill.py). Same channel as the syntax guard: one
+# `wake` to the parent agent, which lands in the Slack-ops chat. No new daemon:
+# this runs inside the 30s hook.
+#  - Transient noise is removed by elapsed time: ops_monitor.py pending-check
+#    counts only human PENDING events waiting >= YAMA_PENDING_STALE_WARN_SEC
+#    (default 600s); own posts, other bots and deliberate 1h waits are excluded.
+#  - Edge notification: one wake when a condition starts, one when it clears
+#    (hook_state "ops_monitor", same idea as "syntax_guard").
+#  - A failure of the monitor itself (pending-check / outbox read) is surfaced
+#    at once, without a grace period (edge-triggered as well). Alert-write
+#    failures reported on dispatcher/backfill stderr (OPS_EXTRA_ALERTS) are
+#    forwarded every time they happen.
+#  - `wake` exits the hook, so the new edge state is saved *before* wake and
+#    rolled back (and the taken outbox entries restored) only if wake returns,
+#    i.e. failed. Wake/state/restore failures go to watchdog.log + hook log.
+#  - Never on a cycle that dispatched a batch (code 0): that cycle's wake must
+#    carry the events payload. Alerts wait one cycle (outbox and state untouched).
+OPS_MONITOR_PY="${YAMA_OPS_MONITOR_PY:-${PROJECT_DIR}/ops_monitor.py}"
+OPS_ALERTS_FILE="${YAMA_OPS_ALERTS_PATH:-${PROJECT_DIR}/state/ops_alerts.jsonl}"
+_OPS_WATCHDOG_LOG="${WATCHDOG_LOG:-${YAMA_WATCHDOG_LOG:-${PROJECT_DIR}/state/watchdog.log}}"
+ops_log_warn() {
+  mkdir -p "$(dirname "$_OPS_WATCHDOG_LOG")" 2>/dev/null || true
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] Ops alert: $*" >> "$_OPS_WATCHDOG_LOG" 2>/dev/null || true
+  if declare -F log >/dev/null 2>&1; then log "ops alert: $*" '{}' >/dev/null 2>&1 || true; fi
+  return 0
+}
+# Errors inside this block must never abort the hook (set -e): run it with
+# errexit off and restore it afterwards.
+set +e
+if [[ "${code:-1}" != "0" ]]; then
+  _ops_state="$(hook_state_get 2>/dev/null || echo '{}')"
+  printf '%s' "$_ops_state" | jq -e 'type == "object"' >/dev/null 2>&1 || _ops_state='{}'
+  _ops_pending_warned="$(printf '%s' "$_ops_state" | jq -r '.ops_monitor.pending_stale_warned // false' 2>/dev/null || echo false)"
+  _ops_fail_warned="$(printf '%s' "$_ops_state" | jq -r '.ops_monitor.monitor_failed_warned // false' 2>/dev/null || echo false)"
+  _ops_new_pending="$_ops_pending_warned"
+  _ops_new_fail="$_ops_fail_warned"
+  _ops_events='[]'
+  _ops_fail_details='[]'
+
+  _ops_pc_rc=0
+  _ops_pc_out="$("$PYTHON_BIN" "$OPS_MONITOR_PY" pending-check --db "$DB_PATH" 2>&1)" || _ops_pc_rc=$?
+  if [[ "$_ops_pc_rc" -eq 0 ]] && printf '%s' "$_ops_pc_out" | jq -e 'type == "object" and .ok == true and (.stale | type == "boolean")' >/dev/null 2>&1; then
+    _ops_stale="$(printf '%s' "$_ops_pc_out" | jq -r '.stale')"
+    if [[ "$_ops_stale" == "true" && "$_ops_pending_warned" != "true" ]]; then
+      _ops_events="$(jq -c --argjson r "$_ops_pc_out" '. + [{"kind": "pending_stale"} + ($r | del(.ok))]' <<<"$_ops_events")"
+      _ops_new_pending=true
+    elif [[ "$_ops_stale" != "true" && "$_ops_pending_warned" == "true" ]]; then
+      _ops_events="$(jq -c --argjson r "$_ops_pc_out" '. + [{"kind": "pending_stale_recovered", "human_pending": $r.human_pending, "oldest_age_sec": $r.oldest_age_sec}]' <<<"$_ops_events")"
+      _ops_new_pending=false
+    fi
+  else
+    _ops_fail_details="$(jq -c --arg o "${_ops_pc_out:0:500}" --argjson rc "$_ops_pc_rc" '. + [{"step": "pending-check", "exit_code": $rc, "output": $o}]' <<<"$_ops_fail_details")"
+  fi
+
+  _ops_taken='[]'
+  if [[ -s "$OPS_ALERTS_FILE" ]]; then
+    _ops_take_rc=0
+    _ops_take_out="$("$PYTHON_BIN" "$OPS_MONITOR_PY" outbox-take --path "$OPS_ALERTS_FILE" 2>&1)" || _ops_take_rc=$?
+    if [[ "$_ops_take_rc" -eq 0 ]] && printf '%s' "$_ops_take_out" | jq -e 'type == "array"' >/dev/null 2>&1; then
+      _ops_taken="$(printf '%s' "$_ops_take_out" | jq -c '.')"
+    else
+      _ops_fail_details="$(jq -c --arg o "${_ops_take_out:0:500}" --argjson rc "$_ops_take_rc" '. + [{"step": "outbox-take", "exit_code": $rc, "output": $o}]' <<<"$_ops_fail_details")"
+    fi
+  fi
+
+  if [[ "$(jq 'length' <<<"$_ops_fail_details")" -gt 0 ]]; then
+    ops_log_warn "ops_monitor failed: $(jq -c '.' <<<"$_ops_fail_details")"
+    if [[ "$_ops_fail_warned" != "true" ]]; then
+      _ops_events="$(jq -c --argjson d "$_ops_fail_details" '. + [{"kind": "ops_monitor_failed", "details": $d}]' <<<"$_ops_events")"
+      _ops_new_fail=true
+    fi
+  elif [[ "$_ops_fail_warned" == "true" ]]; then
+    _ops_events="$(jq -c '. + [{"kind": "ops_monitor_recovered"}]' <<<"$_ops_events")"
+    _ops_new_fail=false
+  fi
+
+  _ops_extra="${OPS_EXTRA_ALERTS:-[]}"
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$_ops_extra" || _ops_extra='[]'
+  _ops_all="$(jq -c -n --argjson a "$_ops_events" --argjson b "$_ops_taken" --argjson c "$_ops_extra" '$a + $b + $c')" || _ops_all='[]'
+  if [[ "$(jq 'length' <<<"$_ops_all" 2>/dev/null || echo 0)" -gt 0 ]]; then
+    if _ops_payload="$(jq -n -c \
+        --argjson alerts "$_ops_all" \
+        '{"ops_alert": true,
+          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗。*_recovered は復旧）。",
+          "kinds": ($alerts | map(.kind // "unknown") | unique),
+          "alerts": $alerts[0:50],
+          "omitted_alerts": ([($alerts | length) - 50, 0] | max)}' 2>/dev/null)" \
+      && _ops_title="Ops alert: $(jq -r '.kinds | join(", ")' <<<"$_ops_payload" 2>/dev/null)" \
+      && _ops_new_state="$(printf '%s' "$_ops_state" | jq -c --argjson p "$_ops_new_pending" --argjson f "$_ops_new_fail" '.ops_monitor = {"pending_stale_warned": $p, "monitor_failed_warned": $f}' 2>/dev/null)"; then
+      hook_state_set "$_ops_new_state" 2>/dev/null || ops_log_warn "edge state save failed (a repeat notice may follow)"
+      if ! wake "$_ops_title" "$_ops_payload"; then
+        ops_log_warn "wake failed (kinds=$(jq -c '.kinds' <<<"$_ops_payload" 2>/dev/null)); edge state rolled back, outbox restored"
+        hook_state_set "$_ops_state" 2>/dev/null || ops_log_warn "edge state rollback failed"
+        if [[ "$(jq 'length' <<<"$_ops_taken")" -gt 0 ]]; then
+          printf '%s' "$_ops_taken" | "$PYTHON_BIN" "$OPS_MONITOR_PY" outbox-restore --path "$OPS_ALERTS_FILE" >/dev/null 2>&1 \
+            || ops_log_warn "outbox restore failed; lost entries: $(jq -c '.' <<<"$_ops_taken" | head -c 2000)"
+        fi
+      fi
+    else
+      ops_log_warn "payload build failed; outbox restored, edge state unchanged"
+      if [[ "$(jq 'length' <<<"$_ops_taken")" -gt 0 ]]; then
+        printf '%s' "$_ops_taken" | "$PYTHON_BIN" "$OPS_MONITOR_PY" outbox-restore --path "$OPS_ALERTS_FILE" >/dev/null 2>&1 \
+          || ops_log_warn "outbox restore failed; lost entries: $(jq -c '.' <<<"$_ops_taken" | head -c 2000)"
+      fi
+    fi
+  fi
+fi
+set -e
+# --- ops alerts: end ---
+
 
 case "$code" in
   0)

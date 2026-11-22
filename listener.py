@@ -6,12 +6,23 @@ Yama Slack Socket Mode Listener (Layer 1)
 - Filters out self-messages, other bots, edits/deletes, and system events
 - Persists valid user messages to SQLite (state/slack_events.db, WAL mode) with status='PENDING'
 - Updates state/heartbeat.json every 30s and exits(1) if WebSocket is disconnected for >= 60s
+- Exits(1) if no Socket Mode pong has been received for >= 90s even though the SDK
+  still reports the socket as connected (frozen/half-open link: is_connected() only
+  checks that a socket object exists, and the main-thread heartbeat stays fresh, so
+  watchdog.sh cannot see this case). systemd Restart=always brings it back in ~10s.
+- Sends sd_notify WATCHDOG=1 from the main loop every WATCHDOG_PING_INTERVAL_SEC when
+  started by systemd with WatchdogSec (NOTIFY_SOCKET set; no-op otherwise). This is a
+  backstop that does not depend on the 30s dispatch hook: if the main loop stalls and
+  the hook (which runs watchdog.sh, 120s heartbeat threshold) is not running either,
+  systemd restarts the listener. WatchdogSec is set above watchdog.sh's effective
+  window so the two do not race on the same stall.
 """
 
 import json
 import logging
 import os
 import signal
+import socket
 import sqlite3
 import sys
 import threading
@@ -32,6 +43,11 @@ DEFAULT_HEARTBEAT_PATH = BASE_DIR / "state" / "heartbeat.json"
 
 HEARTBEAT_INTERVAL_SEC = 30
 MAX_DISCONNECT_SEC = 60
+# No pong for this long => link considered frozen (SDK itself reconnects after
+# 4 x ping_interval = 20s of silence, so 90s means its own recovery is not working).
+MAX_PONG_SILENCE_SEC = 90
+# sd_notify WATCHDOG=1 cadence (must be well below the unit's WatchdogSec=180).
+WATCHDOG_PING_INTERVAL_SEC = 10
 
 # Subtypes allowed to pass the subtype gate (including bot_message from other bots);
 # edits/deletes/joins/leaves (message_changed, message_deleted, channel_join, etc.) are ignored.
@@ -107,6 +123,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                 error_message TEXT,
                 next_retry_at TIMESTAMP,
                 first_unverifiable_at TIMESTAMP,
+                reap_count INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -139,6 +156,14 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
         if "first_unverifiable_at" not in cols:
             conn.execute(
                 "ALTER TABLE events ADD COLUMN first_unverifiable_at TIMESTAMP;"
+            )
+        # Reaper re-queue counter (candidate 12). Separate from retry_count:
+        # only dispatcher.sh's Reaper increments it, only a manual requeue
+        # (agent_tools.py requeue) resets it. Additive column, so older code
+        # that does not know it keeps working.
+        if "reap_count" not in cols:
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN reap_count INTEGER NOT NULL DEFAULT 0;"
             )
         conn.commit()
 
@@ -276,8 +301,11 @@ def write_heartbeat(
     connected: bool,
     bot_user_id: Optional[str],
     heartbeat_path: Path = DEFAULT_HEARTBEAT_PATH,
+    last_pong_age_sec: Optional[float] = None,
 ) -> None:
-    """Atomically write heartbeat status to state/heartbeat.json."""
+    """Atomically write heartbeat status to state/heartbeat.json.
+    last_pong_age_sec (optional, observability only) is null until the
+    current session has received its first pong."""
     heartbeat_path = Path(heartbeat_path)
     heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -287,6 +315,9 @@ def write_heartbeat(
         "pid": os.getpid(),
         "connected": bool(connected),
         "bot_user_id": bot_user_id,
+        "last_pong_age_sec": (
+            None if last_pong_age_sec is None else int(last_pong_age_sec)
+        ),
     }
     tmp_path = heartbeat_path.with_suffix(".json.tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
@@ -314,6 +345,59 @@ def check_connection_watchdog(
     if (now - disconnected_since) >= max_disconnect_sec:
         return disconnected_since, True
     return disconnected_since, False
+
+
+def get_pong_silence_sec(
+    socket_client: Any,
+    now: float,
+) -> Optional[float]:
+    """Seconds since the current Socket Mode session last received a pong
+    (session.last_ping_pong_time, set by the SDK receiver thread on each pong).
+    Returns None when there is no session or the session has not received any
+    pong yet: only a link that *was* answering pongs and then went silent is
+    treated as frozen, so a server that never echoes pings cannot cause a
+    restart loop (that case keeps the previous behaviour)."""
+    session = getattr(socket_client, "current_session", None)
+    if session is None:
+        return None
+    last_pong = getattr(session, "last_ping_pong_time", None)
+    if last_pong is None:
+        return None
+    try:
+        return max(0.0, now - float(last_pong))
+    except (TypeError, ValueError):
+        return None
+
+
+def should_exit_for_pong_silence(
+    connected: bool,
+    pong_silence: Optional[float],
+    max_pong_silence_sec: float = MAX_PONG_SILENCE_SEC,
+) -> bool:
+    """True when the socket still reports connected but no pong has arrived for
+    max_pong_silence_sec (frozen link). Unknown silence (None: no session yet, or
+    no pong received yet in this session) never triggers an exit."""
+    return bool(connected) and pong_silence is not None and pong_silence >= max_pong_silence_sec
+
+
+def sd_notify(message: str, env: Optional[Dict[str, str]] = None) -> bool:
+    """Send one sd_notify datagram (e.g. "WATCHDOG=1") to $NOTIFY_SOCKET.
+    Returns False without doing anything when NOTIFY_SOCKET is unset (not run by
+    systemd, or the unit has no WatchdogSec/NotifyAccess). Raises OSError on a
+    send failure so the caller can log it. Abstract sockets ("@name") supported."""
+    source = env if env is not None else os.environ
+    addr = (source.get("NOTIFY_SOCKET") or "").strip()
+    if not addr:
+        return False
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.connect(addr)
+        sock.sendall(message.encode("utf-8"))
+    finally:
+        sock.close()
+    return True
 
 
 def authenticate_bot(
@@ -417,6 +501,8 @@ def main() -> None:
 
     disconnected_since: Optional[float] = None
     last_heartbeat: float = 0.0
+    last_watchdog_ping: float = 0.0
+    watchdog_ping_error_logged = False
 
     try:
         while not stop_event.is_set():
@@ -445,13 +531,43 @@ def main() -> None:
                 )
                 sys.exit(1)
 
+            try:
+                pong_silence = get_pong_silence_sec(socket_client, now)
+            except Exception:
+                pong_silence = None
+            if should_exit_for_pong_silence(connected, pong_silence):
+                write_heartbeat(
+                    connected=False,
+                    bot_user_id=bot_user_id,
+                    heartbeat_path=DEFAULT_HEARTBEAT_PATH,
+                )
+                logger.error(
+                    "No Socket Mode pong for %d seconds while the socket still looks connected "
+                    "(frozen link). Exiting(1) for systemd restart.",
+                    int(pong_silence),
+                )
+                # Skip socket_client.close(): on a frozen link it may block.
+                logging.shutdown()
+                os._exit(1)
+
             if (now - last_heartbeat) >= HEARTBEAT_INTERVAL_SEC:
                 write_heartbeat(
                     connected=connected,
                     bot_user_id=bot_user_id,
                     heartbeat_path=DEFAULT_HEARTBEAT_PATH,
+                    last_pong_age_sec=pong_silence,
                 )
                 last_heartbeat = now
+
+            if (now - last_watchdog_ping) >= WATCHDOG_PING_INTERVAL_SEC:
+                last_watchdog_ping = now
+                try:
+                    sd_notify("WATCHDOG=1")
+                    watchdog_ping_error_logged = False
+                except Exception as wd_exc:
+                    if not watchdog_ping_error_logged:
+                        logger.error("sd_notify WATCHDOG=1 failed: %s", wd_exc)
+                        watchdog_ping_error_logged = True
 
             stop_event.wait(timeout=1.0)
     finally:

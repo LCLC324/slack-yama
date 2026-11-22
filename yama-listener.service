@@ -10,6 +10,13 @@ EnvironmentFile=/home/hatch/workspace/slack-yama/config/.env
 ExecStart=/home/hatch/workspace/slack-yama/venv/bin/python /home/hatch/workspace/slack-yama/listener.py
 Restart=always
 RestartSec=10
+# Backstop for a stalled main loop that does not depend on the 30s dispatch
+# hook: listener.py sends sd_notify WATCHDOG=1 every 10s from its main loop.
+# 180s is deliberately longer than watchdog.sh's window (heartbeat >= 120s +
+# 5s recheck, checked every 30s), so on the same stall watchdog.sh acts first
+# and systemd only steps in when the hook itself is not running (no race).
+WatchdogSec=180
+NotifyAccess=main
 
 [Install]
 WantedBy=multi-user.target

@@ -10,6 +10,7 @@ Subcommands for the awakened autonomous agent:
   - prune-replies [--days 90] [--dry-run]
   - react --channel X --ts T --emoji eyes
   - commit --event-id E --status DONE|IGNORED|FAILED [--error MSG]
+  - requeue --event-id E   (manual re-queue FAILED -> PENDING; resets reap_count only)
   - mode
 """
 
@@ -2544,7 +2545,18 @@ def _lookup_own_recent_message_once(
                     ),
                     file=sys.stderr,
                 )
-                break
+                # Candidate 14 (option A, owner-delegated): a thread scan cut off
+                # at the page cap cannot prove that no earlier own reply exists,
+                # so fail closed like the delayed-resend path. cmd_reply turns
+                # this into pre_post_check_unverifiable (no post; 1h wait, 24h
+                # terminal); the post-error recovery path reports it as
+                # recovery_error under ambiguous_post_outcome (no resend).
+                raise RuntimeError(
+                    "thread_scan_truncated: thread replies exceed "
+                    f"{THREAD_REPLIES_MAX_PAGES} pages x {THREAD_REPLIES_PAGE_LIMIT} after the "
+                    "scan start and no own reply was found in the checked range; "
+                    "refusing to post (fail-closed)"
+                )
             cursor = next_cursor
         return None
 
@@ -2716,6 +2728,59 @@ def cmd_commit(args: argparse.Namespace) -> int:
         return 1
 
 
+def requeue_event(event_id: str, db_path: Path = DEFAULT_DB_PATH) -> Dict[str, Any]:
+    """Manually re-queue a FAILED event back to PENDING (operator action).
+    This is the only path that resets reap_count to 0 (candidate 12). retry_count,
+    error_message and first_unverifiable_at are deliberately left unchanged so the
+    existing retry / 24h-unverifiable rules keep their history; next_retry_at is
+    cleared so the event is dispatched on the next 30s cycle."""
+    init_db(db_path)
+    with get_db_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        row = conn.execute(
+            "SELECT status FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            raise LookupError(f"Event '{event_id}' not found in database")
+        if str(row["status"]).upper() != "FAILED":
+            conn.rollback()
+            raise ValueError(
+                f"Event '{event_id}' is {row['status']}, not FAILED; requeue only re-queues FAILED events"
+            )
+        conn.execute(
+            """
+            UPDATE events
+            SET status = 'PENDING',
+                reap_count = 0,
+                next_retry_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE event_id = ?
+            """,
+            (event_id,),
+        )
+        conn.commit()
+        updated = conn.execute(
+            """
+            SELECT event_id, status, retry_count, reap_count, error_message,
+                   next_retry_at, first_unverifiable_at, updated_at
+            FROM events WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        return dict(updated)
+
+
+def cmd_requeue(args: argparse.Namespace) -> int:
+    try:
+        updated = requeue_event(args.event_id, db_path=Path(args.db))
+        print(json.dumps({"ok": True, "event": updated}, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
 def cmd_mode(args: argparse.Namespace) -> int:
     mode = get_mode(Path(args.mode_file))
     print(mode)
@@ -2844,6 +2909,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_commit.add_argument("--error", default=None, help="Optional error message when FAILED")
     p_commit.set_defaults(func=cmd_commit)
+
+    p_requeue = subparsers.add_parser(
+        "requeue", help="Manually re-queue a FAILED event to PENDING (resets reap_count)"
+    )
+    p_requeue.add_argument("--event-id", required=True, help="Target event_id (must be FAILED)")
+    p_requeue.set_defaults(func=cmd_requeue)
 
     # mode
     p_mode = subparsers.add_parser("mode", help="Print current operating mode (shadow / mention / full)")

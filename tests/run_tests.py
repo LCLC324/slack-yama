@@ -10,6 +10,7 @@ import io
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1912,7 +1913,8 @@ def test_reply_thread_fullscan_and_pagination() -> str:
         assert out3["recovered_after_ambiguous_error"] is True
         assert out3["ts"] == rec_landed_ts
 
-        # Case 4: Page cap at 20 pages -> stops after 20 calls, logs warning to stderr, and posts normally
+        # Case 4 (candidate 14, option A): page cap at 20 pages -> stops after 20 calls, logs the
+        # warning, then fails closed: no post, pre_post_check_unverifiable (thread_scan_truncated), draft kept
         with get_db_connection(db_path) as conn:
             conn.execute("DELETE FROM replies")
             conn.commit()
@@ -1969,14 +1971,82 @@ def test_reply_thread_fullscan_and_pagination() -> str:
                 ]
             )
 
-        assert rc4 == 0, f"Expected rc=0 after 20-page cap, got {rc4}"
-        assert len(cap_calls) == 20, f"Expected cap at 20 pages, got {len(cap_calls)}"
-        assert len(cap_posts) == 1, f"Expected 1 post after 20-page scan found no match, got {len(cap_posts)}"
-        warn4 = json.loads(stderr4.getvalue())
+        assert rc4 == 1, f"Expected rc=1 (fail-closed) after 20-page cap, got {rc4}"
+        assert len(cap_calls) == 20, f"Expected cap at 20 pages (no whole-scan retry), got {len(cap_calls)}"
+        assert len(cap_posts) == 0, f"Truncated scan must not post, got {len(cap_posts)} post(s)"
+        err_text4 = stderr4.getvalue()
+        first_line4, _, rest4 = err_text4.partition("\n")
+        warn4 = json.loads(first_line4)
         assert warn4["warning"] == "thread_replies_page_limit_reached"
         assert warn4["max_pages"] == 20
+        err4 = json.loads(rest4)
+        assert err4["ok"] is False
+        assert err4["error"] == "pre_post_check_unverifiable", err4
+        assert "thread_scan_truncated" in err4["check_error"], err4
+        assert err4["event_id"] == "Ev_THREAD_CAP20"
+        draft4 = db_path.parent / "reply-Ev_THREAD_CAP20.txt"
+        assert draft4.exists() and draft4.read_text(encoding="utf-8").strip() == reply_text, (
+            "draft must be kept for the 1h-wait re-dispatch"
+        )
 
-        return "15分超(3時間前)のスレッド内同一文面検出・2ページ目(cursorページング)の同一文面検出(投稿前＆応答ロスト回復)・20ページ上限打ち切りとstderr警告を確認"
+        # Case 5: a thread that ends exactly at the 20th page (no next cursor) is not truncated -> posts
+        end_calls: List[Dict[str, Any]] = []
+        end_posts: List[Dict[str, Any]] = []
+
+        class TwentyPageThreadClient(HugeThreadClient):
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                end_calls.append(kwargs)
+                last = len(end_calls) >= 20
+                return {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "user": "U_OTHER",
+                            "text": f"Unrelated message on page {len(end_calls)}",
+                            "ts": f"{float(thread_ts) + len(end_calls):.6f}",
+                        }
+                    ],
+                    "has_more": not last,
+                    "response_metadata": {"next_cursor": "" if last else f"c{len(end_calls) + 1}"},
+                }
+
+            def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                end_posts.append(kwargs)
+                return {
+                    "ok": True,
+                    "channel": kwargs["channel"],
+                    "ts": f"{base_now + 6.0:.6f}",
+                    "message": {"text": kwargs["text"], "ts": f"{base_now + 6.0:.6f}"},
+                }
+
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM replies")
+            conn.commit()
+        stdout5 = io.StringIO()
+        stderr5 = io.StringIO()
+        with patch.object(
+            agent_tools, "get_web_client", return_value=TwentyPageThreadClient()
+        ), redirect_stdout(stdout5), redirect_stderr(stderr5):
+            rc5 = agent_tools.main(
+                [
+                    "--db",
+                    str(db_path),
+                    "reply",
+                    "--channel",
+                    channel_id,
+                    "--text-file",
+                    str(text_file),
+                    "--thread-ts",
+                    thread_ts,
+                    "--event-id",
+                    "Ev_THREAD_END20",
+                ]
+            )
+        assert rc5 == 0, f"Expected rc=0 when the thread ends on page 20, got {rc5}, stderr={stderr5.getvalue()}"
+        assert len(end_calls) == 20 and len(end_posts) == 1
+        assert "thread_replies_page_limit_reached" not in stderr5.getvalue()
+
+        return "15分超(3時間前)のスレッド内同一文面検出・2ページ目(cursorページング)の同一文面検出(投稿前＆応答ロスト回復)・20ページ上限打ち切りで警告＋送信せずpre_post_check_unverifiable(thread_scan_truncated)＆下書き保持・ちょうど20ページで終わるスレッドは送信を確認"
 
 
 def test_prune_replies() -> str:
@@ -9305,6 +9375,576 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
     return "代行3連続でstreak 1→2→3＆auto_streak_limit拒否・本人実投稿(非最新含む)で0リセット・resolve --reply-ts記録・50件上限切捨て・ts末尾ゼロ文字列完全一致・flockロック生成を確認"
 
 
+def _ops_insert_event(
+    db_path: Path,
+    event_id: str,
+    *,
+    user_id: str,
+    is_bot: int = 0,
+    status: str = "PENDING",
+    age_sec: int = 0,
+    next_retry_in_sec: Optional[int] = None,
+) -> None:
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO events (event_id, channel_id, user_id, ts, text, status, is_bot,
+                                created_at, updated_at, next_retry_at)
+            VALUES (?, 'C_OPS', ?, ?, 'ops test', ?, ?,
+                    datetime('now', ?), datetime('now', ?),
+                    CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', ?) END)
+            """,
+            (
+                event_id,
+                user_id,
+                f"{1700300000 + len(event_id)}.{uuid.uuid4().int % 1000000:06d}",
+                status,
+                is_bot,
+                f"-{age_sec} seconds",
+                f"-{age_sec} seconds",
+                next_retry_in_sec,
+                f"+{next_retry_in_sec or 0} seconds",
+            ),
+        )
+        conn.commit()
+
+
+def test_ops_pending_stale_check_and_outbox() -> str:
+    """67. PENDING滞留チェック(候補1/11) ops_monitor.py: 人間の未回答だけを数える(自分・他Bot・既知Bot・B始まり・IGNORED・1時間待ち中を除外)・600秒しきい値・失敗時exit 2・outboxの取り出し/戻し"""
+    import ops_monitor  # noqa: E402
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "slack_events.db"
+        init_db(db_path)
+        hb = tmp_dir / "heartbeat.json"
+        hb.write_text(json.dumps({"bot_user_id": "U_SELF_HB"}), encoding="utf-8")
+
+        # DBなしは ok・stale=false
+        r0 = ops_monitor.pending_check(db_path=tmp_dir / "missing.db", self_user_ids=[])
+        assert r0["ok"] is True and r0["stale"] is False and r0["human_pending"] == 0
+
+        _ops_insert_event(db_path, "Ev_H_FRESH", user_id="U_HUMAN_A", age_sec=120)
+        r1 = ops_monitor.pending_check(db_path=db_path, threshold_sec=600, heartbeat_path=hb, self_user_ids=["U_SELF"])
+        assert r1["stale"] is False and r1["human_pending"] == 1 and r1["oldest_event_id"] == "Ev_H_FRESH"
+
+        # 自分・他Bot(is_bot=1)・既知Botの is_bot=0 行・B始まり・IGNORED_USER_IDS・待ち中は数えない
+        _ops_insert_event(db_path, "Ev_SELF_OLD", user_id="U_SELF", age_sec=5000)
+        _ops_insert_event(db_path, "Ev_BOT_OLD", user_id="U_OTHER_BOT", is_bot=1, age_sec=5000)
+        _ops_insert_event(db_path, "Ev_KNOWN_BOT_OLD", user_id="U_OTHER_BOT", is_bot=0, age_sec=5000)
+        _ops_insert_event(db_path, "Ev_BID_OLD", user_id="B0BOTID", age_sec=5000)
+        _ops_insert_event(db_path, "Ev_IGN_OLD", user_id="U_IGNORED", age_sec=5000)
+        _ops_insert_event(db_path, "Ev_WAIT_OLD", user_id="U_HUMAN_B", age_sec=5000, next_retry_in_sec=1800)
+        _ops_insert_event(db_path, "Ev_DONE_OLD", user_id="U_HUMAN_C", status="DONE", age_sec=5000)
+        with patch.dict(os.environ, {"IGNORED_USER_IDS": "U_IGNORED"}):
+            r2 = ops_monitor.pending_check(db_path=db_path, threshold_sec=600, heartbeat_path=hb, self_user_ids=["U_SELF"])
+        assert r2["stale"] is False, r2
+        assert r2["human_pending"] == 1 and r2["excluded_bot_or_self"] == 5 and r2["excluded_waiting"] == 1, r2
+
+        # heartbeat の bot_user_id も自分として除外される(self_user_ids 未指定時)
+        _ops_insert_event(db_path, "Ev_SELF_HB_OLD", user_id="U_SELF_HB", age_sec=5000)
+        with patch.dict(os.environ, {"IGNORED_USER_IDS": "U_IGNORED", "YAMA_BOT_USER_ID": "U_SELF"}):
+            r3 = ops_monitor.pending_check(db_path=db_path, threshold_sec=600, heartbeat_path=hb)
+        assert r3["stale"] is False and r3["excluded_bot_or_self"] == 6, r3
+
+        # 人間の投稿が600秒を超えたら stale
+        _ops_insert_event(db_path, "Ev_H_OLD", user_id="U_HUMAN_D", age_sec=650)
+        with patch.dict(os.environ, {"IGNORED_USER_IDS": "U_IGNORED", "YAMA_BOT_USER_ID": "U_SELF"}):
+            r4 = ops_monitor.pending_check(db_path=db_path, threshold_sec=600, heartbeat_path=hb)
+        assert r4["stale"] is True and r4["stale_count"] == 1, r4
+        assert r4["oldest_event_id"] == "Ev_H_OLD" and 640 <= r4["oldest_age_sec"] <= 700, r4
+
+        # CLI: 正常は exit 0 の JSON、失敗は exit 2 の {"ok": false}
+        env = os.environ.copy()
+        env.update({"YAMA_HEARTBEAT_PATH": str(hb), "YAMA_BOT_USER_ID": "U_SELF", "IGNORED_USER_IDS": "U_IGNORED"})
+        cli = subprocess.run(
+            [str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "pending-check", "--db", str(db_path)],
+            env=env, capture_output=True, text=True,
+        )
+        assert cli.returncode == 0 and json.loads(cli.stdout)["stale"] is True, cli
+        env_fail = dict(env, YAMA_PENDING_CHECK_FORCE_FAIL="1")
+        cli_f = subprocess.run(
+            [str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "pending-check", "--db", str(db_path)],
+            env=env_fail, capture_output=True, text=True,
+        )
+        assert cli_f.returncode == 2 and json.loads(cli_f.stdout)["ok"] is False, cli_f
+        bad_db = tmp_dir / "not_a_db.db"
+        bad_db.write_text("garbage" * 100, encoding="utf-8")
+        cli_b = subprocess.run(
+            [str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "pending-check", "--db", str(bad_db)],
+            env=env, capture_output=True, text=True,
+        )
+        assert cli_b.returncode == 2 and json.loads(cli_b.stdout)["ok"] is False, cli_b
+
+        # outbox: append -> take(空になる) -> restore(戻る)・壊れた行は unparseable として残す
+        outbox = tmp_dir / "ops_alerts.jsonl"
+        ops_monitor.outbox_append({"kind": "reaper", "reaped_count": 1}, outbox)
+        with open(outbox, "a", encoding="utf-8") as f:
+            f.write("{broken\n")
+        taken = ops_monitor.outbox_take(outbox)
+        assert [e["kind"] for e in taken] == ["reaper", "unparseable_outbox_line"], taken
+        assert outbox.read_text(encoding="utf-8") == ""
+        assert ops_monitor.outbox_take(outbox) == []
+        rs = subprocess.run(
+            [str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-restore", "--path", str(outbox)],
+            input=json.dumps(taken[:1]), capture_output=True, text=True,
+        )
+        assert rs.returncode == 0
+        assert [e["kind"] for e in ops_monitor.outbox_take(outbox)] == ["reaper"]
+
+    return "自分・他Bot・既知Bot・B始まり・IGNORED・1時間待ち中を除外し人間の未回答だけを計数・600秒超でstale・CLIの失敗はexit 2・outboxの取り出し/戻し/壊れ行保持を確認"
+
+
+def test_hook_ops_alert_block_edge_wake() -> str:
+    """68. フックの運用警告ブロック (ライブフックのbegin〜endを実行: PENDING滞留のエッジ通知・復旧1回・outbox配送・wake失敗時の状態ロールバック＆outbox復元・監視失敗の即時表面化・ディスパッチ回は送らない) と構文ガードのwake=exit前提での重複抑止"""
+    hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+    script_text = hook_script.read_text(encoding="utf-8")
+    assert "ops_monitor.py" in script_text and "pending-check" in script_text
+    begin = script_text.index("# --- ops alerts: begin")
+    end = script_text.index("# --- ops alerts: end ---")
+    ops_src = script_text[begin:end]
+    sg_begin = script_text.index("# --- syntax-guard escalation: begin")
+    sg_end = script_text.index("# --- syntax-guard escalation: end ---")
+    sg_src = script_text[sg_begin:sg_end]
+    # 運用警告ブロックは構文ガードの後・ディスパッチ結果の wake の前
+    assert sg_end < begin < script_text.index('wake "New Slack events dispatched for Yama triage"')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "slack_events.db"
+        init_db(db_path)
+        state_file = tmp_dir / "hook_state.json"
+        wake_log = tmp_dir / "wakes.jsonl"
+        watchdog_log = tmp_dir / "watchdog.log"
+        outbox = tmp_dir / "ops_alerts.jsonl"
+        hb = tmp_dir / "heartbeat.json"
+        hb.write_text(json.dumps({"bot_user_id": "U_SELF"}), encoding="utf-8")
+        prelude = (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'STATE_FILE="$1"\nWAKE_LOG="$2"\n'
+            f'PROJECT_DIR="{BASE_DIR}"\n'
+            f'PYTHON_BIN="{PYTHON_BIN}"\n'
+            f'DB_PATH="{db_path}"\n'
+            f'WATCHDOG_LOG="{watchdog_log}"\n'
+            'code="${STUB_CODE:-1}"\n'
+            "hook_state_get() { if [[ -f \"$STATE_FILE\" ]]; then jq -ce 'select(type == \"object\")' <\"$STATE_FILE\" 2>/dev/null || printf '{}'; else printf '{}'; fi; }\n"
+            "hook_state_set() { local v; v=\"$(printf '%s' \"$1\" | jq -ce 'select(type == \"object\")')\" || return 1; printf '%s\\n' \"$v\" >\"$STATE_FILE\"; }\n"
+            # 実ランタイムと同じく、成功した wake はフックを終了させる
+            "wake() { jq -n -c --arg t \"$1\" --arg p \"$2\" '{\"title\": $t, \"payload\": $p}' >>\"$WAKE_LOG\"; "
+            "if [[ \"${STUB_WAKE_FAIL:-0}\" == \"1\" ]]; then return 1; fi; echo WAKE_EXIT; exit 0; }\n"
+        )
+        ops_stub = tmp_dir / "ops_stub.sh"
+        ops_stub.write_text(prelude + ops_src + '\necho "AFTER_OPS_OK"\n', encoding="utf-8")
+        sg_stub = tmp_dir / "sg_stub.sh"
+        sg_stub.write_text(
+            prelude + 'WD_OK="${STUB_WD_OK:-1}"\nDISP_OK=1\nLISTENER_OK=1\n' + sg_src + '\necho "AFTER_SG_OK"\n',
+            encoding="utf-8",
+        )
+
+        base_env = os.environ.copy()
+        base_env.update(
+            {
+                "YAMA_OPS_ALERTS_PATH": str(outbox),
+                "YAMA_HEARTBEAT_PATH": str(hb),
+                "YAMA_BOT_USER_ID": "U_SELF",
+                "IGNORED_USER_IDS": "",
+            }
+        )
+        base_env.pop("YAMA_PENDING_CHECK_FORCE_FAIL", None)
+
+        def run(stub: Path, **extra: str) -> Tuple[List[Dict[str, Any]], str]:
+            before = len(wake_log.read_text(encoding="utf-8").splitlines()) if wake_log.exists() else 0
+            env = dict(base_env, **extra)
+            res = subprocess.run(["bash", str(stub), str(state_file), str(wake_log)], env=env, capture_output=True, text=True)
+            assert res.returncode == 0, f"stub failed rc={res.returncode}: {res.stderr}"
+            lines = wake_log.read_text(encoding="utf-8").splitlines() if wake_log.exists() else []
+            return [json.loads(x) for x in lines[before:]], res.stdout
+
+        def ops_state() -> Dict[str, Any]:
+            if not state_file.exists():
+                return {}
+            return json.loads(state_file.read_text(encoding="utf-8")).get("ops_monitor", {})
+
+        # (a) 過渡ノイズ: 5分の人間PENDING・古いBot/自分のPENDINGでは何も送らない
+        _ops_insert_event(db_path, "Ev_HK_FRESH", user_id="U_HUMAN", age_sec=300)
+        _ops_insert_event(db_path, "Ev_HK_BOT", user_id="U_BOT", is_bot=1, age_sec=4000)
+        _ops_insert_event(db_path, "Ev_HK_SELF", user_id="U_SELF", age_sec=4000)
+        wakes, out = run(ops_stub)
+        assert wakes == [] and "AFTER_OPS_OK" in out
+
+        # (b) 600秒超の人間PENDING -> 1回だけ wake(payload は jq で検証できる JSON)
+        _ops_insert_event(db_path, "Ev_HK_OLD", user_id="U_HUMAN", age_sec=700)
+        wakes, out = run(ops_stub)
+        assert len(wakes) == 1 and "WAKE_EXIT" in out and "AFTER_OPS_OK" not in out, (wakes, out)
+        assert wakes[0]["title"] == "Ops alert: pending_stale"
+        p = json.loads(wakes[0]["payload"])
+        assert p["ops_alert"] is True and p["kinds"] == ["pending_stale"]
+        assert p["alerts"][0]["oldest_event_id"] == "Ev_HK_OLD" and p["alerts"][0]["stale_count"] == 1
+        assert "Slack には投稿せず" in p["note"]
+        assert ops_state() == {"pending_stale_warned": True, "monitor_failed_warned": False}
+        # 続いている間は送らない
+        wakes, out = run(ops_stub)
+        assert wakes == [] and "AFTER_OPS_OK" in out
+
+        # (c) ディスパッチした回(code 0)は outbox も状態も触らない
+        backfill._append_ops_alert({"kind": "reaper", "reaped_count": 1, "reaped_event_ids": ["Ev_X"],
+                                    "failed_count": 0, "failed_event_ids": []}, outbox)
+        wakes, out = run(ops_stub, STUB_CODE="0")
+        assert wakes == [] and "AFTER_OPS_OK" in out
+        assert outbox.read_text(encoding="utf-8").strip() != ""
+
+        # (d) outbox 配送: wake 失敗時は outbox を戻し状態も変えない -> 次回成功で配送され outbox は空
+        wakes, out = run(ops_stub, STUB_WAKE_FAIL="1")
+        assert len(wakes) == 1 and "AFTER_OPS_OK" in out
+        assert json.loads(wakes[0]["payload"])["kinds"] == ["reaper"]
+        assert json.loads(outbox.read_text(encoding="utf-8").strip())["reaped_event_ids"] == ["Ev_X"]
+        assert "Ops alert: wake failed" in watchdog_log.read_text(encoding="utf-8")
+        wakes, out = run(ops_stub)
+        assert len(wakes) == 1 and wakes[0]["title"] == "Ops alert: reaper"
+        assert outbox.read_text(encoding="utf-8") == ""
+
+        # (e) 復旧したら1回だけ通知。wake 失敗時は warned を戻して次回再送
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE events SET status = 'DONE' WHERE event_id IN ('Ev_HK_OLD', 'Ev_HK_FRESH')")
+            conn.commit()
+        wakes, out = run(ops_stub, STUB_WAKE_FAIL="1")
+        assert len(wakes) == 1 and wakes[0]["title"] == "Ops alert: pending_stale_recovered"
+        assert ops_state()["pending_stale_warned"] is True, "rollback after failed wake"
+        wakes, out = run(ops_stub)
+        assert len(wakes) == 1 and wakes[0]["title"] == "Ops alert: pending_stale_recovered"
+        assert ops_state()["pending_stale_warned"] is False
+        wakes, out = run(ops_stub)
+        assert wakes == []
+
+        # (f) 監視処理自体の失敗は猶予なしで即 wake(1回)・ログには毎回・直ったら復旧1回
+        wakes, out = run(ops_stub, YAMA_PENDING_CHECK_FORCE_FAIL="1")
+        assert len(wakes) == 1 and wakes[0]["title"] == "Ops alert: ops_monitor_failed"
+        det = json.loads(wakes[0]["payload"])["alerts"][0]["details"][0]
+        assert det["step"] == "pending-check" and det["exit_code"] == 2
+        wakes, out = run(ops_stub, YAMA_PENDING_CHECK_FORCE_FAIL="1")
+        assert wakes == [] and "AFTER_OPS_OK" in out
+        assert watchdog_log.read_text(encoding="utf-8").count("ops_monitor failed") == 2
+        wakes, out = run(ops_stub)
+        assert len(wakes) == 1 and wakes[0]["title"] == "Ops alert: ops_monitor_recovered"
+
+        # (g) 警告書き込み失敗(dispatcher/backfill の stderr 由来)は毎回そのまま転送
+        extra = json.dumps([{"kind": "alert_write_failed", "source": "dispatcher.sh", "stderr": "REAPER_ALERT_WRITE_FAILED: x"}])
+        wakes, out = run(ops_stub, OPS_EXTRA_ALERTS=extra)
+        assert len(wakes) == 1 and wakes[0]["title"] == "Ops alert: alert_write_failed"
+
+        # (h) 構文ガード: 実ランタイム同様 wake で終了しても、警告は1回だけ(以前は wake 後の warned 保存が走らず毎回警告)
+        sg_env = {"YAMA_SYNTAX_GUARD_NOW": "1000", "STUB_WD_OK": "0"}
+        wakes, out = run(sg_stub, **sg_env)
+        assert wakes == [] and "AFTER_SG_OK" in out
+        wakes, out = run(sg_stub, **dict(sg_env, YAMA_SYNTAX_GUARD_NOW="1600"))
+        assert len(wakes) == 1 and "WAKE_EXIT" in out
+        wakes, out = run(sg_stub, **dict(sg_env, YAMA_SYNTAX_GUARD_NOW="1630"))
+        assert wakes == [] and "AFTER_SG_OK" in out, "syntax guard must not re-warn every cycle"
+        # ディスパッチした回(code 0)は構文ガードを評価せず、ペイロードの wake を奪わない
+        wakes, out = run(sg_stub, **dict(sg_env, YAMA_SYNTAX_GUARD_NOW="1700", STUB_WD_OK="1", STUB_CODE="0"))
+        assert wakes == [] and "AFTER_SG_OK" in out
+        wakes, out = run(sg_stub, **dict(sg_env, YAMA_SYNTAX_GUARD_NOW="1730", STUB_WD_OK="1"))
+        assert len(wakes) == 1 and wakes[0]["title"] == "Syntax guard: target(s) recovered"
+
+    return "ライブフックの運用警告ブロックを実行し、過渡ノイズ無視・600秒超で1回wake・継続中は無通知・ディスパッチ回は保留・wake失敗時のoutbox復元＆状態ロールバック・復旧1回・監視失敗の即時1回＆毎回ログ・書込失敗の転送を確認。構文ガードもwake=exit前提で重複警告なし・ディスパッチ回は評価しないことを確認"
+
+
+def test_reaper_reap_count_cap_and_requeue() -> str:
+    """69. Reaper差し戻し上限(候補12): reap_count列の後方互換追加・差し戻しごとに+1・3回目でFAILED(reaped_too_many_times)・retry_count不変・実行ごとの集約アラート・書込失敗はstderr・手動requeueだけがreap_countを0に戻す"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        db_path = state_dir / "slack_events.db"
+        payload_path = state_dir / "payload.json"
+        mode_file = Path(tmp) / "mode.txt"
+        mode_file.write_text("full\n", encoding="utf-8")
+        outbox = state_dir / "ops_alerts.jsonl"
+
+        # 旧スキーマ(reap_count 列なし)の既存DBを用意 -> dispatcher が列を追加する
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            CREATE TABLE events (
+                event_id TEXT PRIMARY KEY, channel_id TEXT, user_id TEXT, ts TEXT, thread_ts TEXT,
+                text TEXT, status TEXT NOT NULL DEFAULT 'PENDING', is_bot INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0, error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO events (event_id, channel_id, user_id, ts, text, status, retry_count) "
+            "VALUES ('Ev_REAP_A', 'C_BOARD', 'U_01', '1700400001.000000', 'a', 'PENDING', 1)"
+        )
+        conn.execute(
+            "INSERT INTO events (event_id, channel_id, user_id, ts, text, status) "
+            "VALUES ('Ev_REAP_B', 'C_BOARD', 'U_02', '1700400002.000000', 'b', 'PENDING')"
+        )
+        conn.commit()
+        conn.close()
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "YAMA_STATE_DIR": str(state_dir),
+                "YAMA_DB_PATH": str(db_path),
+                "YAMA_PAYLOAD_PATH": str(payload_path),
+                "YAMA_LOCK_PATH": str(state_dir / "dispatcher.lock"),
+                "YAMA_MODE_FILE": str(mode_file),
+                "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+                "YAMA_OPS_ALERTS_PATH": str(outbox),
+            }
+        )
+        env.pop("YAMA_REAP_LIMIT", None)
+
+        def dispatch() -> subprocess.CompletedProcess:
+            return subprocess.run(["bash", str(DISPATCHER_SH)], env=env, capture_output=True, text=True)
+
+        def age(ids: List[str]) -> None:
+            stale = (datetime.now(timezone.utc) - timedelta(seconds=960)).strftime("%Y-%m-%d %H:%M:%S")
+            with get_db_connection(db_path) as c:
+                for eid in ids:
+                    c.execute("UPDATE events SET updated_at = ? WHERE event_id = ?", (stale, eid))
+                c.commit()
+
+        def rows() -> Dict[str, Dict[str, Any]]:
+            with get_db_connection(db_path) as c:
+                return {
+                    r["event_id"]: dict(r)
+                    for r in c.execute("SELECT event_id, status, reap_count, retry_count, error_message FROM events")
+                }
+
+        r = dispatch()
+        assert r.returncode == 0 and r.stdout.strip() == "DISPATCHED:2", r
+        assert {v["reap_count"] for v in rows().values()} == {0}, "column added with default 0"
+        assert not outbox.exists() or outbox.read_text(encoding="utf-8") == "", "no alert when nothing reaped"
+
+        # 1回目・2回目の差し戻し: PENDING に戻り(同じ回で再ディスパッチ) reap_count が 1, 2
+        for n in (1, 2):
+            age(["Ev_REAP_A", "Ev_REAP_B"])
+            r = dispatch()
+            assert r.returncode == 0 and r.stdout.strip() == "DISPATCHED:2", r
+            st = rows()
+            assert st["Ev_REAP_A"]["reap_count"] == n and st["Ev_REAP_B"]["reap_count"] == n, st
+            assert st["Ev_REAP_A"]["retry_count"] == 1 and st["Ev_REAP_B"]["retry_count"] == 0, "retry_count untouched"
+        alerts = [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines()]
+        assert len(alerts) == 2, "one aggregated line per Reaper run"
+        assert alerts[0]["kind"] == "reaper" and alerts[0]["reaped_count"] == 2
+        assert sorted(alerts[0]["reaped_event_ids"]) == ["Ev_REAP_A", "Ev_REAP_B"] and alerts[0]["failed_event_ids"] == []
+
+        # 3回目: 累計3回に達したので FAILED(reaped_too_many_times) で止める
+        age(["Ev_REAP_A", "Ev_REAP_B"])
+        r = dispatch()
+        assert r.returncode == 1 and r.stdout.strip() == "NO_EVENTS", r
+        st = rows()
+        for eid in ("Ev_REAP_A", "Ev_REAP_B"):
+            assert st[eid]["status"] == "FAILED" and st[eid]["reap_count"] == 3, st[eid]
+            assert st[eid]["error_message"].startswith("reaped_too_many_times"), st[eid]
+        assert st["Ev_REAP_A"]["retry_count"] == 1
+        alerts = [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines()]
+        assert len(alerts) == 3 and alerts[2]["reaped_count"] == 0 and alerts[2]["failed_count"] == 2
+        assert sorted(alerts[2]["failed_event_ids"]) == ["Ev_REAP_A", "Ev_REAP_B"]
+
+        # FAILED のままなら再ディスパッチされない
+        r = dispatch()
+        assert r.stdout.strip() == "NO_EVENTS"
+
+        # 手動 requeue: FAILED -> PENDING、reap_count だけ 0 に戻す(retry_count は維持)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_REAP_A"])
+        assert rc == 0, out.getvalue()
+        st = rows()
+        assert st["Ev_REAP_A"]["status"] == "PENDING" and st["Ev_REAP_A"]["reap_count"] == 0
+        assert st["Ev_REAP_A"]["retry_count"] == 1
+        # FAILED 以外の requeue・存在しない event_id は拒否
+        err = io.StringIO()
+        with redirect_stderr(err):
+            assert agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_REAP_A"]) == 1
+            assert agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_NOPE"]) == 1
+        # 通常の FAILED リトライ経路(commit)は reap_count を変えない
+        r = dispatch()
+        assert r.stdout.strip() == "DISPATCHED:1"
+        commit_event("Ev_REAP_A", "FAILED", error_message="agent error", db_path=db_path)
+        assert rows()["Ev_REAP_A"]["reap_count"] == 0
+
+        # アラート書き込み失敗: 差し戻し自体は行い、stderr に REAPER_ALERT_WRITE_FAILED、終了コードは変えない
+        with get_db_connection(db_path) as c:
+            c.execute("UPDATE events SET status = 'PROCESSING' WHERE event_id = 'Ev_REAP_A'")
+            c.commit()
+        age(["Ev_REAP_A"])
+        bad_env = dict(env, YAMA_OPS_ALERTS_PATH=str(state_dir))  # ディレクトリなので開けない
+        r = subprocess.run(["bash", str(DISPATCHER_SH)], env=bad_env, capture_output=True, text=True)
+        assert r.returncode == 0 and r.stdout.strip() == "DISPATCHED:1", r
+        assert "REAPER_ALERT_WRITE_FAILED" in r.stderr and "Ev_REAP_A" in r.stderr
+        assert rows()["Ev_REAP_A"]["reap_count"] == 1
+
+        # 上限は YAMA_REAP_LIMIT で変えられる(既定3)
+        age(["Ev_REAP_A"])
+        r = subprocess.run(["bash", str(DISPATCHER_SH)], env=dict(env, YAMA_REAP_LIMIT="2"), capture_output=True, text=True)
+        assert rows()["Ev_REAP_A"]["status"] == "FAILED" and rows()["Ev_REAP_A"]["reap_count"] == 2
+
+    return "旧DBへのreap_count列追加・差し戻しごとの+1・累計3回でFAILED(reaped_too_many_times)・retry_count不変・実行ごと1行の集約アラート(件数＋ID一覧)・書込失敗時もディスパッチ継続＆stderr表面化・手動requeueのみreap_count=0・commit経路は不変を確認"
+
+
+def test_backfill_history_paging_and_truncation_alert() -> str:
+    """70. backfill履歴ページング(候補13): 30件x最大3ページをcursorで読む・続きがあるのに打ち切ったら警告(stderr＋outboxにエッジで1回、解消時1回)・2ページで終われば警告なし・3ページ目の投稿も取り込む"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "slack_events.db"
+        init_db(db_path)
+        outbox = Path(tmp) / "ops_alerts.jsonl"
+        ch_welcome, ch_board = TARGET_CHANNELS
+        base_now = 1700500000.0
+        calls: List[Dict[str, Any]] = []
+        pages_by_channel = {ch_welcome: 5, ch_board: 2}
+
+        class PagingClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": "U_YAMA_BOT"}
+
+            def conversations_history(self, **kwargs: Any) -> Dict[str, Any]:
+                calls.append(kwargs)
+                ch = kwargs["channel"]
+                assert kwargs["limit"] == 30
+                page = int((kwargs.get("cursor") or "p1")[1:])
+                total = pages_by_channel[ch]
+                msgs = [
+                    {
+                        "type": "message",
+                        "user": "U_HUMAN",
+                        "text": f"{ch} page {page} msg {i}",
+                        "ts": f"{base_now - page * 100 - i:.6f}",
+                    }
+                    for i in range(2)
+                ]
+                more = page < total
+                return {
+                    "ok": True,
+                    "messages": msgs,
+                    "has_more": more,
+                    "response_metadata": {"next_cursor": f"p{page + 1}" if more else ""},
+                }
+
+            def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "messages": [], "has_more": False}
+
+        env_path = Path(tmp) / "missing.env"
+        err = io.StringIO()
+        with patch.dict(os.environ, {"YAMA_OPS_ALERTS_PATH": str(outbox)}), redirect_stderr(err):
+            res = run_backfill(db_path=db_path, env_path=env_path, client=PagingClient(), now=base_now, sleep_fn=lambda s: None)
+        wel_calls = [c for c in calls if c["channel"] == ch_welcome]
+        brd_calls = [c for c in calls if c["channel"] == ch_board]
+        assert len(wel_calls) == 3, f"capped at 3 pages, got {len(wel_calls)}"
+        assert [c.get("cursor") for c in wel_calls] == [None, "p2", "p3"]
+        assert len({c["oldest"] for c in wel_calls}) == 1, "same oldest window on every page"
+        assert len(brd_calls) == 2, "stops when no next cursor"
+        assert res["truncated"] == [ch_welcome], res
+        assert res["channels"][ch_welcome] == 6 and res["channels"][ch_board] == 4, res
+        assert "history page cap reached" in err.getvalue()
+        alerts = [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines()]
+        assert len(alerts) == 1 and alerts[0]["kind"] == "backfill_truncated" and alerts[0]["channel"] == ch_welcome
+        assert alerts[0]["max_pages"] == 3 and alerts[0]["per_page"] == 30 and alerts[0]["pages"] == 3
+
+        # 打ち切りが続いている間は outbox に追加しない(エッジ)
+        with patch.dict(os.environ, {"YAMA_OPS_ALERTS_PATH": str(outbox)}), redirect_stderr(io.StringIO()):
+            run_backfill(db_path=db_path, env_path=env_path, client=PagingClient(), now=base_now, sleep_fn=lambda s: None)
+        assert len(outbox.read_text(encoding="utf-8").splitlines()) == 1
+
+        # 解消したら1回だけ recovered
+        pages_by_channel[ch_welcome] = 1
+        with patch.dict(os.environ, {"YAMA_OPS_ALERTS_PATH": str(outbox)}), redirect_stderr(io.StringIO()):
+            res3 = run_backfill(db_path=db_path, env_path=env_path, client=PagingClient(), now=base_now, sleep_fn=lambda s: None)
+        assert res3["truncated"] == []
+        alerts = [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines()]
+        assert [a["kind"] for a in alerts] == ["backfill_truncated", "backfill_truncation_recovered"]
+
+        # outbox に書けないときはエッジ状態を進めず、次回に再試行する
+        pages_by_channel[ch_welcome] = 4
+        bad = Path(tmp) / "as_dir"
+        bad.mkdir()
+        err5 = io.StringIO()
+        with patch.dict(os.environ, {"YAMA_OPS_ALERTS_PATH": str(bad)}), redirect_stderr(err5):
+            run_backfill(db_path=db_path, env_path=env_path, client=PagingClient(), now=base_now, sleep_fn=lambda s: None)
+        assert "could not write ops alert" in err5.getvalue()
+        with patch.dict(os.environ, {"YAMA_OPS_ALERTS_PATH": str(outbox)}), redirect_stderr(io.StringIO()):
+            run_backfill(db_path=db_path, env_path=env_path, client=PagingClient(), now=base_now, sleep_fn=lambda s: None)
+        alerts = [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines()]
+        assert [a["kind"] for a in alerts][-1] == "backfill_truncated"
+
+    return "3ページ(cursor p2,p3・同一oldest)で打ち切り＆3ページ目まで取り込み・2ページで自然終了は警告なし・打ち切り警告はstderr＋outboxにエッジで1回・解消時1回・outbox書込失敗時は状態を進めず次回再試行を確認"
+
+
+def test_listener_freeze_guards_and_sd_notify() -> str:
+    """71. リスナー凍結対策(項目5): pong途絶判定(接続中かつ90秒以上のみ・pong未受信はNone扱いで終了しない)・sd_notify WATCHDOG=1 の送信(NOTIFY_SOCKET未設定はno-op・抽象ソケット対応)・ユニットの WatchdogSec/NotifyAccess"""
+    import socket as _socket
+
+    import listener
+
+    class Sess:
+        def __init__(self, t: Optional[float]) -> None:
+            self.last_ping_pong_time = t
+
+    class Cli:
+        def __init__(self, sess: Any) -> None:
+            self.current_session = sess
+
+    now = 1700600000.0
+    assert listener.get_pong_silence_sec(Cli(None), now) is None
+    assert listener.get_pong_silence_sec(Cli(Sess(None)), now) is None
+    assert listener.get_pong_silence_sec(Cli(Sess(now - 95)), now) == 95.0
+    assert listener.get_pong_silence_sec(Cli(Sess(now + 5)), now) == 0.0
+    assert listener.get_pong_silence_sec(Cli(Sess("bad")), now) is None
+
+    assert listener.MAX_PONG_SILENCE_SEC == 90
+    assert listener.should_exit_for_pong_silence(True, 90.0) is True
+    assert listener.should_exit_for_pong_silence(True, 89.9) is False
+    assert listener.should_exit_for_pong_silence(True, None) is False, "no pong yet must not exit"
+    assert listener.should_exit_for_pong_silence(False, 500.0) is False, "disconnect path is the 60s rule"
+
+    # sd_notify: 未設定は False で何もしない
+    assert listener.sd_notify("WATCHDOG=1", env={}) is False
+    with tempfile.TemporaryDirectory() as tmp:
+        sock_path = str(Path(tmp) / "notify.sock")
+        srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)
+        srv.bind(sock_path)
+        srv.settimeout(2)
+        try:
+            assert listener.sd_notify("WATCHDOG=1", env={"NOTIFY_SOCKET": sock_path}) is True
+            assert srv.recv(64) == b"WATCHDOG=1"
+        finally:
+            srv.close()
+        # 送信先が無いときは OSError(呼び出し側がログに出す)
+        try:
+            listener.sd_notify("WATCHDOG=1", env={"NOTIFY_SOCKET": sock_path + ".missing"})
+            raise AssertionError("expected OSError")
+        except OSError:
+            pass
+    abstract = f"@yama-test-{uuid.uuid4().hex}"
+    srv2 = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)
+    srv2.bind("\0" + abstract[1:])
+    srv2.settimeout(2)
+    try:
+        assert listener.sd_notify("WATCHDOG=1", env={"NOTIFY_SOCKET": abstract}) is True
+        assert srv2.recv(64) == b"WATCHDOG=1"
+    finally:
+        srv2.close()
+
+    # ping 間隔は WatchdogSec より十分短く、WatchdogSec は watchdog.sh の窓(120秒+再確認+30秒周期)より長い
+    unit = (BASE_DIR / "yama-listener.service").read_text(encoding="utf-8")
+    kv = dict(
+        line.split("=", 1) for line in unit.splitlines() if "=" in line and not line.startswith("#")
+    )
+    assert kv.get("NotifyAccess") == "main", "Type=simple needs NotifyAccess=main for WATCHDOG=1"
+    wd_sec = int(kv["WatchdogSec"])
+    assert wd_sec >= 180 and listener.WATCHDOG_PING_INTERVAL_SEC * 3 <= wd_sec
+    assert kv.get("Restart") == "always"
+    src = (BASE_DIR / "listener.py").read_text(encoding="utf-8")
+    assert 'sd_notify("WATCHDOG=1")' in src and "should_exit_for_pong_silence(connected, pong_silence)" in src
+
+    return "pong途絶は接続中かつ90秒以上だけで終了・pong未受信や切断中は対象外・sd_notifyの送信/未設定no-op/抽象ソケット/送信失敗OSError・ユニットのWatchdogSec(>=180)とNotifyAccess=mainを確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -9320,7 +9960,7 @@ def main() -> int:
         ("11. Reply 応答ロスト回復 (投稿成功+応答例外・回復履歴1回目失敗→2回目発見で実投稿1回・3回失敗時ambiguous_post_outcome)", test_reply_lost_response_recovery),
         ("12. Reply 投稿前スレッド重複防止 (スレッドに同一文面が既にあれば投稿せずdeduplicated=true・oldest=親ts全体走査)", test_reply_pre_post_thread_dedup),
         ("13. Reply チャンネル投稿bounded重複防止 (直近50件・時間窓なしで15分超の同一文面も再投稿阻止・fail-open)", test_reply_pre_post_channel_bounded_dedup),
-        ("14. Reply スレッド全体走査＆ページング (15分超の同一文面検出・2ページ目検出・最大20ページ上限)", test_reply_thread_fullscan_and_pagination),
+        ("14. Reply スレッド全体走査＆ページング (15分超の同一文面検出・2ページ目検出・20ページ上限打ち切りはfail-closedで送信せず)", test_reply_thread_fullscan_and_pagination),
         ("15. Replies 台帳90日prune (91日超削除・89日保持・NULL/解釈不能タイムスタンプ保持・--dry-run確認)", test_prune_replies),
         ("16. Watchdog ユニット復旧 (Unit not found再配置・他失敗除外・コピー元確認・上限3回＆backoff制御)", test_watchdog_unit_recovery),
         ("17. Record-reply 台帳記録＆DONE時errorクリア (record-reply冪等記録・reply連動dedup・DONE時error_message消去)", test_record_reply_and_done_error_clear),
@@ -9373,6 +10013,11 @@ def main() -> int:
         ("64. 構文ガードの10分エスカレーション＆警告wake (jq組立てJSON検証・wake失敗時はwarned未保存＆後段続行・成功時のみwarned保存・復旧・対象独立・破損耐性)", test_hook_syntax_guard_escalation),
         ("65. auto_join statusファイル＆transient_retries (毎回上書き・吸収リトライのみ計上・最終失敗は二重計上なし・ドライラン無書込・状態エラー時error記録)", test_auto_join_last_status_and_transient_retries),
         ("66. DM代行 auto_streak・proxy_ts・排他制御 (代行3連続で1→2→3＆send拒否・本人投稿で0リセット・resolve --reply-ts・50件上限・ts文字列完全一致)", test_owner_dm_poll_proxy_ts_and_auto_streak),
+        ("67. PENDING滞留チェック ops_monitor.py (人間の未回答だけ計数・自分/他Bot/既知Bot/B始まり/IGNORED/1時間待ち除外・600秒しきい値・失敗exit 2・outbox取出/復元)", test_ops_pending_stale_check_and_outbox),
+        ("68. フック運用警告ブロック (PENDING滞留エッジ通知・復旧1回・outbox配送・wake失敗時ロールバック＆復元・監視失敗の即時通知・ディスパッチ回は保留・構文ガード重複警告なし)", test_hook_ops_alert_block_edge_wake),
+        ("69. Reaper差し戻し上限 (reap_count後方互換追加・3回目でFAILED reaped_too_many_times・retry_count不変・実行ごと集約アラート・手動requeueのみ0リセット)", test_reaper_reap_count_cap_and_requeue),
+        ("70. Backfill履歴ページング (30件x最大3ページ・打ち切り警告をstderr＋outboxにエッジ通知・解消時1回・書込失敗時は次回再試行)", test_backfill_history_paging_and_truncation_alert),
+        ("71. リスナー凍結対策 (pong途絶90秒判定・sd_notify WATCHDOG=1・ユニットWatchdogSec/NotifyAccess)", test_listener_freeze_guards_and_sd_notify),
     ]
 
     print("=" * 72)

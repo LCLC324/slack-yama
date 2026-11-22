@@ -24,6 +24,13 @@ PYTHON_BIN="${YAMA_PYTHON_BIN:-${BASE_DIR}/venv/bin/python}"
 # so that a slow in-flight agent batch (including API backoff retries) is never preempted
 # or overwritten, while PROCESSING events stranded by a timeout/crash are reaped to PENDING.
 PROCESSING_TIMEOUT_SEC="${YAMA_PROCESSING_TIMEOUT_SEC:-900}"
+# Reaper re-queue cap (candidate 12): an event reaped this many times in total
+# (reap_count, separate from retry_count) is moved to FAILED with
+# error_message "reaped_too_many_times: ...". Each Reaper run that reaps or
+# fails anything appends one aggregated alert line to the ops alert outbox,
+# which the dispatch hook delivers to the ops chat via wake.
+REAP_LIMIT="${YAMA_REAP_LIMIT:-3}"
+OPS_ALERTS_PATH="${YAMA_OPS_ALERTS_PATH:-${STATE_DIR}/ops_alerts.jsonl}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN="python3"
@@ -48,8 +55,10 @@ if [[ ! -f "${DB_PATH}" ]]; then
     exit 1
 fi
 
-"${PYTHON_BIN}" - "${DB_PATH}" "${PAYLOAD_PATH}" "${MODE_FILE}" "${PROCESSING_TIMEOUT_SEC}" <<'PYEOF'
+"${PYTHON_BIN}" - "${DB_PATH}" "${PAYLOAD_PATH}" "${MODE_FILE}" "${PROCESSING_TIMEOUT_SEC}" "${REAP_LIMIT}" "${OPS_ALERTS_PATH}" <<'PYEOF'
+import fcntl
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -66,6 +75,22 @@ mode_file = Path(sys.argv[3])
 processing_timeout_sec = (
     int(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_PROCESSING_TIMEOUT_SEC
 )
+reap_limit = int(sys.argv[5]) if len(sys.argv) > 5 else 3
+ops_alerts_path = Path(sys.argv[6]) if len(sys.argv) > 6 else db_path.parent / "ops_alerts.jsonl"
+
+
+def append_ops_alert(entry):
+    """Append one JSON line to the ops alert outbox (same flock as ops_monitor.py)."""
+    ops_alerts_path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
+    with open(ops_alerts_path, "a", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 mode = "shadow"
 if mode_file.exists():
@@ -121,42 +146,100 @@ try:
         conn.execute("ALTER TABLE events ADD COLUMN next_retry_at TIMESTAMP;")
     if "first_unverifiable_at" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN first_unverifiable_at TIMESTAMP;")
+    if "reap_count" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN reap_count INTEGER NOT NULL DEFAULT 0;")
 
     now_utc = datetime.now(timezone.utc)
     proc_rows = conn.execute(
         """
-        SELECT event_id, updated_at, created_at
+        SELECT event_id, updated_at, created_at, reap_count
         FROM events
         WHERE status = 'PROCESSING'
         """
     ).fetchall()
 
-    stale_proc_ids = []
+    stale_procs = []
     active_proc_count = 0
     for pr in proc_rows:
         ts_dt = parse_utc_timestamp(pr["updated_at"]) or parse_utc_timestamp(pr["created_at"])
         if ts_dt is None or (now_utc - ts_dt).total_seconds() >= processing_timeout_sec:
-            stale_proc_ids.append(pr["event_id"])
+            stale_procs.append(pr)
         else:
             active_proc_count += 1
 
-    # Reaper: revert stale PROCESSING events (>= processing_timeout_sec) back to PENDING
-    if stale_proc_ids:
-        reap_placeholders = ",".join("?" for _ in stale_proc_ids)
-        conn.execute(
-            f"""
-            UPDATE events
-            SET status = 'PENDING',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE event_id IN ({reap_placeholders})
-            """,
-            stale_proc_ids,
-        )
+    # Reaper: revert stale PROCESSING events (>= processing_timeout_sec) back to PENDING,
+    # counting each reap in reap_count; once an event has been reaped reap_limit times
+    # in total it is stopped as FAILED (reaped_too_many_times) instead of cycling forever.
+    reaped_ids = []
+    failed_ids = []
+    for pr in stale_procs:
+        new_reap_count = int(pr["reap_count"] or 0) + 1
+        if new_reap_count >= reap_limit:
+            conn.execute(
+                """
+                UPDATE events
+                SET status = 'FAILED',
+                    reap_count = ?,
+                    next_retry_at = NULL,
+                    error_message = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE event_id = ?
+                """,
+                (
+                    new_reap_count,
+                    (
+                        f"reaped_too_many_times: PROCESSING exceeded {processing_timeout_sec}s "
+                        f"and was reaped {new_reap_count} times (limit {reap_limit}); "
+                        "stopped by the Reaper re-queue cap"
+                    ),
+                    pr["event_id"],
+                ),
+            )
+            failed_ids.append(pr["event_id"])
+        else:
+            conn.execute(
+                """
+                UPDATE events
+                SET status = 'PENDING',
+                    reap_count = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE event_id = ?
+                """,
+                (new_reap_count, pr["event_id"]),
+            )
+            reaped_ids.append(pr["event_id"])
+
+    def report_reaper():
+        # Called only after the Reaper's changes are committed. One aggregated
+        # line per Reaper run. A write failure must not change the dispatch
+        # result, so it is surfaced on stderr, which the dispatch hook appends
+        # to state/dispatcher_stderr.log and turns into an ops alert.
+        if not reaped_ids and not failed_ids:
+            return
+        try:
+            append_ops_alert(
+                {
+                    "kind": "reaper",
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "processing_timeout_sec": processing_timeout_sec,
+                    "reap_limit": reap_limit,
+                    "reaped_count": len(reaped_ids),
+                    "reaped_event_ids": reaped_ids,
+                    "failed_count": len(failed_ids),
+                    "failed_event_ids": failed_ids,
+                }
+            )
+        except Exception as alert_exc:
+            print(
+                f"REAPER_ALERT_WRITE_FAILED: {alert_exc} reaped={reaped_ids} failed={failed_ids}",
+                file=sys.stderr,
+            )
 
     # Guard: if any recent PROCESSING event (< processing_timeout_sec) is still in flight,
     # skip new dispatch so we do not overwrite state/payload.json or wake a second session.
     if active_proc_count > 0:
         conn.commit()
+        report_reaper()
         print("LOCKED")
         sys.exit(2)
 
@@ -188,6 +271,7 @@ try:
 
     if not rows:
         conn.commit()
+        report_reaper()
         print("NO_EVENTS")
         sys.exit(1)
 
@@ -204,6 +288,7 @@ try:
         event_ids,
     )
     conn.commit()
+    report_reaper()
 
     events_data = []
     for r in rows:
