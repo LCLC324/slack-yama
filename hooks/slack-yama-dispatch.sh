@@ -455,7 +455,7 @@ if [[ "${code:-1}" != "0" ]]; then
     if _ops_payload="$(jq -n -c \
         --argjson alerts "$_ops_all" \
         '{"ops_alert": true,
-          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正／reply_rejected=reply の event-id ガードで投稿を拒否（--event-id と --no-event-id のどちらも無い・両方ある・events に無い --event-id 等、何も投稿していない）／reply_forced=events に無い --event-id を --force --reason で投稿／archive_write_failed=永続ログ（ops_alerts_archive.jsonl）への記録失敗、配送は継続。*_recovered は復旧）。",
+          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正／reply_rejected=reply の event-id ガードで投稿を拒否（--event-id と --no-event-id のどちらも無い・両方ある・events に無い --event-id 等、何も投稿していない）／reply_forced=events に無い --event-id を --force --reason で投稿／archive_write_failed=永続ログ（ops_alerts_archive.jsonl）への記録失敗、配送は継続／failed_with_landed_reply=返信の着地が台帳にあるのに FAILED のイベントを reconcile が検知（状態は変えていない。requeue しないこと）／requeue_blocked=台帳に返信の着地があるため requeue を拒否（行は不変）／requeue_forced=台帳に着地があるイベントを --force --reason で requeue（台帳は残るので reply は重複排除される）。*_recovered は復旧）。",
           "kinds": ($alerts | map(.kind // "unknown") | unique),
           "alerts": $alerts[0:50],
           "omitted_alerts": ([($alerts | length) - 50, 0] | max)}' 2>/dev/null)" \

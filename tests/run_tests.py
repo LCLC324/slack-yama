@@ -513,7 +513,7 @@ def test_history_retry_recovery() -> str:
         calls = {"count": 0}
 
         class FlakyClient:
-            def conversations_history(self, channel: str, limit: int = 20) -> Dict[str, Any]:
+            def conversations_history(self, channel: str, limit: int = 20, include_all_metadata: bool = False) -> Dict[str, Any]:
                 calls["count"] += 1
                 if calls["count"] == 1:
                     raise http.client.IncompleteRead(b"partial")
@@ -524,7 +524,7 @@ def test_history_retry_recovery() -> str:
                     ],
                 }
 
-            def conversations_replies(self, channel: str, ts: str, limit: int = 20) -> Dict[str, Any]:
+            def conversations_replies(self, channel: str, ts: str, limit: int = 20, include_all_metadata: bool = False) -> Dict[str, Any]:
                 calls["count"] += 1
                 if calls["count"] < 3:
                     raise urllib.error.URLError("Remote end closed connection")
@@ -581,7 +581,7 @@ def test_history_retry_recovery() -> str:
         api_calls = {"count": 0}
 
         class ApiErrorClient:
-            def conversations_history(self, channel: str, limit: int = 20) -> Dict[str, Any]:
+            def conversations_history(self, channel: str, limit: int = 20, include_all_metadata: bool = False) -> Dict[str, Any]:
                 api_calls["count"] += 1
                 raise SlackApiError(
                     message="channel_not_found",
@@ -661,11 +661,11 @@ def test_history_local_db_fallback() -> str:
         sleeps: List[float] = []
 
         class AlwaysDownClient:
-            def conversations_history(self, channel: str, limit: int = 20) -> Dict[str, Any]:
+            def conversations_history(self, channel: str, limit: int = 20, include_all_metadata: bool = False) -> Dict[str, Any]:
                 calls["count"] += 1
                 raise socket.timeout("timed out")
 
-            def conversations_replies(self, channel: str, ts: str, limit: int = 20) -> Dict[str, Any]:
+            def conversations_replies(self, channel: str, ts: str, limit: int = 20, include_all_metadata: bool = False) -> Dict[str, Any]:
                 calls["count"] += 1
                 raise ConnectionResetError("Remote end closed connection without response")
 
@@ -1335,6 +1335,9 @@ def test_reply_lost_response_recovery() -> str:
                 ts: str,
                 oldest: Optional[str] = None,
                 limit: int = 50,
+                include_all_metadata: bool = False,
+                latest: Optional[str] = None,
+                cursor: Optional[str] = None,
             ) -> Dict[str, Any]:
                 if not unrec_posted["value"]:
                     return {"ok": True, "messages": []}
@@ -1412,6 +1415,7 @@ def test_reply_pre_post_thread_dedup() -> str:
                 oldest: Optional[str] = None,
                 limit: int = 50,
                 cursor: Optional[str] = None,
+                include_all_metadata: bool = False,
             ) -> Dict[str, Any]:
                 oldest_seen.append(oldest)
                 assert limit == 50, f"Expected limit=50, got {limit}"
@@ -3117,7 +3121,7 @@ def test_history_retry_5_attempts_and_backoff() -> str:
         ]
 
         class SucceedOn4thHistoryClient:
-            def conversations_history(self, channel: str, limit: int = 20) -> Dict[str, Any]:
+            def conversations_history(self, channel: str, limit: int = 20, include_all_metadata: bool = False) -> Dict[str, Any]:
                 idx = fh_calls["count"]
                 fh_calls["count"] += 1
                 if idx < 3:
@@ -11538,7 +11542,9 @@ def test_ops_alert_archive_on_take() -> str:
             )
             out2 = ops_monitor.outbox_take(bad_out)
             assert [e["kind"] for e in out2] == ["reaper", "archive_write_failed"], out2
-            assert [r["kind"] for r in arch_rows(bad_dir / "ops_alerts_archive.jsonl")] == ["archive_write_failed"]
+            # 監査指摘4の修正（2026-11-23）: アーカイブに失敗した reaper 行も、次の成功した take でアーカイブされる
+            # （旧 assert は ["archive_write_failed"] だけで、失敗行が「アーカイブ済み」扱いで抜け落ちる挙動を固定していた）
+            assert [r["kind"] for r in arch_rows(bad_dir / "ops_alerts_archive.jsonl")] == ["reaper", "archive_write_failed"]
     finally:
         for k, v in saved_env.items():
             if v is None:
@@ -11784,6 +11790,215 @@ def test_reply_event_id_guard_and_metadata_read_no_fallback() -> str:
             "呼び直さず1回で例外・遅延再送はfail-closedを確認")
 
 
+def test_audit_fix_2026_11_23() -> str:
+    """86. 監査（2026-11-23 夜）の指摘の修正: (1) commit --force で FAILED→FAILED は FAILED のまま（retry_count 不変・PENDING に戻らない・requeue のブロックは引き続き効く。PENDING/PROCESSING からの FAILED は従来どおりリトライ）、(2) アーカイブに失敗した行は take が _archived:false を明示し、restore はその印を尊重して次の take でアーカイブされる（印のない行は従来どおり true を付ける）、(3) failed_with_landed_reply の event_ids が archive の keys に入る、(4) _lookup_own_recent_message_once と _fetch_history_unbounded は TypeError で呼び直さない（1回で例外）、(5) requeue 拒否時の stderr は JSON 1行"""
+    import inspect
+    import ops_monitor
+
+    saved_env = {k: os.environ.pop(k, None) for k in (
+        "YAMA_OPS_ALERTS_PATH", "YAMA_OPS_ALERTS_ARCHIVE_PATH",
+        "YAMA_OPS_ALERTS_ARCHIVE_MAX_BYTES", "YAMA_OPS_ARCHIVE_FORCE_FAIL")}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "slack_events.db"
+            init_db(db_path)
+            outbox = db_path.parent / "ops_alerts.jsonl"
+            th = "1795600000.000000"
+
+            def alerts() -> List[Dict[str, Any]]:
+                if not outbox.exists():
+                    return []
+                return [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+            def row(eid: str) -> Dict[str, Any]:
+                with get_db_connection(db_path) as conn:
+                    return dict(conn.execute(
+                        "SELECT status, retry_count, reap_count, error_message, next_retry_at FROM events "
+                        "WHERE event_id = ?", (eid,)).fetchone())
+
+            with get_db_connection(db_path) as conn:
+                # 監査 exp1 と同じ形: Reaper が FAILED にした（retry_count=0, reap_count=3）＋台帳に着地あり
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status, retry_count, "
+                    "reap_count, error_message, created_at, updated_at) VALUES ('Ev_AF_FAIL', 'C_AF', 'U_Q', 't', "
+                    "'1795600001.000000', ?, 'FAILED', 0, 3, 'x', '2026-11-23 00:00:00', '2026-11-23 00:00:00')",
+                    (th,),
+                )
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, retry_count, "
+                    "created_at, updated_at) VALUES ('Ev_AF_PROC', 'C_AF', 'U_Q', 't', '1795600002.000000', "
+                    "'PROCESSING', 0, '2026-11-23 00:00:00', '2026-11-23 00:00:00')"
+                )
+                conn.commit()
+            agent_tools.record_reply(event_id="Ev_AF_FAIL", channel_id="C_AF", thread_ts=th,
+                                     reply_ts="1795600100.000000", text="landed", db_path=db_path)
+
+            # (1) force FAILED->FAILED: stays FAILED, retry_count unchanged, reason kept, commit_forced
+            with redirect_stderr(io.StringIO()):
+                res = agent_tools.commit_event("Ev_AF_FAIL", "FAILED", error_message="audit probe",
+                                               db_path=db_path, force=True, reason="理由の訂正")
+            r = row("Ev_AF_FAIL")
+            assert res["status"] == "FAILED" and r["status"] == "FAILED", (res, r)
+            assert r["retry_count"] == 0 and r["reap_count"] == 3 and r["next_retry_at"] is None, r
+            assert "[forced FAILED->FAILED] 理由の訂正" in r["error_message"], r
+            a = alerts()
+            assert a[-1]["kind"] == "commit_forced" and a[-1]["new_status"] == "FAILED", a
+            # unverifiable error_message must not turn it into a PENDING wait either
+            with redirect_stderr(io.StringIO()):
+                agent_tools.commit_event("Ev_AF_FAIL", "FAILED", error_message="pre_post_check_unverifiable: x",
+                                         db_path=db_path, force=True, reason="再訂正")
+            r = row("Ev_AF_FAIL")
+            assert r["status"] == "FAILED" and r["retry_count"] == 0 and r["next_retry_at"] is None, r
+            # CLI 経由も同じ
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = agent_tools.main(["--db", str(db_path), "commit", "--event-id", "Ev_AF_FAIL", "--status",
+                                       "FAILED", "--force", "--reason", "CLI での訂正"])
+            assert rc == 0 and row("Ev_AF_FAIL")["status"] == "FAILED", (rc, out.getvalue(), err.getvalue())
+            # the only way back is requeue, and the ledger still blocks it
+            n_before = len(alerts())
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_AF_FAIL"])
+            assert rc == 1 and row("Ev_AF_FAIL")["status"] == "FAILED"
+            # (5) stderr is exactly one JSON line (no separate WARN line); the facts are in the alert
+            lines = [x for x in err.getvalue().splitlines() if x.strip()]
+            assert len(lines) == 1, err.getvalue()
+            body = json.loads(lines[0])
+            assert body["error"] == "reply_already_landed" and body["alert_written"] is True, body
+            a = alerts()
+            assert len(a) == n_before + 1 and a[-1]["kind"] == "requeue_blocked", a
+            assert a[-1]["event_id"] == "Ev_AF_FAIL" and a[-1]["reply_ts"] == "1795600100.000000", a[-1]
+            # non-terminal FAILED commits keep the retry rule (PROCESSING -> FAILED -> PENDING, retry_count 1)
+            with redirect_stderr(io.StringIO()):
+                agent_tools.commit_event("Ev_AF_PROC", "FAILED", error_message="agent error", db_path=db_path)
+            r = row("Ev_AF_PROC")
+            assert r["status"] == "PENDING" and r["retry_count"] == 1, r
+            # alert write failure on a blocked requeue: still one JSON line, alert_written false
+            blockfile = Path(tmp) / "blockfile"
+            blockfile.write_text("not a dir", encoding="utf-8")
+            with patch.object(agent_tools, "_ops_alerts_path", return_value=blockfile / "ops_alerts.jsonl"):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_AF_FAIL"])
+            lines = [x for x in err.getvalue().splitlines() if x.strip()]
+            assert rc == 1 and len(lines) == 1 and json.loads(lines[0])["alert_written"] is False, err.getvalue()
+
+            # (2) archive failure -> restore -> next take archives the failed rows (audit exp2)
+            af_dir = Path(tmp) / "arch"
+            af_out = af_dir / "ops_alerts.jsonl"
+            af_arch = af_dir / "ops_alerts_archive.jsonl"
+
+            def arch_kinds() -> List[str]:
+                if not af_arch.exists():
+                    return []
+                return [json.loads(x)["kind"] for x in af_arch.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+            ops_monitor.outbox_append({"kind": "commit_rejected", "event_id": "Ev_AF_1"}, af_out)
+            env_fail = dict(os.environ, YAMA_OPS_ARCHIVE_FORCE_FAIL="1")
+            cp = subprocess.run([str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-take", "--path",
+                                 str(af_out)], env=env_fail, capture_output=True, text=True)
+            assert cp.returncode == 0 and cp.stderr == "", cp
+            taken = json.loads(cp.stdout)
+            assert [e["kind"] for e in taken] == ["commit_rejected", "archive_write_failed"], taken
+            assert taken[0][ops_monitor.ARCHIVED_MARKER] is False, "失敗行には _archived:false を明示する"
+            assert ops_monitor.ARCHIVED_MARKER not in taken[1], taken[1]
+            # wake failed -> hook restores the same JSON; restore keeps the explicit false
+            subprocess.run([str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-restore", "--path",
+                            str(af_out)], input=json.dumps(taken), capture_output=True, text=True, check=True)
+            restored = [json.loads(x) for x in af_out.read_text(encoding="utf-8").splitlines() if x.strip()]
+            assert restored[0][ops_monitor.ARCHIVED_MARKER] is False, restored
+            assert ops_monitor.ARCHIVED_MARKER not in restored[1], restored
+            # the second take fails too (two failures in a row): still not marked archived
+            cp = subprocess.run([str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-take", "--path",
+                                 str(af_out)], env=env_fail, capture_output=True, text=True)
+            taken2 = json.loads(cp.stdout)
+            assert [e["kind"] for e in taken2] == ["commit_rejected", "archive_write_failed", "archive_write_failed"]
+            assert taken2[0][ops_monitor.ARCHIVED_MARKER] is False and taken2[1][ops_monitor.ARCHIVED_MARKER] is False
+            subprocess.run([str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-restore", "--path",
+                            str(af_out)], input=json.dumps(taken2), capture_output=True, text=True, check=True)
+            # the next (successful) take archives every row once, and delivers them without the marker
+            ok_take = ops_monitor.outbox_take(af_out)
+            assert [e["kind"] for e in ok_take] == ["commit_rejected", "archive_write_failed", "archive_write_failed"]
+            assert all(ops_monitor.ARCHIVED_MARKER not in e for e in ok_take), ok_take
+            assert arch_kinds() == ["commit_rejected", "archive_write_failed", "archive_write_failed"], arch_kinds()
+            # rows from a successful take (no marker) are still marked true by restore: no double archive
+            subprocess.run([str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-restore", "--path",
+                            str(af_out)], input=json.dumps(ok_take[:1]), capture_output=True, text=True, check=True)
+            assert ops_monitor.outbox_take(af_out)[0]["kind"] == "commit_rejected"
+            assert len(arch_kinds()) == 3, arch_kinds()
+
+            # (3) failed_with_landed_reply: keys from event_ids
+            rec = ops_monitor.archive_record({"kind": "failed_with_landed_reply", "count": 2,
+                                              "event_ids": ["Ev0CH5CWKHM0", "Ev_B"], "items": []})
+            assert rec["key"] is None and rec["keys"] == ["Ev0CH5CWKHM0", "Ev_B"], rec
+            assert rec["action"] == "alert"
+            # single-event rows and commit-batch rows keep their previous shape
+            assert "keys" not in ops_monitor.archive_record({"kind": "reaper", "event_id": "Ev_S"})
+            assert ops_monitor.archive_record({"kind": "commit_rejected", "rejected": [{"event_id": "Ev_X"}]})["keys"] == ["Ev_X"]
+
+            # (4) no TypeError fallback in _lookup_own_recent_message_once / _fetch_history_unbounded
+            class StrictOldClient:
+                def __init__(self) -> None:
+                    self.replies_calls: List[Dict[str, Any]] = []
+                    self.history_calls: List[Dict[str, Any]] = []
+
+                def auth_test(self) -> Dict[str, Any]:
+                    return {"ok": True, "user_id": "U_YAMA_BOT"}
+
+                def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+                    self.replies_calls.append(kw)
+                    if "include_all_metadata" in kw:
+                        raise TypeError("conversations_replies() got an unexpected keyword argument 'include_all_metadata'")
+                    raise AssertionError("fallback call without include_all_metadata must not happen")
+
+                def conversations_history(self, **kw: Any) -> Dict[str, Any]:
+                    self.history_calls.append(kw)
+                    if "include_all_metadata" in kw:
+                        raise TypeError("conversations_history() got an unexpected keyword argument 'include_all_metadata'")
+                    raise AssertionError("fallback call without include_all_metadata must not happen")
+
+            for thread in (th, None):
+                c = StrictOldClient()
+                try:
+                    agent_tools._lookup_own_recent_message_once(
+                        channel="C_AF", text="x", thread_ts=thread, client=c, bot_user_id="U_YAMA_BOT",
+                        sleep_fn=lambda s: None, oldest="1795600000.000000", latest="1795609999.000000",
+                        event_id="Ev_AF_FAIL",
+                    )
+                    raise AssertionError("expected TypeError from _lookup_own_recent_message_once")
+                except TypeError:
+                    pass
+                calls = c.replies_calls if thread else c.history_calls
+                assert len(calls) == 1 and calls[0]["include_all_metadata"] is True, calls
+                assert calls[0]["oldest"] == "1795600000.000000" and calls[0]["latest"] == "1795609999.000000", calls
+                assert (c.history_calls if thread else c.replies_calls) == []
+
+                c = StrictOldClient()
+                try:
+                    agent_tools._fetch_history_unbounded(
+                        channel="C_AF", thread_ts=thread, limit=5, db_path=db_path, client=c,
+                        sleep_fn=lambda s: None)
+                    raise AssertionError("expected TypeError from _fetch_history_unbounded")
+                except TypeError:
+                    pass
+                calls = c.replies_calls if thread else c.history_calls
+                assert len(calls) == 1 and calls[0]["include_all_metadata"] is True, calls
+            assert "except TypeError" not in inspect.getsource(agent_tools._lookup_own_recent_message_once)
+            assert "except TypeError" not in inspect.getsource(agent_tools._fetch_history_unbounded)
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    return ("force FAILED->FAILEDはFAILEDのまま(retry_count不変・unverifiableでもPENDINGにならない・CLIも同じ)・requeueは台帳で"
+            "引き続きブロック・非終端からのFAILEDは従来どおりPENDING・requeue拒否のstderrはJSON1行(alert_written)・"
+            "アーカイブ失敗行は_archived:falseでrestore後も保持され2連続失敗後の成功takeで全行1回ずつアーカイブ・"
+            "failed_with_landed_replyのkeys・2関数はTypeErrorで呼び直さず1回で例外、を確認")
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -11871,6 +12086,7 @@ def main() -> int:
         ("83. 運用アラートの永続ログ (take時にarchiveへ追記・単一経路・rejected/forced区別・サイズ上限で1世代ローテーション・書込失敗でもtake継続＋archive_write_failed・restore行の二重記録なし)", test_ops_alert_archive_on_take),
         ("84. 候補27 代替案A (台帳に着地ありのFAILEDを検知して1行通知・状態は不変・PROCESSING等は対象外・requeueは台帳ありでブロック・--force --reasonで通過)", test_failed_with_landed_reply_detect_and_requeue_guard),
         ("85. 候補28 event-id 付け忘れ・打ち間違い防止 (reply の二択必須・実在確認と--force --reason・--no-event-idは台帳に記録しない・読み取りのinclude_all_metadataフォールバック削除)", test_reply_event_id_guard_and_metadata_read_no_fallback),
+        ("86. 監査（2026-11-23 夜）の修正 (force FAILED->FAILEDはFAILEDのまま・requeue拒否のstderrはJSON1行・アーカイブ失敗行に印を付けない・failed_with_landed_replyのkeys・2関数のTypeErrorフォールバック削除)", test_audit_fix_2026_11_23),
     ]
 
     print("=" * 72)

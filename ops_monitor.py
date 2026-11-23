@@ -48,6 +48,9 @@ Permanent archive (candidate 26, 2026-11-23):
     hook merges stderr into the JSON it parses).
   - Entries put back by outbox-restore (wake failed) carry "_archived": true so
     the next take does not archive them twice; take strips the marker.
+    When the archive write itself failed, take returns those rows with an
+    explicit "_archived": false; restore keeps an existing marker as is, so
+    they are archived by the next take (audit fix 2026-11-23).
   - Timing: the hook's successful wake exits the hook, so take is the last
     point we control. A row is therefore "taken for delivery"; a failed wake is
     logged in watchdog.log and the row is restored, not re-archived.
@@ -274,6 +277,9 @@ def archive_record(entry: Dict[str, Any], archived_at: Optional[str] = None) -> 
     if not key and isinstance(entry.get("rejected"), list):
         # commit-batch validation: one outbox line for several events
         keys = [r.get("event_id") for r in entry["rejected"] if isinstance(r, dict) and r.get("event_id")]
+    elif not key and isinstance(entry.get("event_ids"), list):
+        # failed_with_landed_reply (reconcile): one outbox line for several events
+        keys = [str(x) for x in entry["event_ids"] if x]
     # forced: the status the row had when the correction was attempted
     current = entry.get("previous_status") if action == "forced" else entry.get("current_status")
     now = archived_at or _utc_now_iso()
@@ -355,6 +361,11 @@ def outbox_take(
                 raise OSError("forced failure (test hook)")
             archive_append(to_archive, target)
         except Exception as exc:
+            # Audit fix 2026-11-23 (#4): the rows that failed to archive carry an
+            # explicit "_archived": false, so outbox-restore (wake failed) does
+            # not mark them archived and the next take archives them.
+            for e in to_archive:
+                e[ARCHIVED_MARKER] = False
             entries.append(
                 {
                     "kind": "archive_write_failed",
@@ -438,9 +449,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise ValueError("expected a JSON array on stdin")
             for entry in data:
                 if isinstance(entry, dict):
-                    # already archived by the take that produced it; do not archive twice
-                    # (the archive_write_failed notice itself was never archived)
-                    if entry.get("kind") != "archive_write_failed":
+                    # An explicit marker set by take is respected ("_archived": false =
+                    # the archive write failed, so the next take must archive it).
+                    # Without a marker the row was archived by the take that produced
+                    # it; mark it so it is not archived twice (the archive_write_failed
+                    # notice itself was never archived).
+                    if ARCHIVED_MARKER not in entry and entry.get("kind") != "archive_write_failed":
                         entry = dict(entry, **{ARCHIVED_MARKER: True})
                     outbox_append(entry, Path(args.path))
             return 0

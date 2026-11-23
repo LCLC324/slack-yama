@@ -475,10 +475,12 @@ def _ops_alerts_path(db_path: Path) -> Path:
     return Path(env_path) if env_path else Path(db_path).parent / OPS_ALERTS_FILENAME
 
 
-def _append_ops_alert(entry: Dict[str, Any], db_path: Path) -> bool:
+def _append_ops_alert(entry: Dict[str, Any], db_path: Path, quiet: bool = False) -> bool:
     """Append one JSON line to the ops alert outbox under an exclusive flock (same
     format as ops_monitor.outbox_append). Never raises: a failed write is reported on
-    stderr so the caller's commit result is not affected."""
+    stderr so the caller's commit result is not affected. quiet=True skips that stderr
+    line; the caller must then report the False return itself (requeue puts it in
+    its single stderr JSON)."""
     import fcntl
 
     path = _ops_alerts_path(db_path)
@@ -495,6 +497,8 @@ def _append_ops_alert(entry: Dict[str, Any], db_path: Path) -> bool:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         return True
     except Exception as exc:
+        if quiet:
+            return False
         print(
             f"[commit] ALERT_WRITE_FAILED ({entry.get('kind')}): {exc} entry={json.dumps(entry, ensure_ascii=False)[:500]}",
             file=sys.stderr,
@@ -546,6 +550,9 @@ def commit_event(
       - force=True with a non-empty reason: a rejected transition is applied anyway (for
         corrections such as IGNORED -> DONE). The reason is kept in error_message
         ("[forced OLD->NEW] reason") and one line goes to the ops alert outbox.
+        A forced FAILED -> FAILED only rewrites error_message: the row stays FAILED and
+        the retry rules below are skipped (retry_count unchanged), so force is never
+        a way around requeue.
 
     Commit the final or retry state of an event:
       - DONE / IGNORED: transitions status directly to DONE or IGNORED and clears wait timestamps.
@@ -663,7 +670,26 @@ def commit_event(
 
         current_retries = int(row["retry_count"] or 0)
 
-        if status == "FAILED":
+        if decision == "force" and current_status == "FAILED" and status == "FAILED":
+            # Audit fix 2026-11-23 (#3): a forced FAILED -> FAILED is only a
+            # correction of error_message. It must not run the retry branch
+            # below (retry_count < max_retries would flip it to PENDING and
+            # bypass the requeue ledger check). FAILED -> PENDING stays
+            # requeue-only.
+            new_retries = current_retries
+            final_status = "FAILED"
+            conn.execute(
+                """
+                UPDATE events
+                SET status = 'FAILED',
+                    error_message = ?,
+                    next_retry_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE event_id = ?
+                """,
+                (error_message, event_id),
+            )
+        elif status == "FAILED":
             is_unverifiable = bool(
                 error_message and UNVERIFIABLE_ERROR_CODE in error_message.lower()
             )
@@ -1050,32 +1076,20 @@ def _fetch_history_unbounded(
     try:
         active_client = client if client is not None else get_web_client()
 
+        # Candidate 28 (audit fix 2026-11-23): no TypeError fallback.
         def _do_call() -> Any:
             if thread_ts:
-                try:
-                    return active_client.conversations_replies(
-                        channel=channel,
-                        ts=thread_ts,
-                        limit=limit,
-                        include_all_metadata=True,
-                    )
-                except TypeError:
-                    return active_client.conversations_replies(
-                        channel=channel,
-                        ts=thread_ts,
-                        limit=limit,
-                    )
-            try:
-                return active_client.conversations_history(
+                return active_client.conversations_replies(
                     channel=channel,
+                    ts=thread_ts,
                     limit=limit,
                     include_all_metadata=True,
                 )
-            except TypeError:
-                return active_client.conversations_history(
-                    channel=channel,
-                    limit=limit,
-                )
+            return active_client.conversations_history(
+                channel=channel,
+                limit=limit,
+                include_all_metadata=True,
+            )
 
         resp = _call_with_retry(
             _do_call,
@@ -3353,22 +3367,12 @@ def _lookup_own_recent_message_once(
             if cursor:
                 replies_kwargs["cursor"] = cursor
 
+            # Candidate 28 (audit fix 2026-11-23): no TypeError fallback. The
+            # production SDK accepts include_all_metadata; silently dropping it
+            # (or the oldest/latest/cursor window) would downgrade the metadata
+            # match to a text match without anyone noticing.
             def _do_page_call(kw: Dict[str, Any] = replies_kwargs) -> Any:
-                try:
-                    return active_client.conversations_replies(**kw)
-                except TypeError:
-                    no_meta_kw = {
-                        k: v
-                        for k, v in kw.items()
-                        if k in ("channel", "ts", "oldest", "limit", "cursor")
-                    }
-                    try:
-                        return active_client.conversations_replies(**no_meta_kw)
-                    except TypeError:
-                        fallback_kw = {
-                            k: v for k, v in kw.items() if k in ("channel", "ts", "oldest", "limit")
-                        }
-                        return active_client.conversations_replies(**fallback_kw)
+                return active_client.conversations_replies(**kw)
 
             resp = _call_with_retry(
                 _do_page_call,
@@ -3462,14 +3466,10 @@ def _lookup_own_recent_message_once(
     if scan_latest_ch is not None:
         history_kwargs["latest"] = scan_latest_ch
 
+    # Candidate 28 (audit fix 2026-11-23): no TypeError fallback (it also
+    # dropped the oldest/latest window).
     def _do_history_call(kw: Dict[str, Any] = history_kwargs) -> Any:
-        try:
-            return active_client.conversations_history(**kw)
-        except TypeError:
-            return active_client.conversations_history(
-                channel=channel,
-                limit=CHANNEL_HISTORY_BOUND_LIMIT,
-            )
+        return active_client.conversations_history(**kw)
 
     resp = _call_with_retry(
         _do_history_call,
@@ -3953,9 +3953,12 @@ class RequeueBlocked(ValueError):
     """requeue refused because the replies ledger already holds a landed reply for the
     event (candidate 27, alternative A). Carries the ledger row for the CLI output."""
 
-    def __init__(self, event_id: str, ledger_row: Dict[str, Any]) -> None:
+    def __init__(
+        self, event_id: str, ledger_row: Dict[str, Any], alert_written: bool = True
+    ) -> None:
         self.event_id = event_id
         self.ledger_row = dict(ledger_row)
+        self.alert_written = bool(alert_written)
         super().__init__(
             f"Event '{event_id}' is FAILED but the replies ledger already records a landed "
             f"reply (channel={ledger_row.get('channel_id')}, reply_ts={ledger_row.get('reply_ts')}). "
@@ -4018,12 +4021,10 @@ def requeue_event(
             ledger_row = dict(ledger)
             if not force:
                 conn.rollback()
-                print(
-                    f"[requeue] WARN reply_already_landed: event {event_id} has a landed reply "
-                    f"(reply_ts={ledger_row.get('reply_ts')}); requeue refused (row unchanged)",
-                    file=sys.stderr,
-                )
-                _append_ops_alert(
+                # Audit fix 2026-11-23 (#8): no separate "[requeue] WARN" line. The
+                # same facts are in the requeue_blocked ops alert below and in the
+                # single stderr JSON that cmd_requeue prints (stderr = one JSON).
+                alert_ok = _append_ops_alert(
                     {
                         "kind": "requeue_blocked",
                         "reason": "reply_already_landed",
@@ -4037,8 +4038,9 @@ def requeue_event(
                         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     },
                     Path(db_path),
+                    quiet=True,
                 )
-                raise RequeueBlocked(event_id, ledger_row)
+                raise RequeueBlocked(event_id, ledger_row, alert_written=alert_ok)
             forced_reply_ts = str(ledger_row.get("reply_ts"))
             new_error = _forced_requeue_error_message(
                 forced_reply_ts, str(reason), row["error_message"]
@@ -4105,6 +4107,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
                     "current_status": "FAILED",
                     "landed_reply": blocked.ledger_row,
                     "message": str(blocked),
+                    "alert_written": blocked.alert_written,
                 },
                 ensure_ascii=False,
             ),
