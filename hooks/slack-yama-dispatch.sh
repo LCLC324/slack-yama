@@ -107,7 +107,9 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 # Best-effort listener watchdog: restarts the listener only when its
-# heartbeat has been stale for more than 3 minutes. Silent when healthy.
+# heartbeat has been stale for 120 seconds or more (= watchdog.sh
+# THRESHOLD_SEC=120; it re-checks after RECHECK_SEC=5 before restarting and
+# applies RESTART_COOLDOWN_SEC=60 after a restart). Silent when healthy.
 # Guard: never execute a child script whose syntax is broken (e.g. mid-edit
 # or a bad save). bash reads scripts incrementally, so a torn file could
 # otherwise run half-old/half-new code. Skip this cycle and log it; the
@@ -453,7 +455,7 @@ if [[ "${code:-1}" != "0" ]]; then
     if _ops_payload="$(jq -n -c \
         --argjson alerts "$_ops_all" \
         '{"ops_alert": true,
-          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正。*_recovered は復旧）。",
+          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正／reply_rejected=reply の event-id ガードで投稿を拒否（--event-id と --no-event-id のどちらも無い・両方ある・events に無い --event-id 等、何も投稿していない）／reply_forced=events に無い --event-id を --force --reason で投稿／archive_write_failed=永続ログ（ops_alerts_archive.jsonl）への記録失敗、配送は継続。*_recovered は復旧）。",
           "kinds": ($alerts | map(.kind // "unknown") | unique),
           "alerts": $alerts[0:50],
           "omitted_alerts": ([($alerts | length) - 50, 0] | max)}' 2>/dev/null)" \

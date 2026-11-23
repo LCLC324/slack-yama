@@ -4,7 +4,9 @@ Yama Agent Tools CLI (Layer 3)
 Subcommands for the awakened autonomous agent:
   - pending
   - history --channel X [--thread-ts Y] [--limit N]
-  - reply --channel X --text-file F [--thread-ts Y] [--event-id E]
+  - reply --channel X --text-file F [--thread-ts Y] (--event-id E | --no-event-id)
+      [--force --reason TEXT]   (exactly one of --event-id / --no-event-id is required;
+      --event-id must exist in the events table unless --force --reason)
   - record-reply --event-id E --channel X --reply-ts T --text-file F [--thread-ts Y]
   - reconcile-replies [--days 7] [--dry-run]
   - prune-replies [--days 90] [--dry-run]
@@ -13,7 +15,9 @@ Subcommands for the awakened autonomous agent:
       (terminal guard: DONE/IGNORED same status = no-op, other status / FAILED = already_terminal)
   - commit-batch --file decisions.json   (several commits at once; all-or-nothing validation)
   - seed-mirror [--days 3] [--dry-run]   (one-off read-only fill of the local thread mirror)
-  - requeue --event-id E   (manual re-queue FAILED -> PENDING; resets reap_count only)
+  - requeue --event-id E [--force --reason TEXT]   (manual re-queue FAILED -> PENDING;
+      resets reap_count only; refused with reply_already_landed when the replies ledger
+      already has a reply for E, unless --force --reason)
   - mode
 """
 
@@ -63,6 +67,8 @@ MAX_RETRIES = 3
 TERMINAL_STATUSES = ("DONE", "IGNORED", "FAILED")
 COMMIT_REJECTED_CODE = "already_terminal"
 OPS_ALERTS_FILENAME = "ops_alerts.jsonl"
+# Candidate 27, alternative A: FAILED events with a landed reply already alerted once.
+FAILED_LANDED_ALERTED_FILENAME = "failed_with_landed_reply_alerted.json"
 
 TRANSIENT_CONNECTION_ERRORS: Tuple[type, ...] = (
     urllib.error.URLError,
@@ -1728,20 +1734,13 @@ def _scan_thread_yama_messages(
         if cursor:
             replies_kwargs["cursor"] = cursor
 
+        # No TypeError fallback (candidate 28): slack_sdk 3.46.0 declares
+        # include_all_metadata on conversations_replies and the live API returns
+        # metadata with it (checked 2026-11-23). Dropping the flag silently would
+        # turn the metadata match into a text-only match, so a TypeError is a bug
+        # and must surface instead of being swallowed.
         def _do_call(kw: Dict[str, Any] = replies_kwargs) -> Any:
-            try:
-                return client.conversations_replies(**kw)
-            except TypeError:
-                fallback_kw = {
-                    k: v for k, v in kw.items() if k in ("channel", "ts", "oldest", "limit", "cursor")
-                }
-                try:
-                    return client.conversations_replies(**fallback_kw)
-                except TypeError:
-                    minimal_kw = {
-                        k: v for k, v in kw.items() if k in ("channel", "ts", "limit")
-                    }
-                    return client.conversations_replies(**minimal_kw)
+            return client.conversations_replies(**kw)
 
         resp = _call_with_retry(
             _do_call,
@@ -1935,6 +1934,127 @@ def _select_matching_yama_message(
     return None
 
 
+def _failed_landed_alerted_path(db_path: Path) -> Path:
+    """Which FAILED-with-landed-reply events were already alerted (one alert per event)."""
+    return Path(db_path).parent / FAILED_LANDED_ALERTED_FILENAME
+
+
+def detect_failed_with_landed_reply(
+    db_path: Path = DEFAULT_DB_PATH,
+    dry_run: bool = False,
+    extra_event_ids: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Candidate 27, alternative A (detection only; no status change).
+    Finds events whose status is FAILED while the replies ledger already records a
+    landed reply for the same event_id. Only FAILED is looked at, so PENDING /
+    PROCESSING events (still being worked on) and DONE / IGNORED are never reported.
+    The check reads the local DB only, so it is not limited to reconcile's day window
+    (a FAILED event stays a double-reply risk for requeue however old it is).
+
+    New findings go to the ops alert outbox as one line per run (kind
+    "failed_with_landed_reply"). Already alerted event_ids are kept in a small state
+    file beside the DB so the hourly run does not repeat them; an id is dropped from
+    that file once the event is no longer FAILED-with-ledger, so a recurrence alerts
+    again. dry_run reports what would be alerted without writing the outbox or the
+    state file. extra_event_ids: FAILED events this run matched but (dry_run) did not
+    write to the ledger; they are reported as if recorded."""
+    db_path = Path(db_path)
+    _ensure_replies_table(db_path)
+    with get_db_connection(db_path) as conn:
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                """
+                SELECT e.event_id, e.channel_id, e.thread_ts, e.ts, e.error_message,
+                       e.updated_at, r.reply_ts, r.created_at AS recorded_at
+                FROM events e
+                JOIN replies r ON r.event_id = e.event_id
+                WHERE e.status = 'FAILED'
+                ORDER BY CAST(e.ts AS REAL) ASC, e.rowid ASC
+                """
+            ).fetchall()
+        ]
+        if extra_event_ids:
+            known = {r["event_id"] for r in rows}
+            for eid in sorted(set(extra_event_ids) - known):
+                ev = conn.execute(
+                    "SELECT event_id, channel_id, thread_ts, ts, error_message, updated_at "
+                    "FROM events WHERE event_id = ? AND status = 'FAILED'",
+                    (eid,),
+                ).fetchone()
+                if ev is not None:
+                    item = dict(ev)
+                    item["reply_ts"] = None
+                    item["recorded_at"] = None
+                    item["pending_record"] = True
+                    rows.append(item)
+
+    found_ids = [str(r["event_id"]) for r in rows]
+    state_path = _failed_landed_alerted_path(db_path)
+    alerted_before: Dict[str, Any] = {}
+    try:
+        if state_path.exists():
+            loaded = json.loads(state_path.read_text(encoding="utf-8") or "{}")
+            if isinstance(loaded, dict):
+                alerted_before = loaded
+    except Exception:
+        alerted_before = {}
+
+    new_rows = [r for r in rows if str(r["event_id"]) not in alerted_before]
+    result: Dict[str, Any] = {
+        "found": found_ids,
+        "new": [str(r["event_id"]) for r in new_rows],
+        "alerted": False,
+    }
+    if dry_run:
+        return result
+
+    if new_rows:
+        result["alerted"] = _append_ops_alert(
+            {
+                "kind": "failed_with_landed_reply",
+                "source": "reconcile-replies",
+                "count": len(new_rows),
+                "event_ids": [str(r["event_id"]) for r in new_rows],
+                "items": [
+                    {
+                        "event_id": str(r["event_id"]),
+                        "channel": r.get("channel_id"),
+                        "thread_ts": r.get("thread_ts"),
+                        "reply_ts": r.get("reply_ts"),
+                        "error": (str(r.get("error_message") or ""))[:200] or None,
+                    }
+                    for r in new_rows
+                ],
+                "note": "status unchanged (FAILED); do not requeue without checking the thread",
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            db_path,
+        )
+    # Keep ids still FAILED-with-ledger; drop the rest so a recurrence alerts again.
+    # Ids from a failed alert write are not stored, so the next run retries them.
+    next_state = {
+        eid: alerted_before[eid] for eid in found_ids if eid in alerted_before
+    }
+    if new_rows and result["alerted"]:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for r in new_rows:
+            next_state[str(r["event_id"])] = stamp
+    if next_state != alerted_before:
+        try:
+            tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+            tmp_path.write_text(
+                json.dumps(next_state, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+            )
+            os.replace(tmp_path, state_path)
+        except Exception as exc:
+            print(
+                f"[reconcile] WARN failed_with_landed_reply state write failed: {exc}",
+                file=sys.stderr,
+            )
+    return result
+
+
 def reconcile_replies(
     days: int = DEFAULT_RECONCILE_DAYS,
     dry_run: bool = False,
@@ -1950,7 +2070,9 @@ def reconcile_replies(
     recorded (or from event_ts - 60s for legacy events without attempt_ts) and matching by:
       1. metadata.event_payload.event_id exact match
       2. normalized intended_text match (backward compatibility),
-    and clear residual error_message on DONE events whose thread scan completes."""
+    and clear residual error_message on DONE events whose thread scan completes.
+    Finally, FAILED events that have a landed reply in the ledger are reported and
+    alerted once (detect_failed_with_landed_reply); their status is left unchanged."""
     if days < 0:
         raise ValueError(f"days must be non-negative, got {days}")
     db_path = Path(db_path)
@@ -2201,6 +2323,24 @@ def reconcile_replies(
         except Exception as exc:
             error_details.append({"event_id": event_id, "error": str(exc)})
 
+    # Candidate 27, alternative A: detect FAILED events that have a landed reply in the
+    # ledger and alert once. Status is never changed here (terminal guard kept).
+    failed_candidate_ids = {
+        str(c["event_id"]) for c in candidates if str(c.get("status") or "").upper() == "FAILED"
+    }
+    dry_run_extra = (
+        {r["event_id"] for r in recorded if r["event_id"] in failed_candidate_ids}
+        if dry_run
+        else None
+    )
+    try:
+        failed_with_landed = detect_failed_with_landed_reply(
+            db_path=db_path, dry_run=dry_run, extra_event_ids=dry_run_extra
+        )
+    except Exception as exc:
+        failed_with_landed = {"error": str(exc)}
+        error_details.append({"event_id": "*failed_with_landed_reply*", "error": str(exc)})
+
     return {
         "ok": True,
         "dry_run": bool(dry_run),
@@ -2209,6 +2349,7 @@ def reconcile_replies(
         "recorded": recorded,
         "not_found": not_found,
         "done_error_cleared": done_error_cleared,
+        "failed_with_landed_reply": failed_with_landed,
         "errors": len(error_details),
         "error_details": error_details,
     }
@@ -2528,22 +2669,9 @@ def _pre_post_check_thread_for_reply(
         if cursor:
             replies_kwargs["cursor"] = cursor
 
+        # No TypeError fallback (candidate 28): see _scan_thread_yama_messages.
         def _do_page_call(kw: Dict[str, Any] = replies_kwargs) -> Any:
-            try:
-                return active_client.conversations_replies(**kw)
-            except TypeError:
-                no_meta_kw = {
-                    k: v
-                    for k, v in kw.items()
-                    if k in ("channel", "ts", "oldest", "limit", "cursor")
-                }
-                try:
-                    return active_client.conversations_replies(**no_meta_kw)
-                except TypeError:
-                    fallback_kw = {
-                        k: v for k, v in kw.items() if k in ("channel", "ts", "oldest", "limit")
-                    }
-                    return active_client.conversations_replies(**fallback_kw)
+            return active_client.conversations_replies(**kw)
 
         resp = _call_with_retry(
             _do_page_call,
@@ -2633,7 +2761,110 @@ def _pre_post_check_thread_for_reply(
     return None, None
 
 
+def _reply_guard_alert(kind: str, fields: Dict[str, Any], db_path: Path) -> None:
+    entry: Dict[str, Any] = {
+        "kind": kind,
+        "source": "reply",
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    entry.update({k: v for k, v in fields.items() if v is not None})
+    _append_ops_alert(entry, db_path)
+
+
+def check_reply_event_id_choice(
+    event_id_arg: Optional[str],
+    no_event_id: bool,
+    force: bool,
+    reason: Optional[str],
+    channel: Optional[str],
+    db_path: Path,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], bool]:
+    """Event-id guard for reply (candidate 28). Returns (event_id, error, forced).
+
+    Exactly one of --event-id <ID> / --no-event-id must be given (forgotten id guard).
+    A given --event-id must exist in the events table (typo guard); --force --reason
+    lets an unknown id through. --no-event-id posts carry no event_id at all, so they
+    are never recorded in the replies ledger. A refusal returns an error dict (caller
+    prints it and exits 1, nothing is read or posted) and leaves one ops alert line."""
+    has_id_flag = event_id_arg is not None
+    event_id = str(event_id_arg).strip() if has_id_flag else None
+
+    def _refuse(code: str, message: str, **extra: Any) -> Tuple[None, Dict[str, Any], bool]:
+        _reply_guard_alert(
+            "reply_rejected",
+            {"reason": code, "event_id": event_id or None, "channel": channel, **extra},
+            db_path,
+        )
+        err: Dict[str, Any] = {"ok": False, "error": code, "message": message}
+        if event_id:
+            err["event_id"] = event_id
+        return None, err, False
+
+    if has_id_flag and no_event_id:
+        return _refuse(
+            "event_id_choice_conflict",
+            "--event-id and --no-event-id are mutually exclusive; give exactly one.",
+        )
+    if not has_id_flag and not no_event_id:
+        return _refuse(
+            "event_id_choice_missing",
+            "reply requires --event-id <ID> (reply to an event) or --no-event-id "
+            "(share / report post not tied to an event).",
+        )
+    if no_event_id:
+        if force or reason is not None:
+            return _refuse(
+                "force_without_event_id",
+                "--force / --reason only apply to --event-id; drop them for --no-event-id.",
+            )
+        return None, None, False
+    if not event_id:
+        return _refuse(
+            "event_id_empty",
+            "--event-id was given an empty value; pass the real event_id or use --no-event-id.",
+        )
+    if force and not (reason and str(reason).strip()):
+        return _refuse(
+            "force_requires_reason",
+            "--force requires a non-empty --reason.",
+        )
+    if get_event_by_id(event_id, db_path=db_path) is not None:
+        return event_id, None, False
+    if not force:
+        return _refuse(
+            "unknown_event_id",
+            f"event_id {event_id} is not in the events table (typo?). Nothing was posted. "
+            "Check the id; to post anyway use --force --reason <text>.",
+        )
+    _reply_guard_alert(
+        "reply_forced",
+        {
+            "reason": str(reason).strip()[:300],
+            "event_id": event_id,
+            "channel": channel,
+            "forced_check": "unknown_event_id",
+        },
+        db_path,
+    )
+    return event_id, None, True
+
+
 def cmd_reply(args: argparse.Namespace) -> int:
+    db_path = Path(getattr(args, "db", DEFAULT_DB_PATH))
+    # A forced unknown event_id is recorded as a reply_forced ops alert (stderr stays
+    # reserved for the single JSON error object callers parse).
+    event_id, guard_err, _forced_unknown_event = check_reply_event_id_choice(
+        event_id_arg=getattr(args, "event_id", None),
+        no_event_id=bool(getattr(args, "no_event_id", False)),
+        force=bool(getattr(args, "force", False)),
+        reason=getattr(args, "reason", None),
+        channel=getattr(args, "channel", None),
+        db_path=db_path,
+    )
+    if guard_err is not None:
+        print(json.dumps(guard_err, ensure_ascii=False), file=sys.stderr)
+        return 1
+
     text_file = Path(args.text_file)
     if not text_file.exists():
         print(
@@ -2649,9 +2880,6 @@ def cmd_reply(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-
-    event_id: Optional[str] = getattr(args, "event_id", None)
-    db_path = Path(getattr(args, "db", DEFAULT_DB_PATH))
 
     event_row = get_event_by_id(event_id, db_path=db_path) if event_id else None
     event_ts: Optional[str] = (
@@ -3721,17 +3949,57 @@ def cmd_seed_mirror(args: argparse.Namespace) -> int:
     return 0 if out.get("ok") else 1
 
 
-def requeue_event(event_id: str, db_path: Path = DEFAULT_DB_PATH) -> Dict[str, Any]:
+class RequeueBlocked(ValueError):
+    """requeue refused because the replies ledger already holds a landed reply for the
+    event (candidate 27, alternative A). Carries the ledger row for the CLI output."""
+
+    def __init__(self, event_id: str, ledger_row: Dict[str, Any]) -> None:
+        self.event_id = event_id
+        self.ledger_row = dict(ledger_row)
+        super().__init__(
+            f"Event '{event_id}' is FAILED but the replies ledger already records a landed "
+            f"reply (channel={ledger_row.get('channel_id')}, reply_ts={ledger_row.get('reply_ts')}). "
+            "Requeueing it would put an already answered event back in the queue. "
+            "Check the thread first; if a requeue is still needed, run "
+            "requeue --event-id <id> --force --reason <text>."
+        )
+
+
+def _forced_requeue_error_message(
+    reply_ts: Any, reason: str, error_message: Optional[str]
+) -> str:
+    marker = f"[forced requeue: reply already landed ts={reply_ts}] {reason.strip()}"
+    return f"{error_message} {marker}" if error_message else marker
+
+
+def requeue_event(
+    event_id: str,
+    db_path: Path = DEFAULT_DB_PATH,
+    force: bool = False,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
     """Manually re-queue a FAILED event back to PENDING (operator action).
     This is the only path that resets reap_count to 0 (candidate 12). retry_count,
     error_message and first_unverifiable_at are deliberately left unchanged so the
     existing retry / 24h-unverifiable rules keep their history; next_retry_at is
-    cleared so the event is dispatched on the next 30s cycle."""
+    cleared so the event is dispatched on the next 30s cycle.
+
+    Landed-reply guard (candidate 27, alternative A): if the replies ledger already has
+    a row for this event_id, the requeue is refused (RequeueBlocked, row unchanged, one
+    ops alert line "requeue_blocked"). force=True with a non-empty reason overrides it
+    (same form as the commit terminal-guard correction): the reason is appended to
+    error_message and one ops alert line "requeue_forced" is written. The ledger row is
+    kept, so a later reply --event-id for this event is deduplicated, not re-posted.
+    The status check and the ledger check run in the same BEGIN IMMEDIATE transaction."""
+    if force and not (reason and str(reason).strip()):
+        raise ValueError("force requires a non-empty reason (--reason)")
     init_db(db_path)
+    _ensure_replies_table(Path(db_path))
+    forced_reply_ts: Optional[str] = None
     with get_db_connection(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE;")
         row = conn.execute(
-            "SELECT status FROM events WHERE event_id = ?", (event_id,)
+            "SELECT status, error_message FROM events WHERE event_id = ?", (event_id,)
         ).fetchone()
         if not row:
             conn.rollback()
@@ -3741,16 +4009,51 @@ def requeue_event(event_id: str, db_path: Path = DEFAULT_DB_PATH) -> Dict[str, A
             raise ValueError(
                 f"Event '{event_id}' is {row['status']}, not FAILED; requeue only re-queues FAILED events"
             )
+        ledger = conn.execute(
+            "SELECT event_id, channel_id, thread_ts, reply_ts, created_at FROM replies WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        new_error = row["error_message"]
+        if ledger is not None:
+            ledger_row = dict(ledger)
+            if not force:
+                conn.rollback()
+                print(
+                    f"[requeue] WARN reply_already_landed: event {event_id} has a landed reply "
+                    f"(reply_ts={ledger_row.get('reply_ts')}); requeue refused (row unchanged)",
+                    file=sys.stderr,
+                )
+                _append_ops_alert(
+                    {
+                        "kind": "requeue_blocked",
+                        "reason": "reply_already_landed",
+                        "event_id": event_id,
+                        "current_status": "FAILED",
+                        "requested_status": "PENDING",
+                        "reply_ts": ledger_row.get("reply_ts"),
+                        "channel": ledger_row.get("channel_id"),
+                        "thread_ts": ledger_row.get("thread_ts"),
+                        "source": "requeue",
+                        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                    Path(db_path),
+                )
+                raise RequeueBlocked(event_id, ledger_row)
+            forced_reply_ts = str(ledger_row.get("reply_ts"))
+            new_error = _forced_requeue_error_message(
+                forced_reply_ts, str(reason), row["error_message"]
+            )
         conn.execute(
             """
             UPDATE events
             SET status = 'PENDING',
                 reap_count = 0,
                 next_retry_at = NULL,
+                error_message = ?,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE event_id = ?
+            WHERE event_id = ? AND status = 'FAILED'
             """,
-            (event_id,),
+            (new_error, event_id),
         )
         conn.commit()
         updated = conn.execute(
@@ -3761,14 +4064,53 @@ def requeue_event(event_id: str, db_path: Path = DEFAULT_DB_PATH) -> Dict[str, A
             """,
             (event_id,),
         ).fetchone()
-        return dict(updated)
+        result = dict(updated)
+    if forced_reply_ts is not None:
+        result["forced"] = True
+        result["landed_reply_ts"] = forced_reply_ts
+        _append_ops_alert(
+            {
+                "kind": "requeue_forced",
+                "event_id": event_id,
+                "previous_status": "FAILED",
+                "requested_status": "PENDING",
+                "new_status": result.get("status"),
+                "reply_ts": forced_reply_ts,
+                "reason": str(reason).strip()[:300],
+                "source": "requeue",
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            Path(db_path),
+        )
+    return result
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
     try:
-        updated = requeue_event(args.event_id, db_path=Path(args.db))
+        updated = requeue_event(
+            args.event_id,
+            db_path=Path(args.db),
+            force=bool(getattr(args, "force", False)),
+            reason=getattr(args, "reason", None),
+        )
         print(json.dumps({"ok": True, "event": updated}, ensure_ascii=False, indent=2))
         return 0
+    except RequeueBlocked as blocked:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "reply_already_landed",
+                    "event_id": blocked.event_id,
+                    "current_status": "FAILED",
+                    "landed_reply": blocked.ledger_row,
+                    "message": str(blocked),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
@@ -3832,10 +4174,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_reply.add_argument("--channel", required=True, help="Slack channel ID")
     p_reply.add_argument("--text-file", required=True, help="Path to file containing message text")
     p_reply.add_argument("--thread-ts", default=None, help="Thread parent timestamp (optional)")
+    # Exactly one of --event-id / --no-event-id is required (checked in cmd_reply so
+    # the refusal is a JSON error + exit 1 like every other reply error).
     p_reply.add_argument(
         "--event-id",
         default=None,
-        help="Source event_id for idempotent reply deduplication (optional)",
+        help="Source event_id (must exist in the events table) for idempotent reply "
+        "deduplication. Required unless --no-event-id is given.",
+    )
+    p_reply.add_argument(
+        "--no-event-id",
+        action="store_true",
+        help="Post not tied to any event (share / report post). Not recorded in the "
+        "replies ledger. Required unless --event-id is given.",
+    )
+    p_reply.add_argument(
+        "--force",
+        action="store_true",
+        help="Post with an --event-id that is not in the events table; requires --reason",
+    )
+    p_reply.add_argument(
+        "--reason", default=None, help="Why the unknown --event-id is forced (kept in the ops alert)"
     )
     p_reply.set_defaults(func=cmd_reply)
 
@@ -3951,6 +4310,14 @@ def build_parser() -> argparse.ArgumentParser:
         "requeue", help="Manually re-queue a FAILED event to PENDING (resets reap_count)"
     )
     p_requeue.add_argument("--event-id", required=True, help="Target event_id (must be FAILED)")
+    p_requeue.add_argument(
+        "--force",
+        action="store_true",
+        help="Requeue even though the replies ledger already records a landed reply; requires --reason",
+    )
+    p_requeue.add_argument(
+        "--reason", default=None, help="Why the forced requeue is made (kept in error_message)"
+    )
     p_requeue.set_defaults(func=cmd_requeue)
 
     # mode

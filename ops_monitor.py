@@ -28,6 +28,29 @@ Subcommands:
   outbox-restore [--path PATH]
       Read a JSON array from stdin and append it back to the outbox (used by
       the hook when the alert wake could not be emitted).
+
+Permanent archive (candidate 26, 2026-11-23):
+  outbox-take is the single recording point. Every entry it takes out of the
+  outbox is also appended to an append-only archive
+  (YAMA_OPS_ALERTS_ARCHIVE_PATH, default: ops_alerts_archive.jsonl next to the
+  outbox). Writers (commit guard, Reaper, backfill) do not write the archive
+  themselves, so there is no double write.
+  - Schema (aligned with Neiro/Yanayana mark_rejected.jsonl): at, key,
+    attempted_status, current_status, reason, plus source, action
+    ("rejected" | "forced" | "alert"), kind, archived_at, schema, entry (the
+    outbox line as taken).
+  - Bounded: when the next write would push the file past
+    YAMA_OPS_ALERTS_ARCHIVE_MAX_BYTES (default 5 MiB), it is renamed to
+    <archive>.1 (one generation, the previous .1 is replaced).
+  - fail-open: a failed archive write never fails the take. Instead one
+    {"kind": "archive_write_failed", ...} entry is added to the returned list
+    so it is delivered with the same wake. Nothing is printed on stderr (the
+    hook merges stderr into the JSON it parses).
+  - Entries put back by outbox-restore (wake failed) carry "_archived": true so
+    the next take does not archive them twice; take strips the marker.
+  - Timing: the hook's successful wake exits the hook, so take is the last
+    point we control. A row is therefore "taken for delivery"; a failed wake is
+    logged in watchdog.log and the row is restored, not re-archived.
 """
 
 import argparse
@@ -45,6 +68,10 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "state" / "slack_events.db"
 DEFAULT_HEARTBEAT_PATH = BASE_DIR / "state" / "heartbeat.json"
 DEFAULT_OUTBOX_PATH = BASE_DIR / "state" / "ops_alerts.jsonl"
+ARCHIVE_FILENAME = "ops_alerts_archive.jsonl"
+DEFAULT_ARCHIVE_MAX_BYTES = 5 * 1024 * 1024
+ARCHIVE_SCHEMA_VERSION = 1
+ARCHIVED_MARKER = "_archived"
 DEFAULT_PENDING_STALE_WARN_SEC = 600
 DB_BUSY_TIMEOUT_SEC = 30.0
 
@@ -214,10 +241,134 @@ def outbox_append(entry: Dict[str, Any], path: Path = DEFAULT_OUTBOX_PATH) -> No
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
-def outbox_take(path: Path = DEFAULT_OUTBOX_PATH) -> List[Dict[str, Any]]:
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def default_archive_path(outbox_path: Path) -> Path:
+    env_path = os.environ.get("YAMA_OPS_ALERTS_ARCHIVE_PATH", "").strip()
+    return Path(env_path) if env_path else Path(outbox_path).parent / ARCHIVE_FILENAME
+
+
+def _archive_max_bytes() -> int:
+    try:
+        value = int(os.environ.get("YAMA_OPS_ALERTS_ARCHIVE_MAX_BYTES", DEFAULT_ARCHIVE_MAX_BYTES))
+        return value if value > 0 else DEFAULT_ARCHIVE_MAX_BYTES
+    except ValueError:
+        return DEFAULT_ARCHIVE_MAX_BYTES
+
+
+def archive_record(entry: Dict[str, Any], archived_at: Optional[str] = None) -> Dict[str, Any]:
+    """Map one outbox entry to the shared schema (mark_rejected.jsonl fields + source/action).
+    action: "rejected" (commit / requeue / reply refused, row unchanged, nothing posted) | "forced" (correction
+    or requeue with a reason via --force) | "alert" (every other ops alert)."""
+    kind = str(entry.get("kind") or "unknown")
+    if kind in ("commit_rejected", "requeue_blocked", "reply_rejected"):
+        action = "rejected"
+    elif kind in ("commit_forced", "requeue_forced", "reply_forced"):
+        action = "forced"
+    else:
+        action = "alert"
+    key = entry.get("event_id") or entry.get("channel")
+    keys = None
+    if not key and isinstance(entry.get("rejected"), list):
+        # commit-batch validation: one outbox line for several events
+        keys = [r.get("event_id") for r in entry["rejected"] if isinstance(r, dict) and r.get("event_id")]
+    # forced: the status the row had when the correction was attempted
+    current = entry.get("previous_status") if action == "forced" else entry.get("current_status")
+    now = archived_at or _utc_now_iso()
+    record: Dict[str, Any] = {
+        "schema": ARCHIVE_SCHEMA_VERSION,
+        "at": entry.get("at") or now,
+        "archived_at": now,
+        "key": key,
+        "attempted_status": entry.get("requested_status"),
+        "current_status": current,
+        "reason": entry.get("reason"),
+        "source": entry.get("source"),
+        "action": action,
+        "kind": kind,
+        "entry": entry,
+    }
+    if keys is not None:
+        record["keys"] = keys
+    if action == "forced":
+        record["new_status"] = entry.get("new_status")
+    return record
+
+
+def archive_append(
+    entries: List[Dict[str, Any]],
+    archive_path: Path,
+    max_bytes: Optional[int] = None,
+) -> None:
+    """Append archive records for `entries`, rotating to <archive>.1 first when the
+    file would exceed max_bytes. Raises on failure (the caller decides fail-open)."""
+    if not entries:
+        return
+    archive_path = Path(archive_path)
+    limit = max_bytes if max_bytes and max_bytes > 0 else _archive_max_bytes()
+    now = _utc_now_iso()
+    data = "".join(
+        json.dumps(archive_record(e, now), ensure_ascii=False, sort_keys=True) + "\n" for e in entries
+    ).encode("utf-8")
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = archive_path.with_name(archive_path.name + ".lock")
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                size = archive_path.stat().st_size
+            except FileNotFoundError:
+                size = 0
+            if size > 0 and size + len(data) > limit:
+                os.replace(archive_path, archive_path.with_name(archive_path.name + ".1"))
+            with open(archive_path, "ab") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def outbox_take(
+    path: Path = DEFAULT_OUTBOX_PATH,
+    archive_path: Optional[Path] = None,
+    archive: bool = True,
+) -> List[Dict[str, Any]]:
     """Read all entries and truncate the outbox (same flock as outbox_append).
-    Unparseable lines are kept as {"kind": "unparseable_outbox_line", ...}."""
+    Unparseable lines are kept as {"kind": "unparseable_outbox_line", ...}.
+    Taken entries are archived (see module docstring); an archive failure adds one
+    archive_write_failed entry to the result instead of failing the take."""
     path = Path(path)
+    entries = _outbox_take_raw(path)
+    if not entries:
+        return entries
+    to_archive: List[Dict[str, Any]] = []
+    for e in entries:
+        if e.pop(ARCHIVED_MARKER, False) is not True:
+            to_archive.append(e)
+    if archive and to_archive:
+        target = Path(archive_path) if archive_path else default_archive_path(path)
+        try:
+            if os.environ.get("YAMA_OPS_ARCHIVE_FORCE_FAIL") == "1":
+                raise OSError("forced failure (test hook)")
+            archive_append(to_archive, target)
+        except Exception as exc:
+            entries.append(
+                {
+                    "kind": "archive_write_failed",
+                    "at": _utc_now_iso(),
+                    "archive_path": str(target),
+                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                    "lost_count": len(to_archive),
+                    "lost_kinds": sorted({str(e.get("kind") or "unknown") for e in to_archive}),
+                }
+            )
+    return entries
+
+
+def _outbox_take_raw(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     entries: List[Dict[str, Any]] = []
@@ -287,6 +438,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise ValueError("expected a JSON array on stdin")
             for entry in data:
                 if isinstance(entry, dict):
+                    # already archived by the take that produced it; do not archive twice
+                    # (the archive_write_failed notice itself was never archived)
+                    if entry.get("kind") != "archive_write_failed":
+                        entry = dict(entry, **{ARCHIVED_MARKER: True})
                     outbox_append(entry, Path(args.path))
             return 0
     except Exception as exc:

@@ -1052,6 +1052,9 @@ def test_reply_idempotency() -> str:
                     "1794472708.249819",
                     "--event-id",
                     "Ev0CH0PMRGF8",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1093,6 +1096,9 @@ def test_reply_idempotency() -> str:
                     "1794472708.249819",
                     "--event-id",
                     "Ev0CH0PMRGF8",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1107,7 +1113,7 @@ def test_reply_idempotency() -> str:
         assert out2["channel"] == "C_ALL"
         assert out2["thread_ts"] == "1794472708.249819"
 
-        # 3) Legacy call WITHOUT --event-id -> backward compatible, posts normally every time
+        # 3) --no-event-id call (no event, candidate 28 form of the old id-less call) -> posts normally every time
         with get_db_connection(db_path) as conn:
             conn.execute("DELETE FROM replies")
             conn.commit()
@@ -1127,11 +1133,12 @@ def test_reply_idempotency() -> str:
                     str(text_file),
                     "--thread-ts",
                     "1794472708.249819",
+                    "--no-event-id",
                 ]
             )
 
         assert rc3 == 0
-        assert len(post_calls) == 2, f"Expected legacy call without --event-id to post (total 2), got {len(post_calls)}"
+        assert len(post_calls) == 2, f"Expected --no-event-id call to post (total 2), got {len(post_calls)}"
         out3 = json.loads(stdout3.getvalue())
         assert out3["ok"] is True
         assert out3["ts"] == "1794472780.000002"
@@ -1256,6 +1263,9 @@ def test_reply_lost_response_recovery() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev0CHXK8PDLY",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1293,6 +1303,9 @@ def test_reply_lost_response_recovery() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev0CHXK8PDLY",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
         assert rc2 == 0
@@ -1352,6 +1365,9 @@ def test_reply_lost_response_recovery() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_AMBIGUOUS",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1440,6 +1456,9 @@ def test_reply_pre_post_thread_dedup() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_PRE_DEDUP_1",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1458,7 +1477,7 @@ def test_reply_pre_post_thread_dedup() -> str:
         rec = get_recorded_reply("Ev_PRE_DEDUP_1", db_path=db_path)
         assert rec is not None and rec["reply_ts"] == existing_slack_ts
 
-        # 2) Without --event-id (with --thread-ts) -> also detects in thread and skips posting with deduplicated=true
+        # 2) With --no-event-id (with --thread-ts) -> also detects in thread and skips posting with deduplicated=true
         stdout2 = io.StringIO()
         stderr2 = io.StringIO()
         with patch.object(
@@ -1479,6 +1498,7 @@ def test_reply_pre_post_thread_dedup() -> str:
                     str(text_file),
                     "--thread-ts",
                     thread_ts,
+                    "--no-event-id",
                 ]
             )
 
@@ -1560,6 +1580,9 @@ def test_reply_pre_post_channel_bounded_dedup() -> str:
                     str(text_file),
                     "--event-id",
                     "Ev_CH_BOUND_1",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1598,6 +1621,7 @@ def test_reply_pre_post_channel_bounded_dedup() -> str:
                     channel_id,
                     "--text-file",
                     str(text_file),
+                    "--no-event-id",
                 ]
             )
 
@@ -1646,6 +1670,9 @@ def test_reply_pre_post_channel_bounded_dedup() -> str:
                     str(text_file),
                     "--event-id",
                     "Ev_CH_FAIL_OPEN",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1733,6 +1760,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_THREAD_OLD_1",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1828,6 +1858,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_THREAD_PAGE2_1",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1909,6 +1942,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_THREAD_REC_PAGE2",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -1974,6 +2010,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_THREAD_CAP20",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -2046,6 +2085,9 @@ def test_reply_thread_fullscan_and_pagination() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_THREAD_END20",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
         assert rc5 == 0, f"Expected rc=0 when the thread ends on page 20, got {rc5}, stderr={stderr5.getvalue()}"
@@ -3150,6 +3192,9 @@ def test_history_retry_5_attempts_and_backoff() -> str:
                     thread_ts,
                     "--event-id",
                     "share-reconcile-20261112",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -3276,6 +3321,9 @@ def test_pre_post_check_fail_closed_thread_and_fail_open_channel() -> str:
                     thread_ts,
                     "--event-id",
                     "Ev_THREAD_FAIL_CLOSED",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -3337,6 +3385,9 @@ def test_pre_post_check_fail_closed_thread_and_fail_open_channel() -> str:
                     str(text_file),
                     "--event-id",
                     "Ev_CHANNEL_FAIL_OPEN",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
 
@@ -6463,6 +6514,7 @@ def test_windowed_thread_ignores_past_event_template() -> str:
                     "--channel", channel_id,
                     "--text-file", str(text_file),
                     "--thread-ts", thread_ts,
+                    "--no-event-id",
                 ]
             )
         assert rc3 == 0
@@ -6951,6 +7003,7 @@ def test_reply_metadata_attachment_and_include_all_metadata() -> str:
                     "reply",
                     "--channel", channel_id,
                     "--text-file", str(text_file),
+                    "--no-event-id",
                 ]
             )
         assert rc2 == 0
@@ -7152,6 +7205,7 @@ def test_recovery_and_reconcile_by_metadata_match() -> str:
                     "--channel", channel_id,
                     "--text-file", str(text_file),
                     "--thread-ts", thread_ts,
+                    "--no-event-id",
                 ]
             )
         assert rc2 == 0, f"Expected rc=0 via request_id metadata recovery, got {rc2}"
@@ -7865,6 +7919,9 @@ def test_pre_post_thread_ledger_parroting_prevention() -> str:
                     "--channel", channel_id,
                     "--text-file", str(file_same),
                     "--event-id", "Ev50_NEW_CHANNEL_DIRECT",
+                    "--force",
+                    "--reason",
+                    "test fixture: events row intentionally absent (pre-candidate-28 call shape)",
                 ]
             )
         assert rc5 == 0, f"Expected rc=0, got {rc5}, stderr={stderr5.getvalue()}"
@@ -11172,6 +11229,561 @@ def test_commit_terminal_guard() -> str:
             "FAILED→requeue→PROCESSING→DONE・cmd_replyの内部commit拒否時は実際のstatus表示・reconcileは判定理由を消さない、を確認")
 
 
+def test_failed_with_landed_reply_detect_and_requeue_guard() -> str:
+    """84. 候補27 代替案A: reconcile は状態を変えず「台帳に着地記録があるのに FAILED」を検知して運用アラートへ1行（同じ件は繰り返さない・FAILED でなくなれば記録から外す・dry-run は書かない・窓の外の古い FAILED も対象＝Ev0CH5CWKHM0 型・PENDING/PROCESSING/DONE は対象外）、手動 requeue は台帳に着地ありならブロック（行は不変＋requeue_blocked 1行）、--force --reason でだけ通す（理由を error_message に残し requeue_forced 1行・台帳は残るので reply は重複排除）"""
+    import ops_monitor
+
+    saved_env = os.environ.pop("YAMA_OPS_ALERTS_PATH", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "slack_events.db"
+            init_db(db_path)
+            outbox = db_path.parent / "ops_alerts.jsonl"
+            alerted_state = db_path.parent / agent_tools.FAILED_LANDED_ALERTED_FILENAME
+            now = datetime(2026, 11, 23, 12, 0, 0, tzinfo=timezone.utc)
+            th = "1795400000.000000"
+            events = [
+                # event_id, status, error_message, ts, created_at, ledger reply_ts (None = no ledger)
+                # 実例 Ev0CH5CWKHM0 と同じ形: 11-12 作成（reconcile の7日窓の外）・FAILED・台帳あり
+                ("Ev_L_OLD", "FAILED",
+                 "pre_post_check_unverifiable: Slack API IncompleteRead（投稿前のスレッド確認が失敗、投稿は未実施。次回再送）",
+                 "1794492249.625919", "2026-11-12 14:04:09", "1794492548.415999"),
+                ("Ev_L_PROC", "PROCESSING", None, "1795400001.000000", "2026-11-23 00:00:00", "1795400101.000000"),
+                ("Ev_L_PEND", "PENDING", None, "1795400002.000000", "2026-11-23 00:00:00", "1795400102.000000"),
+                ("Ev_L_DONE", "DONE", None, "1795400003.000000", "2026-11-23 00:00:00", "1795400103.000000"),
+                ("Ev_L_NOLEDGER", "FAILED", "agent error", "1795400004.000000", "2026-11-23 00:00:00", None),
+                # 窓の中・FAILED・台帳なし。スレッドに metadata 付きの着地があり、この run で台帳に記録される
+                ("Ev_L_SCAN", "FAILED", "ambiguous_post_outcome", "1795400005.000000", "2026-11-23 00:00:00", None),
+            ]
+            with get_db_connection(db_path) as conn:
+                for eid, st, err, ts, created, _ in events:
+                    conn.execute(
+                        "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status, retry_count, "
+                        "error_message, created_at, updated_at) VALUES (?, 'C_L', 'U_Q', 't', ?, ?, ?, 3, ?, ?, ?)",
+                        (eid, ts, th, st, err, created, created),
+                    )
+                conn.commit()
+            for eid, _, _, _, _, rts in events:
+                if rts:
+                    agent_tools.record_reply(event_id=eid, channel_id="C_L", thread_ts=th, reply_ts=rts,
+                                 text=f"reply for {eid}", db_path=db_path)
+
+            scan_ts = "1795400105.000000"
+
+            class LandedClient:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def auth_test(self) -> Dict[str, Any]:
+                    return {"ok": True, "user_id": "U_YAMA"}
+
+                def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+                    self.calls += 1
+                    return {
+                        "ok": True,
+                        "messages": [
+                            {"user": "U_Q", "text": "質問", "ts": th},
+                            {"user": "U_YAMA", "text": "Yama の返信", "ts": scan_ts, "thread_ts": th,
+                             "metadata": {"event_type": "yama_reply", "event_payload": {"event_id": "Ev_L_SCAN"}}},
+                        ],
+                        "has_more": False,
+                    }
+
+            def alerts() -> List[Dict[str, Any]]:
+                if not outbox.exists():
+                    return []
+                return [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+            def status_of(eid: str) -> Tuple[Any, ...]:
+                with get_db_connection(db_path) as conn:
+                    r = conn.execute(
+                        "SELECT status, retry_count, reap_count, error_message, next_retry_at FROM events WHERE event_id=?",
+                        (eid,),
+                    ).fetchone()
+                    return tuple(r)
+
+            before_all = {e[0]: status_of(e[0]) for e in events}
+
+            # (1) dry-run: 検知は報告するが outbox・状態ファイル・台帳・状態は書かない
+            res = agent_tools.reconcile_replies(days=7, dry_run=True, db_path=db_path, client=LandedClient(),
+                                                bot_user_id="U_YAMA", now=now)
+            fw = res["failed_with_landed_reply"]
+            assert sorted(fw["found"]) == ["Ev_L_OLD", "Ev_L_SCAN"], fw
+            assert fw["alerted"] is False and alerts() == [] and not alerted_state.exists(), fw
+            assert get_recorded_reply("Ev_L_SCAN", db_path=db_path) is None
+
+            # (2) 本番 run: Ev_L_SCAN を台帳に記録 → 同じ run の検知に入る。窓の外の Ev_L_OLD も入る。
+            #     PROCESSING / PENDING / DONE（台帳あり）と FAILED（台帳なし）は対象外。状態は一切変えない
+            res = agent_tools.reconcile_replies(days=7, dry_run=False, db_path=db_path, client=LandedClient(),
+                                                bot_user_id="U_YAMA", now=now)
+            assert res["recorded"] == [{"event_id": "Ev_L_SCAN", "reply_ts": scan_ts}], res["recorded"]
+            fw = res["failed_with_landed_reply"]
+            assert fw["found"] == ["Ev_L_OLD", "Ev_L_SCAN"] and fw["new"] == ["Ev_L_OLD", "Ev_L_SCAN"], fw
+            assert fw["alerted"] is True
+            a = alerts()
+            assert len(a) == 1 and a[0]["kind"] == "failed_with_landed_reply" and a[0]["count"] == 2, a
+            assert a[0]["event_ids"] == ["Ev_L_OLD", "Ev_L_SCAN"], a
+            assert {i["event_id"]: i["reply_ts"] for i in a[0]["items"]} == {
+                "Ev_L_OLD": "1794492548.415999", "Ev_L_SCAN": scan_ts}, a
+            for eid, *_ in events:
+                assert status_of(eid) == before_all[eid], f"reconcile must not change {eid}"
+
+            # (3) 次の run（毎時）では同じ件を繰り返さない
+            res = agent_tools.reconcile_replies(days=7, dry_run=False, db_path=db_path, client=LandedClient(),
+                                                bot_user_id="U_YAMA", now=now)
+            assert res["failed_with_landed_reply"]["new"] == [] and len(alerts()) == 1, res
+
+            # (4) requeue: 台帳に着地あり → ブロック（行は不変・明確なエラー・requeue_blocked 1行）
+            before = status_of("Ev_L_OLD")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_L_OLD"])
+            assert rc == 1, out.getvalue()
+            body = json.loads(err.getvalue().strip().splitlines()[-1])
+            assert body["error"] == "reply_already_landed" and body["landed_reply"]["reply_ts"] == "1794492548.415999", body
+            assert "--force --reason" in body["message"], body
+            assert status_of("Ev_L_OLD") == before
+            a = alerts()
+            assert len(a) == 2 and a[1]["kind"] == "requeue_blocked" and a[1]["event_id"] == "Ev_L_OLD", a
+            assert ops_monitor.archive_record(a[1])["action"] == "rejected"
+
+            # --force だけ（理由なし）は通さない
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                assert agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_L_OLD", "--force"]) == 1
+                assert agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_L_OLD",
+                                         "--force", "--reason", "   "]) == 1
+            assert status_of("Ev_L_OLD") == before and len(alerts()) == 2
+
+            # (5) PROCESSING / PENDING は従来どおり「FAILED でない」で拒否（台帳ブロックの対象外）
+            for eid in ("Ev_L_PROC", "Ev_L_PEND"):
+                err = io.StringIO()
+                with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    assert agent_tools.main(["--db", str(db_path), "requeue", "--event-id", eid]) == 1
+                assert "not FAILED" in err.getvalue() and "reply_already_landed" not in err.getvalue(), err.getvalue()
+                assert status_of(eid) == before_all[eid]
+
+            # (6) 台帳なしの FAILED は従来どおり通る（アラートも出ない）
+            r = agent_tools.requeue_event("Ev_L_NOLEDGER", db_path=db_path)
+            assert r["status"] == "PENDING" and r["error_message"] == "agent error" and not r.get("forced"), r
+            assert len(alerts()) == 2
+
+            # (7) --force --reason で通す: 理由を error_message に残し requeue_forced 1行。台帳は残す
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                rc = agent_tools.main(["--db", str(db_path), "requeue", "--event-id", "Ev_L_OLD",
+                                       "--force", "--reason", "スレッドで返信の欠落を確認したため"])
+            assert rc == 0, out.getvalue()
+            ev = json.loads(out.getvalue())["event"]
+            assert ev["status"] == "PENDING" and ev["reap_count"] == 0 and ev["retry_count"] == 3, ev
+            assert ev["forced"] is True and ev["landed_reply_ts"] == "1794492548.415999", ev
+            assert ev["error_message"].startswith("pre_post_check_unverifiable") and \
+                "[forced requeue: reply already landed ts=1794492548.415999] スレッドで返信の欠落を確認したため" in ev["error_message"], ev
+            a = alerts()
+            assert len(a) == 3 and a[2]["kind"] == "requeue_forced" and a[2]["new_status"] == "PENDING", a
+            assert ops_monitor.archive_record(a[2])["action"] == "forced"
+            assert get_recorded_reply("Ev_L_OLD", db_path=db_path) is not None
+
+            # (8) FAILED でなくなった件は既通知の記録から外れ、再び FAILED になれば再通知される
+            res = agent_tools.reconcile_replies(days=7, dry_run=False, db_path=db_path, client=LandedClient(),
+                                                bot_user_id="U_YAMA", now=now)
+            assert res["failed_with_landed_reply"]["found"] == ["Ev_L_SCAN"], res["failed_with_landed_reply"]
+            state = json.loads(alerted_state.read_text(encoding="utf-8"))
+            assert sorted(state) == ["Ev_L_SCAN"], state
+            with get_db_connection(db_path) as conn:
+                conn.execute("UPDATE events SET status='FAILED' WHERE event_id='Ev_L_OLD'")
+                conn.commit()
+            res = agent_tools.reconcile_replies(days=7, dry_run=False, db_path=db_path, client=LandedClient(),
+                                                bot_user_id="U_YAMA", now=now)
+            assert res["failed_with_landed_reply"]["new"] == ["Ev_L_OLD"], res["failed_with_landed_reply"]
+            assert alerts()[-1]["kind"] == "failed_with_landed_reply" and alerts()[-1]["event_ids"] == ["Ev_L_OLD"]
+
+            # (9) アラート書き込みに失敗した run は既通知に入れず、次の run で再試行する
+            with get_db_connection(db_path) as conn:
+                conn.execute("UPDATE events SET status='DONE' WHERE event_id='Ev_L_SCAN'")
+                conn.commit()
+            agent_tools.detect_failed_with_landed_reply(db_path=db_path)  # Ev_L_SCAN を記録から外す
+            with get_db_connection(db_path) as conn:
+                conn.execute("UPDATE events SET status='FAILED' WHERE event_id='Ev_L_SCAN'")
+                conn.commit()
+            os.environ["YAMA_OPS_ALERTS_PATH"] = str(db_path.parent)  # ディレクトリなので開けない
+            try:
+                with redirect_stderr(io.StringIO()):
+                    r1 = agent_tools.detect_failed_with_landed_reply(db_path=db_path)
+            finally:
+                os.environ.pop("YAMA_OPS_ALERTS_PATH", None)
+            assert r1["new"] == ["Ev_L_SCAN"] and r1["alerted"] is False, r1
+            r2 = agent_tools.detect_failed_with_landed_reply(db_path=db_path)
+            assert r2["new"] == ["Ev_L_SCAN"] and r2["alerted"] is True, r2
+    finally:
+        if saved_env is not None:
+            os.environ["YAMA_OPS_ALERTS_PATH"] = saved_env
+
+    return ("dry-runは書かない・台帳に着地ありのFAILEDだけ検知(窓外の古い実例型も・同じrunで記録した分も)・PROCESSING/PENDING/DONE/台帳なしは対象外・状態は不変・"
+            "同じ件は再通知しない・FAILEDを外れたら記録から外し再発で再通知・書込失敗は次runで再試行・requeueは台帳ありでブロック(行不変＋requeue_blocked)・"
+            "--force単独/空理由は不可・--force --reasonで通過(理由をerror_messageに・requeue_forced・台帳は保持)・PROCESSING/PENDINGは従来の拒否")
+
+
+def test_ops_alert_archive_on_take() -> str:
+    """83. 運用アラートの永続ログ（候補26）: outbox-take の時点で取り出した行を ops_alerts_archive.jsonl に追記（単一経路・書き手側は二重書きしない）・mark_rejected と揃えたスキーマ（at/key/attempted_status/current_status/reason＋source/action）・rejected と forced の区別・サイズ上限で1世代ローテーション・書き込み失敗でも take は成功し archive_write_failed を1行返す（stderr は汚さない）・restore した行は二重にアーカイブしない"""
+    import ops_monitor
+
+    saved_env = {k: os.environ.pop(k, None) for k in (
+        "YAMA_OPS_ALERTS_PATH", "YAMA_OPS_ALERTS_ARCHIVE_PATH",
+        "YAMA_OPS_ALERTS_ARCHIVE_MAX_BYTES", "YAMA_OPS_ARCHIVE_FORCE_FAIL")}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "slack_events.db"
+            init_db(db_path)
+            outbox = db_path.parent / "ops_alerts.jsonl"
+            archive = db_path.parent / "ops_alerts_archive.jsonl"
+
+            def arch_rows(p: Path = archive) -> List[Dict[str, Any]]:
+                if not p.exists():
+                    return []
+                return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+            with get_db_connection(db_path) as conn:
+                for i, (eid, st) in enumerate((("Ev_A_DONE", "DONE"), ("Ev_A_IGN", "IGNORED"))):
+                    conn.execute(
+                        "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, retry_count, "
+                        "created_at, updated_at) VALUES (?, 'C', 'U', 't', ?, ?, 0, '2026-11-23 00:00:00', '2026-11-23 00:00:00')",
+                        (eid, f"1795500000.{i:06d}", st),
+                    )
+                conn.commit()
+
+            # (1) 本物の書き手（commit 終端ガード）→ outbox → take → archive。書き手は archive に書かない
+            with redirect_stderr(io.StringIO()):
+                agent_tools.commit_event("Ev_A_DONE", "FAILED", error_message="late", db_path=db_path)
+                agent_tools.commit_event("Ev_A_IGN", "DONE", db_path=db_path, force=True, reason="誤判定の訂正")
+            ops_monitor.outbox_append({"kind": "reaper", "reaped_count": 2, "at": "2026-11-23T00:00:00Z"}, outbox)
+            ops_monitor.outbox_append({"kind": "commit_rejected", "reason": "already_terminal",
+                                       "source": "commit-batch-validation", "batch_size": 2,
+                                       "rejected": [{"event_id": "Ev_X1"}, {"event_id": "Ev_X2"}]}, outbox)
+            assert not archive.exists(), "書き手（ガード）からは archive に書かない（二重書きなし）"
+            taken = ops_monitor.outbox_take(outbox)
+            assert [e["kind"] for e in taken] == ["commit_rejected", "commit_forced", "reaper", "commit_rejected"], taken
+            assert outbox.read_text(encoding="utf-8") == ""
+            rows = arch_rows()
+            assert len(rows) == 4, rows
+            shared = {"at", "key", "attempted_status", "current_status", "reason", "source", "action"}
+            for r in rows:
+                assert shared <= set(r), r
+                assert r["schema"] == 1 and r["archived_at"] and isinstance(r["entry"], dict)
+            rej, forced, reaper, batch = rows
+            assert rej["action"] == "rejected" and rej["key"] == "Ev_A_DONE"
+            assert rej["attempted_status"] == "FAILED" and rej["current_status"] == "DONE"
+            assert rej["reason"] == "already_terminal" and rej["source"] == "commit"
+            assert forced["action"] == "forced" and forced["key"] == "Ev_A_IGN"
+            assert forced["attempted_status"] == "DONE" and forced["current_status"] == "IGNORED"
+            assert forced["new_status"] == "DONE" and forced["reason"] == "誤判定の訂正"
+            assert reaper["action"] == "alert" and reaper["key"] is None and reaper["at"] == "2026-11-23T00:00:00Z"
+            assert reaper["entry"]["reaped_count"] == 2
+            assert batch["action"] == "rejected" and batch["keys"] == ["Ev_X1", "Ev_X2"]
+            assert ops_monitor.outbox_take(outbox) == [] and len(arch_rows()) == 4, "空の take は何も足さない"
+
+            # (2) restore（wake 失敗）した行は次の take で二重にアーカイブしない・印は配送内容に出さない
+            rs = subprocess.run(
+                [str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-restore", "--path", str(outbox)],
+                input=json.dumps(taken[2:3]), capture_output=True, text=True,
+            )
+            assert rs.returncode == 0, rs
+            ops_monitor.outbox_append({"kind": "backfill_truncated", "channel": "C_NEW"}, outbox)
+            again = ops_monitor.outbox_take(outbox)
+            assert [e["kind"] for e in again] == ["reaper", "backfill_truncated"], again
+            assert all(ops_monitor.ARCHIVED_MARKER not in e for e in again), again
+            rows = arch_rows()
+            assert len(rows) == 5 and rows[-1]["kind"] == "backfill_truncated" and rows[-1]["key"] == "C_NEW", rows
+
+            # (3) ローテーション: 上限超えで .1 へ（1世代のみ・古い .1 は置き換え）・本体は上限内
+            rot_dir = Path(tmp) / "rot"
+            rot_out = rot_dir / "ops_alerts.jsonl"
+            rot_arch = rot_dir / "ops_alerts_archive.jsonl"
+            os.environ["YAMA_OPS_ALERTS_ARCHIVE_MAX_BYTES"] = "1500"
+            for n in range(12):
+                ops_monitor.outbox_append({"kind": "reaper", "n": n, "pad": "x" * 200}, rot_out)
+                ops_monitor.outbox_take(rot_out)
+            gen1 = rot_arch.with_name(rot_arch.name + ".1")
+            assert gen1.exists() and rot_arch.exists()
+            assert rot_arch.stat().st_size <= 1500 and gen1.stat().st_size <= 1500
+            assert sorted(p.name for p in rot_dir.iterdir() if "archive" in p.name and not p.name.endswith(".lock")) == [
+                "ops_alerts_archive.jsonl", "ops_alerts_archive.jsonl.1"], "世代は1つだけ"
+            ns = [r["entry"]["n"] for r in arch_rows(gen1) + arch_rows(rot_arch)]
+            assert ns == sorted(ns) and ns[-1] == 11 and ns[0] > 0, ns  # 最古は捨てられ、最新は残る
+            os.environ.pop("YAMA_OPS_ALERTS_ARCHIVE_MAX_BYTES")
+
+            # (4) 書き込み失敗: take は成功（outbox は空・元の行も配送される）＋archive_write_failed を1行
+            bad_dir = Path(tmp) / "bad"
+            bad_out = bad_dir / "ops_alerts.jsonl"
+            ops_monitor.outbox_append({"kind": "commit_forced", "event_id": "Ev_F"}, bad_out)
+            blocked = bad_dir / "blocked"
+            blocked.write_text("not a dir", encoding="utf-8")
+            res = ops_monitor.outbox_take(bad_out, archive_path=blocked / "archive.jsonl")
+            assert [e["kind"] for e in res] == ["commit_forced", "archive_write_failed"], res
+            assert res[1]["lost_count"] == 1 and res[1]["lost_kinds"] == ["commit_forced"] and res[1]["error"]
+            assert bad_out.read_text(encoding="utf-8") == ""
+            # CLI 経由（フックの呼び方）: exit 0・stdout は JSON 配列・stderr は空（フックは 2>&1 で読む）
+            ops_monitor.outbox_append({"kind": "reaper"}, bad_out)
+            env = dict(os.environ, YAMA_OPS_ARCHIVE_FORCE_FAIL="1")
+            cp = subprocess.run(
+                [str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-take", "--path", str(bad_out)],
+                env=env, capture_output=True, text=True,
+            )
+            assert cp.returncode == 0 and cp.stderr == "", cp
+            out = json.loads(cp.stdout)
+            assert [e["kind"] for e in out] == ["reaper", "archive_write_failed"], out
+            # wake 失敗で restore された失敗通知は、次の成功した take でアーカイブされる
+            subprocess.run(
+                [str(PYTHON_BIN), str(BASE_DIR / "ops_monitor.py"), "outbox-restore", "--path", str(bad_out)],
+                input=json.dumps(out), capture_output=True, text=True, check=True,
+            )
+            out2 = ops_monitor.outbox_take(bad_out)
+            assert [e["kind"] for e in out2] == ["reaper", "archive_write_failed"], out2
+            assert [r["kind"] for r in arch_rows(bad_dir / "ops_alerts_archive.jsonl")] == ["archive_write_failed"]
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    return "take時に4行(rejected/forced/alert/バッチrejected)をアーカイブ・ガードは書かない・共通スキーマ＋source/action・forcedはcurrent=訂正前/new_status・restore行の二重記録なし＆印は配送に出ない・1500B上限で.1へ1世代ローテーション・書込失敗でもtake成功＋archive_write_failed(CLIはexit 0・stderr空)・失敗通知は次回アーカイブ、を確認"
+
+
+def test_reply_event_id_guard_and_metadata_read_no_fallback() -> str:
+    """85. 候補28 event-id 付け忘れ・打ち間違い防止: reply は --event-id <ID> と --no-event-id の二択必須
+    （どちらも無い・両方ある・空の --event-id は非0で何も読まず投稿しない＋reply_rejected 1行）、--event-id は
+    events に実在しなければ unknown_event_id で拒否、--force は --reason 必須、--force --reason でだけ通す
+    （reply_forced 1行・台帳には指定 ID で記録）、--no-event-id の投稿は台帳に記録されない（metadata は
+    request_id）、--no-event-id に --force は不可。読み取り側: 本番 slack_sdk は include_all_metadata を宣言して
+    おり、_pre_post_check_thread_for_reply / _scan_thread_yama_messages は TypeError を握りつぶして
+    include_all_metadata なしで呼び直さない（1回だけ呼んで例外を上げる・遅延再送の reply は fail-closed）"""
+    import inspect
+    import ops_monitor
+    from slack_sdk import WebClient as RealWebClient
+
+    saved_env = os.environ.pop("YAMA_OPS_ALERTS_PATH", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "slack_events.db"
+            init_db(db_path)
+            outbox = db_path.parent / "ops_alerts.jsonl"
+            channel_id, thread_ts = "C_ALL", "1795450000.000100"
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status) "
+                    "VALUES ('Ev_R28_REAL', ?, 'U_Q', '質問です', '1795450001.000200', ?, 'PROCESSING')",
+                    (channel_id, thread_ts),
+                )
+                conn.commit()
+            text_file = Path(tmp) / "reply.txt"
+            text_file.write_text("候補28のテスト返信です。\n", encoding="utf-8")
+
+            def alerts() -> List[Dict[str, Any]]:
+                if not outbox.exists():
+                    return []
+                return [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+            def ledger_rows() -> List[Tuple[Any, ...]]:
+                with get_db_connection(db_path) as conn:
+                    return [tuple(r) for r in conn.execute(
+                        "SELECT event_id, channel_id, thread_ts, reply_ts FROM replies ORDER BY reply_ts"
+                    ).fetchall()]
+
+            class PostClient:
+                def __init__(self) -> None:
+                    self.posts: List[Dict[str, Any]] = []
+                    self.reads = 0
+
+                def auth_test(self) -> Dict[str, Any]:
+                    return {"ok": True, "user_id": "U_YAMA_BOT"}
+
+                def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                    self.reads += 1
+                    return {"ok": True, "messages": [], "has_more": False}
+
+                def conversations_history(self, **kwargs: Any) -> Dict[str, Any]:
+                    self.reads += 1
+                    return {"ok": True, "messages": [], "has_more": False}
+
+                def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                    self.posts.append(kwargs)
+                    ts = f"1795450100.00000{len(self.posts)}"
+                    return {"ok": True, "channel": kwargs["channel"], "ts": ts,
+                            "message": {"text": kwargs["text"], "ts": ts}}
+
+            def run(extra: List[str], thread: bool = True) -> Tuple[int, str, str, PostClient]:
+                client = PostClient()
+                argv = ["--db", str(db_path), "reply", "--channel", channel_id, "--text-file", str(text_file)]
+                if thread:
+                    argv += ["--thread-ts", thread_ts]
+                argv += extra
+                out, err = io.StringIO(), io.StringIO()
+                with patch.object(agent_tools, "get_web_client", return_value=client), \
+                        patch.object(agent_tools.time, "sleep", return_value=None), \
+                        redirect_stdout(out), redirect_stderr(err):
+                    rc = agent_tools.main(argv)
+                return rc, out.getvalue(), err.getvalue(), client
+
+            def assert_refused(extra: List[str], code: str, n_alerts: int) -> None:
+                rc, out, err, client = run(extra)
+                assert rc == 1, f"{extra}: expected exit 1, got {rc} (stdout={out})"
+                assert out == "", out
+                e = json.loads(err)
+                assert e["ok"] is False and e["error"] == code, e
+                assert client.posts == [] and client.reads == 0, "a refused reply must not read or post"
+                a = alerts()
+                assert len(a) == n_alerts, a
+                assert a[-1]["kind"] == "reply_rejected" and a[-1]["reason"] == code and a[-1]["source"] == "reply", a[-1]
+                assert ledger_rows() == []
+
+            # (1) neither --event-id nor --no-event-id -> refused (the forgotten-id guard itself)
+            assert_refused([], "event_id_choice_missing", 1)
+            # (2) both given / empty --event-id -> refused
+            assert_refused(["--event-id", "Ev_R28_REAL", "--no-event-id"], "event_id_choice_conflict", 2)
+            assert_refused(["--event-id", ""], "event_id_empty", 3)
+            assert_refused(["--event-id", "   "], "event_id_empty", 4)
+            # (3) unknown --event-id (typo) -> refused; --force alone / empty reason -> refused
+            assert_refused(["--event-id", "Ev_R28_TYPO"], "unknown_event_id", 5)
+            assert alerts()[-1]["event_id"] == "Ev_R28_TYPO"
+            assert_refused(["--event-id", "Ev_R28_TYPO", "--force"], "force_requires_reason", 6)
+            assert_refused(["--event-id", "Ev_R28_TYPO", "--force", "--reason", "  "], "force_requires_reason", 7)
+            # --no-event-id with --force / --reason -> refused (force only applies to --event-id)
+            assert_refused(["--no-event-id", "--force", "--reason", "x"], "force_without_event_id", 8)
+            assert_refused(["--no-event-id", "--reason", "x"], "force_without_event_id", 9)
+
+            # (4) --force --reason lets the unknown id through: posts once, reply_forced alert, ledger keeps the id
+            rc, out, err, client = run(["--event-id", "Ev_R28_TYPO", "--force", "--reason", "手動投稿の記録用"])
+            assert rc == 0, err
+            assert len(client.posts) == 1
+            assert client.posts[0]["metadata"]["event_payload"] == {"event_id": "Ev_R28_TYPO"}
+            a = alerts()
+            assert len(a) == 10 and a[-1]["kind"] == "reply_forced", a[-1]
+            assert a[-1]["event_id"] == "Ev_R28_TYPO" and a[-1]["reason"] == "手動投稿の記録用"
+            assert a[-1]["forced_check"] == "unknown_event_id"
+            assert [r[0] for r in ledger_rows()] == ["Ev_R28_TYPO"]
+
+            # (5) existing --event-id: no --force needed, no alert, recorded in the ledger
+            text_file.write_text("候補28のテスト返信（実在イベント）です。\n", encoding="utf-8")
+            rc, out, err, client = run(["--event-id", "Ev_R28_REAL"])
+            assert rc == 0, err
+            assert len(client.posts) == 1 and json.loads(out)["event_id"] == "Ev_R28_REAL"
+            assert len(alerts()) == 10, "a valid --event-id leaves no ops alert"
+            assert sorted(r[0] for r in ledger_rows()) == ["Ev_R28_REAL", "Ev_R28_TYPO"]
+            # --force with an existing id is harmless (no reply_forced line)
+            text_file.write_text("候補28のテスト返信（実在イベント・force）です。\n", encoding="utf-8")
+            with get_db_connection(db_path) as conn:
+                conn.execute("DELETE FROM replies WHERE event_id='Ev_R28_REAL'")
+                conn.commit()
+            rc, out, err, client = run(["--event-id", "Ev_R28_REAL", "--force", "--reason", "念のため"])
+            assert rc == 0 and len(client.posts) == 1, err
+            assert len(alerts()) == 10
+
+            # (6) --no-event-id share posts (thread and channel): posted, never recorded in the ledger
+            before = ledger_rows()
+            for thread in (True, False):
+                text_file.write_text(f"共有の投稿です（thread={thread}）。\n", encoding="utf-8")
+                rc, out, err, client = run(["--no-event-id"], thread=thread)
+                assert rc == 0, err
+                assert len(client.posts) == 1
+                payload = client.posts[0]["metadata"]["event_payload"]
+                assert "event_id" not in payload and payload.get("request_id"), payload
+                assert "event_id" not in json.loads(out)
+                assert ledger_rows() == before, "--no-event-id must not write the replies ledger"
+            assert len(alerts()) == 10
+
+            # (7) archive classification of the new kinds (rejected / forced, like commit/requeue)
+            recs = {e["kind"]: ops_monitor.archive_record(e) for e in alerts()}
+            assert recs["reply_rejected"]["action"] == "rejected"
+            assert recs["reply_forced"]["action"] == "forced"
+            assert recs["reply_forced"]["key"] == "Ev_R28_TYPO"
+
+            # (8) read side: the production SDK declares include_all_metadata ...
+            for name in ("conversations_replies", "conversations_history"):
+                assert "include_all_metadata" in inspect.signature(getattr(RealWebClient, name)).parameters, name
+
+            # ... so a TypeError is a bug: no silent retry without the flag (text-only match)
+            class StrictOldClient:
+                def __init__(self) -> None:
+                    self.calls: List[Dict[str, Any]] = []
+                    self.posts: List[Dict[str, Any]] = []
+
+                def auth_test(self) -> Dict[str, Any]:
+                    return {"ok": True, "user_id": "U_YAMA_BOT"}
+
+                def conversations_replies(self, channel: str, ts: str, oldest: Optional[str] = None,
+                                          limit: int = 20, cursor: Optional[str] = None,
+                                          latest: Optional[str] = None) -> Dict[str, Any]:
+                    raise AssertionError("must not be reached without include_all_metadata")
+
+                def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                    self.posts.append(kwargs)
+                    raise AssertionError("must not post")
+
+            def recording(client: "StrictOldClient") -> Callable[..., Any]:
+                original = StrictOldClient.conversations_replies
+
+                def _call(**kwargs: Any) -> Any:
+                    client.calls.append(kwargs)
+                    return original(client, **kwargs)
+                return _call
+
+            c1 = StrictOldClient()
+            c1.conversations_replies = recording(c1)  # type: ignore[assignment]
+            try:
+                agent_tools._pre_post_check_thread_for_reply(
+                    channel=channel_id, raw_text="x", post_text="x", thread_ts=thread_ts,
+                    client=c1, bot_user_id="U_YAMA_BOT", db_path=db_path, sleep_fn=lambda s: None,
+                )
+                raise AssertionError("expected TypeError from _pre_post_check_thread_for_reply")
+            except TypeError:
+                pass
+            assert len(c1.calls) == 1 and c1.calls[0]["include_all_metadata"] is True, c1.calls
+
+            c2 = StrictOldClient()
+            c2.conversations_replies = recording(c2)  # type: ignore[assignment]
+            try:
+                agent_tools._scan_thread_yama_messages(
+                    channel=channel_id, parent_ts=thread_ts, client=c2, bot_user_ids={"U_YAMA_BOT"},
+                    sleep_fn=lambda s: None,
+                )
+                raise AssertionError("expected TypeError from _scan_thread_yama_messages")
+            except TypeError:
+                pass
+            assert len(c2.calls) == 1 and c2.calls[0]["include_all_metadata"] is True, c2.calls
+
+            # delayed-retry reply through cmd_reply: the TypeError fails closed (nothing posted)
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status, "
+                    "first_unverifiable_at) VALUES ('Ev_R28_DELAYED', ?, 'U_Q', '質問', '1795450002.000300', ?, "
+                    "'PROCESSING', ?)",
+                    (channel_id, thread_ts,
+                     (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+            text_file.write_text("遅延再送の返信です。\n", encoding="utf-8")
+            c3 = StrictOldClient()
+            c3.conversations_replies = recording(c3)  # type: ignore[assignment]
+            err = io.StringIO()
+            with patch.object(agent_tools, "get_web_client", return_value=c3), \
+                    patch.object(agent_tools.time, "sleep", return_value=None), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = agent_tools.main(["--db", str(db_path), "reply", "--channel", channel_id, "--text-file",
+                                       str(text_file), "--thread-ts", thread_ts, "--event-id", "Ev_R28_DELAYED"])
+            assert rc == 1, err.getvalue()
+            e = json.loads(err.getvalue())
+            assert e["error"] == "pre_post_check_unverifiable", e
+            assert c3.posts == [] and len(c3.calls) == 1, (c3.posts, c3.calls)
+    finally:
+        if saved_env is not None:
+            os.environ["YAMA_OPS_ALERTS_PATH"] = saved_env
+
+    return ("二択なし/両方/空ID/実在しないID/--force単独/空理由/--no-event-idに--forceは非0で読まず投稿せずreply_rejected・"
+            "--force --reasonでだけ通過(reply_forced・台帳に記録)・実在IDはアラートなしで記録・--no-event-idは台帳に記録せず"
+            "metadataはrequest_id・新kindはrejected/forcedに分類・本番SDKはinclude_all_metadataを宣言・2関数はTypeErrorで"
+            "呼び直さず1回で例外・遅延再送はfail-closedを確認")
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -11256,6 +11868,9 @@ def main() -> int:
         ("80. 滞留対策: seed-mirror (ミラー開始前スレッドの一度きりの補完)", test_seed_mirror),
         ("81. 滞留対策: フックの補完処理をdispatcherの後へ (バッチ周期は即wake・backfill最低5分に1回)", test_hook_supplementary_jobs_after_dispatch),
         ("82. commit 終端ガード 第1段 (同一状態no-op・別状態/FAILEDはalready_terminal拒否・--force訂正・commit-batch検証・requeue経由DONE・reply表示・reconcile判定理由保持)", test_commit_terminal_guard),
+        ("83. 運用アラートの永続ログ (take時にarchiveへ追記・単一経路・rejected/forced区別・サイズ上限で1世代ローテーション・書込失敗でもtake継続＋archive_write_failed・restore行の二重記録なし)", test_ops_alert_archive_on_take),
+        ("84. 候補27 代替案A (台帳に着地ありのFAILEDを検知して1行通知・状態は不変・PROCESSING等は対象外・requeueは台帳ありでブロック・--force --reasonで通過)", test_failed_with_landed_reply_detect_and_requeue_guard),
+        ("85. 候補28 event-id 付け忘れ・打ち間違い防止 (reply の二択必須・実在確認と--force --reason・--no-event-idは台帳に記録しない・読み取りのinclude_all_metadataフォールバック削除)", test_reply_event_id_guard_and_metadata_read_no_fallback),
     ]
 
     print("=" * 72)
