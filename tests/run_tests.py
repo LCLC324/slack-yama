@@ -9,6 +9,7 @@ import http.client
 import io
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -52,6 +53,11 @@ from listener import (  # noqa: E402
 )
 
 DISPATCHER_SH = BASE_DIR / "dispatcher.sh"
+# Live hook script by default; YAMA_TEST_HOOK_SCRIPT points the hook tests at a
+# staged copy before it is installed (stall fix 2026-11-22).
+HOOK_SCRIPT_PATH = Path(
+    os.environ.get("YAMA_TEST_HOOK_SCRIPT", "/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+)
 WATCHDOG_SH = BASE_DIR / "watchdog.sh"
 AGENT_TOOLS_PY = BASE_DIR / "agent_tools.py"
 PYTHON_BIN = BASE_DIR / "venv" / "bin" / "python"
@@ -4230,6 +4236,16 @@ def test_reconcile_replies_picks_up_unverifiable() -> str:
 
 def test_pre_post_check_per_page_retry_and_bot_id_reuse() -> str:
     """28. (監査指摘5) 送信前チェックのAPIコール単位リトライとbot_user_id再利用: 複数ページ走査の2・3ページ目で単発IncompleteReadが起きても1ページ目からやり直さず当該ページのみリトライで完走し、bot_user_idも再利用されることを確認"""
+    # This test exercises the auth_test path + its cache, so the env override
+    # (config/.env has YAMA_BOT_USER_ID since 2026-11-22) must be absent here.
+    saved_uid_env = {k: os.environ.pop(k) for k in ("YAMA_BOT_USER_ID", "SLACK_BOT_USER_ID") if k in os.environ}
+    try:
+        return _test_pre_post_check_per_page_retry_and_bot_id_reuse_body()
+    finally:
+        os.environ.update(saved_uid_env)
+
+
+def _test_pre_post_check_per_page_retry_and_bot_id_reuse_body() -> str:
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "slack_events.db"
         init_db(db_path)
@@ -4516,7 +4532,7 @@ def test_backfill_live_dedup_and_thread_pagination() -> str:
 
 def test_hook_env_atomic_replace() -> str:
     """30. (監査指摘7) フック slack-yama-dispatch.sh の .env 更新が同一ディレクトリ内一時ファイル＋chmod 600＋mv アトミック置換になっており、空ファイル競合が起きないことを確認"""
-    hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+    hook_script = HOOK_SCRIPT_PATH
     assert hook_script.exists(), f"Hook script not found: {hook_script}"
     script_text = hook_script.read_text(encoding="utf-8")
 
@@ -4871,7 +4887,7 @@ def test_batch_d_ignored_error_clear_watchdog_and_busy_timeout() -> str:
         assert "Unit reinstall skipped: backoff active" in wd_log.read_text(encoding="utf-8")
 
         # 4) Hook self-heal logs restart-required warning when replacing an existing unit file
-        hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+        hook_script = HOOK_SCRIPT_PATH
         hook_text = hook_script.read_text(encoding="utf-8")
         assert "service restart required" in hook_text
 
@@ -6207,6 +6223,9 @@ def test_windowed_thread_dedup_after_event_ts() -> str:
         reconcile_text = "reconcile対象のYama返信です。"
         now_dt = datetime.now(timezone.utc)
         recent_str = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        # PROCESSING rows are "just dispatched" (updated_at = now): the safety-read
+        # deadline counts back from the Reaper horizon (dispatch + 900s).
+        dispatched_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         with get_db_connection(db_path) as conn:
             conn.executemany(
@@ -6217,8 +6236,8 @@ def test_windowed_thread_dedup_after_event_ts() -> str:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (ev_normal, channel_id, "U_ASKER", "質問1", event_ts, thread_ts, "PROCESSING", None, None, None, recent_str, recent_str),
-                    (ev_delayed, channel_id, "U_ASKER", "質問2", event_ts, thread_ts, "PROCESSING", "pre_post_check_unverifiable", "2026-11-13 23:00:00", None, recent_str, recent_str),
+                    (ev_normal, channel_id, "U_ASKER", "質問1", event_ts, thread_ts, "PROCESSING", None, None, None, recent_str, dispatched_str),
+                    (ev_delayed, channel_id, "U_ASKER", "質問2", event_ts, thread_ts, "PROCESSING", "pre_post_check_unverifiable", "2026-11-13 23:00:00", None, recent_str, dispatched_str),
                     (ev_reconcile, channel_id, "U_ASKER", "質問3", reconcile_event_ts, thread_ts, "FAILED", "ambiguous_post_outcome", None, reconcile_text, recent_str, recent_str),
                 ],
             )
@@ -6788,6 +6807,7 @@ def test_reply_metadata_attachment_and_include_all_metadata() -> str:
         ev_rec_id = "Ev_META_RECONCILE_1"
         now_dt = datetime.now(timezone.utc)
         recent_ts_str = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        dispatched_ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")  # PROCESSING rows: just dispatched
 
         with get_db_connection(db_path) as conn:
             conn.executemany(
@@ -6813,7 +6833,7 @@ def test_reply_metadata_attachment_and_include_all_metadata() -> str:
                         None,
                         None,
                         recent_ts_str,
-                        recent_ts_str,
+                        dispatched_ts_str,
                     ),
                     (
                         ev_delayed_id,
@@ -6829,7 +6849,7 @@ def test_reply_metadata_attachment_and_include_all_metadata() -> str:
                         None,
                         None,
                         recent_ts_str,
-                        recent_ts_str,
+                        dispatched_ts_str,
                     ),
                     (
                         ev_rec_id,
@@ -8752,7 +8772,7 @@ def test_watchdog_restart_py_compile_gate() -> str:
 
 def test_hook_bash_n_guards() -> str:
     """62. フックの bash -n ガード (dispatcher.sh / watchdog.sh が構文エラーの回は実行を飛ばしてログに残す)"""
-    hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+    hook_script = HOOK_SCRIPT_PATH
     assert hook_script.exists(), f"Hook script not found: {hook_script}"
     script_text = hook_script.read_text(encoding="utf-8")
     assert 'bash -n "$PROJECT_DIR/dispatcher.sh"' in script_text
@@ -8910,7 +8930,7 @@ def test_resolve_bot_user_id_env_validation() -> str:
 
 def test_hook_syntax_guard_escalation() -> str:
     """64. 構文ガードの10分エスカレーション＆警告wake (jq組立てJSON検証・wake失敗時はwarned未保存で再試行＆後段処理続行・成功時のみwarned保存・10分未満静観・復旧・対象独立・破損状態耐性)"""
-    hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+    hook_script = HOOK_SCRIPT_PATH
     assert hook_script.exists(), f"Hook script not found: {hook_script}"
     script_text = hook_script.read_text(encoding="utf-8")
     for needle in (
@@ -9497,7 +9517,7 @@ def test_ops_pending_stale_check_and_outbox() -> str:
 
 def test_hook_ops_alert_block_edge_wake() -> str:
     """68. フックの運用警告ブロック (ライブフックのbegin〜endを実行: PENDING滞留のエッジ通知・復旧1回・outbox配送・wake失敗時の状態ロールバック＆outbox復元・監視失敗の即時表面化・ディスパッチ回は送らない) と構文ガードのwake=exit前提での重複抑止"""
-    hook_script = Path("/home/hatch/hooks/scripts/slack-yama-dispatch.sh")
+    hook_script = HOOK_SCRIPT_PATH
     script_text = hook_script.read_text(encoding="utf-8")
     assert "ops_monitor.py" in script_text and "pending-check" in script_text
     begin = script_text.index("# --- ops alerts: begin")
@@ -10177,6 +10197,981 @@ def test_dispatcher_batch_weight_budget_and_payload_text_cap() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Stall fix (2026-11-22): stepped unverifiable wait, read deadlines, local
+# thread mirror + context bundling, commit-batch, seed-mirror, hook ordering.
+# ---------------------------------------------------------------------------
+
+
+def _write_mirror_health(state_dir: Path, hb_age: float = 0.0, backfill_ok: Optional[bool] = True) -> None:
+    now = time.time()
+    (state_dir / "heartbeat.json").write_text(
+        json.dumps({"timestamp": now - hb_age, "connected": True}), encoding="utf-8"
+    )
+    st = state_dir / "backfill_last_status.json"
+    if backfill_ok is None:
+        if st.exists():
+            st.unlink()
+    else:
+        st.write_text(json.dumps({"at": now, "ok": backfill_ok, "errors": []}), encoding="utf-8")
+
+
+def test_unverifiable_stepped_wait() -> str:
+    """74. 投稿前チェック不能の待ちの段階化 (2→5→15→30→60分・first_unverifiable_at基準・retry_count非消費・24h終端不変・固定値指定は従来どおり)"""
+    f = agent_tools.unverifiable_retry_wait_seconds
+    assert [f(0), f(119), f(120), f(419), f(420), f(1319), f(1320), f(3119), f(3120), f(80000)] == [
+        120, 120, 300, 300, 900, 900, 1800, 1800, 3600, 3600]
+    assert agent_tools._parse_retry_ladder("60, 600") == (60, 600)
+    assert agent_tools._parse_retry_ladder("x,1") == agent_tools.UNVERIFIABLE_RETRY_LADDER_SECONDS
+    assert agent_tools._parse_retry_ladder("0,5") == agent_tools.UNVERIFIABLE_RETRY_LADDER_SECONDS
+
+    with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("YAMA_UNVERIFIABLE_RETRY_WAIT_SEC", None)
+        os.environ.pop("YAMA_UNVERIFIABLE_RETRY_LADDER_SEC", None)
+        db_path = Path(tmp) / "state" / "slack_events.db"
+        init_db(db_path)
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status) "
+                "VALUES ('Ev_LADDER', 'C1', 'U1', 'q', '1797000000.000100', '1797000000.000100', 'PROCESSING')"
+            )
+            conn.commit()
+        t0 = datetime(2026, 11, 22, 0, 0, 0, tzinfo=timezone.utc)
+        waits = []
+        # Each re-dispatch happens a bit after next_retry_at (poll cycle + batch time).
+        offsets = [0, 150, 480, 1400, 3200, 6900]
+        for off in offsets:
+            now_dt = t0 + timedelta(seconds=off)
+            row = commit_event("Ev_LADDER", "FAILED", error_message="pre_post_check_unverifiable",
+                               db_path=db_path, now=now_dt)
+            assert row["status"] == "PENDING" and int(row["retry_count"]) == 0, row
+            assert row["first_unverifiable_at"] == "2026-11-22 00:00:00", row
+            nxt = datetime.strptime(row["next_retry_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            waits.append(int((nxt - now_dt).total_seconds()))
+        assert waits == [120, 300, 900, 1800, 3600, 3600], waits
+        row = commit_event("Ev_LADDER", "FAILED", error_message="pre_post_check_unverifiable",
+                           db_path=db_path, now=t0 + timedelta(hours=24, seconds=1))
+        assert row["status"] == "FAILED" and "abandoned after 24h" in row["error_message"], row
+        # Explicit fixed wait (argument or env) keeps the old behaviour.
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE events SET status='PROCESSING', first_unverifiable_at=NULL, error_message=NULL")
+            conn.commit()
+        row = commit_event("Ev_LADDER", "FAILED", error_message="pre_post_check_unverifiable",
+                           db_path=db_path, now=t0, retry_wait_seconds=3600)
+        assert row["next_retry_at"] == "2026-11-22 01:00:00", row
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE events SET status='PROCESSING', first_unverifiable_at=NULL, error_message=NULL")
+            conn.commit()
+        with patch.dict(os.environ, {"YAMA_UNVERIFIABLE_RETRY_WAIT_SEC": "600"}):
+            row = commit_event("Ev_LADDER", "FAILED", error_message="pre_post_check_unverifiable",
+                               db_path=db_path, now=t0)
+        assert row["next_retry_at"] == "2026-11-22 00:10:00", row
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE events SET status='PROCESSING', first_unverifiable_at=NULL, error_message=NULL")
+            conn.commit()
+        with patch.dict(os.environ, {"YAMA_UNVERIFIABLE_RETRY_LADDER_SEC": "60,600"}):
+            r1 = commit_event("Ev_LADDER", "FAILED", error_message="pre_post_check_unverifiable",
+                              db_path=db_path, now=t0)
+            r2 = commit_event("Ev_LADDER", "FAILED", error_message="pre_post_check_unverifiable",
+                              db_path=db_path, now=t0 + timedelta(seconds=70))
+        assert r1["next_retry_at"] == "2026-11-22 00:01:00" and r2["next_retry_at"] == "2026-11-22 00:11:10", (r1, r2)
+    return "待ち時間が初回からの経過で2→5→15→30→60→60分と段階化(再ディスパッチの遅れがあっても1段ずつ)・retry_count非消費・24h超FAILED終端は不変・固定値指定(引数/環境変数)と段階の上書きを確認"
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+        self.slept: List[float] = []
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, d: float) -> None:
+        self.slept.append(d)
+        self.t += d
+
+
+def test_read_deadlines_context_and_safety() -> str:
+    """75. 通信の締切 (文脈用20秒でローカルへ・再試行の待ちを締切内に制限・SDKのtimeout/再試行とcurlを残り時間で制限・安全用は残り時間から逆算しfail-closed)"""
+    clock = _FakeClock()
+    calls = {"n": 0}
+
+    def always_fail() -> Any:
+        calls["n"] += 1
+        clock.t += 3.0  # each attempt itself takes 3s
+        raise urllib.error.URLError("down")
+
+    # 1) _call_with_retry stops before a backoff that would cross the deadline.
+    with patch.object(agent_tools.time, "monotonic", clock.monotonic):
+        with agent_tools.read_deadline(10.0):
+            try:
+                agent_tools._call_with_retry(always_fail, sleep_fn=clock.sleep)
+                raise AssertionError("expected SlackReadDeadlineExceeded")
+            except agent_tools.SlackReadDeadlineExceeded as exc:
+                assert isinstance(exc, TimeoutError)
+        assert clock.t - 1000.0 <= 10.0 + 3.0, clock.t
+        assert calls["n"] == 3 and clock.slept == [1.0, 2.0], (calls, clock.slept)
+        # No deadline -> unchanged 5 attempts.
+        calls["n"] = 0
+        clock.slept.clear()
+        try:
+            agent_tools._call_with_retry(always_fail, sleep_fn=clock.sleep)
+        except urllib.error.URLError:
+            pass
+        assert calls["n"] == 5 and clock.slept == [1.0, 2.0, 4.0, 8.0], clock.slept
+        # Nested deadlines keep the earlier one and restore on exit.
+        with agent_tools.read_deadline(5.0):
+            d1 = agent_tools._ACTIVE_READ_DEADLINE
+            with agent_tools.read_deadline(50.0):
+                assert agent_tools._ACTIVE_READ_DEADLINE == d1
+            with agent_tools.read_deadline(1.0):
+                assert agent_tools._ACTIVE_READ_DEADLINE < d1
+            assert agent_tools._ACTIVE_READ_DEADLINE == d1
+        assert agent_tools._ACTIVE_READ_DEADLINE is None
+
+    # 2) Context read: deadline -> local DB fallback with fallback_reason.
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "state" / "slack_events.db"
+        init_db(db_path)
+        handle_event_payload(
+            {"event_id": "Ev_DL_1", "event": {"type": "message", "channel": "C_DL", "user": "U_A",
+                                               "text": "ローカルにある投稿", "ts": "1797100000.000100"}},
+            bot_user_id="U_YAMA", db_path=db_path,
+        )
+
+        class SlowClient:
+            def conversations_replies(self, **kw: Any) -> Any:
+                clock.t += 15.0
+                raise urllib.error.URLError("slow")
+
+        clock.t = 5000.0
+        clock.slept.clear()
+        with patch.object(agent_tools.time, "monotonic", clock.monotonic):
+            res = fetch_history("C_DL", thread_ts="1797100000.000100", limit=20, db_path=db_path,
+                                client=SlowClient(), sleep_fn=clock.sleep, deadline_seconds=20.0)
+        assert res["source"] == "local_db_fallback" and res.get("fallback_reason") == "read_deadline", res
+        assert res["messages"][0]["text"] == "ローカルにある投稿"
+        assert clock.t - 5000.0 <= 31.0, clock.t
+        assert agent_tools.CONTEXT_READ_DEADLINE_SECONDS == 20.0
+
+    # 3) _CurlFallbackWebClient: socket timeout / SDK retry handlers / curl max-time bounded.
+    seen: Dict[str, Any] = {}
+    client = agent_tools._CurlFallbackWebClient(token="xoxb-dummy-token-for-test")
+    orig_timeout, orig_handlers = client.timeout, list(client.retry_handlers)
+
+    def fake_sdk_replies(self: Any, **kw: Any) -> Any:
+        seen["timeout"] = self.timeout
+        seen["handlers"] = list(self.retry_handlers)
+        raise urllib.error.URLError("sdk down")
+
+    def fake_curl(token: str, method: str, params: Dict[str, Any], max_time: Optional[float] = None) -> Any:
+        seen["max_time"] = max_time
+        raise RuntimeError("curl down")
+
+    with patch.object(agent_tools.WebClient, "conversations_replies", fake_sdk_replies), \
+            patch.object(agent_tools, "_curl_api_read", fake_curl):
+        with agent_tools.read_deadline(7.0):
+            try:
+                client.conversations_replies(channel="C", ts="1.0")
+            except urllib.error.URLError:
+                pass
+        assert seen["timeout"] <= 7.0 and seen["handlers"] == [] and seen["max_time"] <= 7.0, seen
+        assert client.timeout == orig_timeout and len(client.retry_handlers) == len(orig_handlers)
+        seen.clear()
+        try:
+            client.conversations_replies(channel="C", ts="1.0")
+        except urllib.error.URLError:
+            pass
+        assert seen["timeout"] == orig_timeout and len(seen["handlers"]) == len(orig_handlers)
+        assert seen["max_time"] is None, seen
+
+    # 4) Safety budget counted back from the Reaper horizon.
+    now_dt = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    def row(age: float, status: str = "PROCESSING") -> Dict[str, Any]:
+        return {"status": status, "updated_at": (now_dt - timedelta(seconds=age)).strftime("%Y-%m-%d %H:%M:%S")}
+
+    b = agent_tools.safety_read_budget_seconds
+    assert b(row(0), now=now_dt) == 180.0
+    assert b(row(700), now=now_dt) == 140.0
+    assert b(row(850), now=now_dt) == 0.0
+    assert b(row(5000, "PENDING"), now=now_dt) == 180.0 and b(None, now=now_dt) == 180.0
+
+    # 5) cmd_reply: too little time left -> pre_post_check_unverifiable without any read or post.
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "state" / "slack_events.db"
+        init_db(db_path)
+        old = (datetime.now(timezone.utc) - timedelta(seconds=860)).strftime("%Y-%m-%d %H:%M:%S")
+        fresh = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status, created_at, updated_at) "
+                "VALUES (?, 'C_S', 'U_A', 'q', ?, '1797200000.000100', 'PROCESSING', ?, ?)",
+                [("Ev_SAFE_OLD", "1797200001.000100", old, old), ("Ev_SAFE_NEW", "1797200002.000100", fresh, fresh)],
+            )
+            conn.commit()
+        text_file = Path(tmp) / "r.txt"
+        text_file.write_text("返信本文です。\n", encoding="utf-8")
+        reads = {"n": 0, "posts": 0}
+
+        class Client:
+            timeout = 30
+            retry_handlers: List[Any] = []
+
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": "U_YAMA_BOT"}
+
+            def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+                reads["n"] += 1
+                return {"ok": True, "messages": [], "has_more": False}
+
+            def chat_postMessage(self, **kw: Any) -> Dict[str, Any]:
+                reads["posts"] += 1
+                return {"ok": True, "channel": kw["channel"], "ts": "1797200099.000100"}
+
+        def run(eid: str) -> Tuple[int, str, str]:
+            args = Namespace(channel="C_S", text_file=str(text_file), thread_ts="1797200000.000100",
+                             event_id=eid, db=str(db_path))
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(agent_tools, "get_web_client", lambda *a, **k: Client()), \
+                    redirect_stdout(out), redirect_stderr(err):
+                rc = cmd_reply(args)
+            return rc, out.getvalue(), err.getvalue()
+
+        rc, _, err = run("Ev_SAFE_OLD")
+        assert rc == 1 and "pre_post_check_unverifiable" in err and "safety_read_deadline" in err, err
+        assert reads == {"n": 0, "posts": 0}, reads
+        rc, out, _ = run("Ev_SAFE_NEW")
+        assert rc == 0 and reads["n"] >= 1 and reads["posts"] == 1, (rc, reads, out)
+    return "締切内で再試行を打ち切り(待ちを跨がない)・締切なしは従来の5回・文脈用は締切でlocal_db_fallback(fallback_reason)・SDKのtimeout/再試行ハンドラとcurlのmax-timeを残り時間で制限し呼出後に復元・安全用予算はReaper回収時刻から逆算(余裕なしは読まず送らずunverifiable)を確認"
+
+
+def test_listener_mirror_own_posts_and_edits() -> str:
+    """76. ミラーの穴埋め (自分の投稿はevents外のmirror_messagesへ・編集/削除をmessage_editsへ・eventsの除外は不変・backfillも自分の投稿と編集を記録)"""
+    import listener as listener_mod
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "state" / "slack_events.db"
+        init_db(db_path)
+        saved, reason = handle_event_payload(
+            {"event_id": "Ev_OWN", "event": {"type": "message", "channel": "C_M", "user": "U_YAMA", "bot_id": "B_Y",
+                                              "text": "Yama の共有投稿", "ts": "1797300001.000100",
+                                              "thread_ts": "1797300000.000100"}},
+            bot_user_id="U_YAMA", db_path=db_path,
+        )
+        assert (saved, reason) == (False, "self_bot_message")
+        saved, reason = handle_event_payload(
+            {"event": {"type": "message", "subtype": "message_changed", "channel": "C_M", "hidden": True,
+                       "message": {"user": "U_OTHER", "text": "編集後の本文", "ts": "1797300002.000100"}}},
+            bot_user_id="U_YAMA", db_path=db_path,
+        )
+        assert saved is False and reason.startswith("ignored_subtype")
+        handle_event_payload(
+            {"event": {"type": "message", "subtype": "message_changed", "channel": "C_M",
+                       "message": {"user": "U_YAMA", "text": "Yama 編集後", "ts": "1797300001.000100",
+                                   "thread_ts": "1797300000.000100"}}},
+            bot_user_id="U_YAMA", db_path=db_path,
+        )
+        handle_event_payload(
+            {"event": {"type": "message", "subtype": "message_deleted", "channel": "C_M",
+                       "deleted_ts": "1797300003.000100"}},
+            bot_user_id="U_YAMA", db_path=db_path,
+        )
+        with get_db_connection(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+            own = conn.execute("SELECT * FROM mirror_messages WHERE ts='1797300001.000100'").fetchone()
+            assert own["user_id"] == "U_YAMA" and own["is_bot"] == 1 and own["text"] == "Yama 編集後"
+            assert own["thread_ts"] == "1797300000.000100"
+            ed = {r["ts"]: dict(r) for r in conn.execute("SELECT * FROM message_edits").fetchall()}
+            assert ed["1797300002.000100"]["text"] == "編集後の本文" and ed["1797300002.000100"]["deleted"] == 0
+            assert ed["1797300003.000100"]["deleted"] == 1
+        s1 = listener_mod.mark_mirror_since(db_path, now=100.0)
+        s2 = listener_mod.mark_mirror_since(db_path, now=200.0)
+        assert s1 == s2 == "100.000000"
+        # A mirror failure never breaks intake.
+        with patch.object(listener_mod, "record_own_message", side_effect=RuntimeError("disk")):
+            assert listener_mod.mirror_side_event(
+                {"type": "message", "channel": "C", "user": "U_YAMA", "ts": "1.0", "text": "x"}, "U_YAMA",
+                db_path=db_path) is None
+
+        # backfill: own posts and edited messages it reads are mirrored too.
+        class BfClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": "U_YAMA"}
+
+            def conversations_history(self, **kw: Any) -> Dict[str, Any]:
+                if kw["channel"] != "C_B":
+                    return {"ok": True, "messages": [], "has_more": False}
+                return {"ok": True, "has_more": False, "messages": [
+                    {"type": "message", "user": "U_YAMA", "bot_id": "B_Y", "text": "停止中のYama投稿", "ts": f"{time.time() - 30:.6f}"},
+                    {"type": "message", "user": "U_P", "text": "編集された人間の投稿", "ts": f"{time.time() - 20:.6f}", "edited": {"ts": "1"}},
+                ]}
+
+            def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+                return {"ok": True, "messages": [], "has_more": False}
+
+        env_file = Path(tmp) / ".env"
+        env_file.write_text("", encoding="utf-8")
+        res = run_backfill(db_path=db_path, env_path=env_file, channels=("C_B",), client=BfClient(), sleep_fn=lambda s: None)
+        assert res["inserted"] == 1, res
+        with get_db_connection(db_path) as conn:
+            m = conn.execute("SELECT * FROM mirror_messages WHERE channel_id='C_B'").fetchall()
+            assert len(m) == 1 and m[0]["text"] == "停止中のYama投稿" and m[0]["source"] == "backfill"
+            assert conn.execute("SELECT COUNT(*) FROM message_edits WHERE channel_id='C_B'").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM events WHERE channel_id='C_B' AND user_id='U_YAMA'").fetchone()[0] == 0
+        st = json.loads((db_path.parent / "backfill_last_status.json").read_text(encoding="utf-8"))
+        assert st["ok"] is True
+
+        class BadClient(BfClient):
+            def conversations_history(self, **kw: Any) -> Dict[str, Any]:
+                raise SlackApiError("boom", {"ok": False, "error": "channel_not_found"})
+
+        run_backfill(db_path=db_path, env_path=env_file, channels=("C_B",), client=BadClient(), sleep_fn=lambda s: None)
+        st = json.loads((db_path.parent / "backfill_last_status.json").read_text(encoding="utf-8"))
+        assert st["ok"] is False and st["errors"], st
+    return "自分の投稿はeventsに入れずmirror_messagesへ(編集も反映)・他者の編集と削除をmessage_editsへ・mirror_meta開始時刻は初回のみ・ミラー失敗は取り込みに影響なし・backfillが停止中の自分の投稿と編集を記録しbackfill_last_status.jsonに成否を残すことを確認"
+
+
+def _seed_context_db(db_path: Path, since: float) -> None:
+    import listener as listener_mod
+    init_db(db_path)
+    listener_mod.mark_mirror_since(db_path, now=since)
+    thread = "1797400000.000100"
+    with get_db_connection(db_path) as conn:
+        rows = [("Ev_P", "C_X", "U_OWNER", "親の問いかけ", thread, None, 0, "DONE")]
+        for i in range(1, 26):
+            rows.append((f"Ev_R{i:02d}", "C_X", "U_NEIRO", f"返信{i:02d}", f"17974000{i:02d}.000100", thread, 1, "DONE"))
+        conn.executemany(
+            "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, is_bot, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+    listener_mod.record_own_message("C_X", "1797400026.500000", thread, "Yama の共有（台帳外）", user_id=agent_tools.YAMA_BOT_USER_ID, db_path=db_path)
+    agent_tools.record_reply(event_id="Ev_R25", channel_id="C_X", thread_ts=thread, reply_ts="1797400027.000100",
+                             text="Yama の返信（台帳）", db_path=db_path)
+    listener_mod.record_message_edit("C_X", "1797400024.000100", "返信24（編集後）", db_path=db_path)
+    listener_mod.record_message_edit("C_X", "1797400023.000100", None, deleted=True, db_path=db_path)
+
+
+def test_context_bundle_local_thread_context() -> str:
+    """77. 文脈のローカル同梱 (events+mirror+台帳の統合・親＋直近20件・編集反映/削除除外・直前のYama発言・欠けがあればcontext_ok=falseで理由)"""
+    import context_bundle
+    import listener as listener_mod
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "state"
+        state.mkdir()
+        db_path = state / "slack_events.db"
+        _seed_context_db(db_path, since=1797300000.0)
+        _write_mirror_health(state)
+        ev = {"event_id": "Ev_NEW", "channel_id": "C_X", "ts": "1797400028.000100",
+              "thread_ts": "1797400000.000100", "retry_count": 0}
+        ctxs, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        a = ann["Ev_NEW"]
+        assert a == {"context_key": "C_X:1797400000.000100", "context_ok": True, "context_gaps": []}, a
+        c = ctxs[a["context_key"]]
+        msgs = c["messages"]
+        assert c["complete"] is True and c["source"] == "local_db_bundle"
+        assert msgs[0]["ts"] == "1797400000.000100" and msgs[0]["text"] == "親の問いかけ"
+        assert len(msgs) == 21, len(msgs)
+        texts = [m["text"] for m in msgs]
+        assert "返信23" not in texts and c.get("deleted_omitted") == 1
+        assert "返信24（編集後）" in texts and any(m.get("edited") for m in msgs)
+        assert texts[-2:] == ["Yama の共有（台帳外）", "Yama の返信（台帳）"], texts[-3:]
+        assert msgs[-1].get("is_yama") is True
+        assert c["last_own_message"]["text"] == "Yama の返信（台帳）"
+        assert c["older_omitted"] == 26 - 20 and "省略" in c["note"]
+
+        # Same thread twice in one batch -> one context, shared.
+        ev2 = dict(ev, event_id="Ev_NEW2", ts="1797400029.000100")
+        ctxs, ann = context_bundle.build_batch_contexts(db_path, [ev, ev2], state_dir=state)
+        assert len(ctxs) == 1 and ann["Ev_NEW2"]["context_key"] == ann["Ev_NEW"]["context_key"]
+
+        # Retry / wait-state event -> per-event gap (thread context itself still complete).
+        ev_r = dict(ev, event_id="Ev_RETRY", retry_count=1)
+        ev_w = dict(ev, event_id="Ev_WAIT", first_unverifiable_at="2026-11-22 00:00:00")
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev_r, ev_w], state_dir=state)
+        assert ann["Ev_RETRY"]["context_ok"] is False and ann["Ev_RETRY"]["context_gaps"] == ["retry_requires_api_history"]
+        assert ann["Ev_WAIT"]["context_ok"] is False
+
+        # Parent missing.
+        ev_np = {"event_id": "Ev_NP", "channel_id": "C_X", "ts": "1797500001.000100", "thread_ts": "1797500000.000100"}
+        with get_db_connection(db_path) as conn:
+            conn.execute("INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status) VALUES "
+                         "('Ev_NP', 'C_X', 'U_N', 'x', '1797500001.000100', '1797500000.000100', 'PROCESSING')")
+            conn.commit()
+        ctxs, ann = context_bundle.build_batch_contexts(db_path, [ev_np], state_dir=state)
+        assert ann["Ev_NP"]["context_gaps"] == ["parent_missing"] and "messages" not in ctxs["C_X:1797500000.000100"]
+
+        # Top-level post (no thread_ts): its own ts is the parent -> complete.
+        ev_top = {"event_id": "Ev_NP", "channel_id": "C_X", "ts": "1797500001.000100", "thread_ts": None}
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev_top], state_dir=state)
+        assert ann["Ev_NP"]["context_ok"] is True, ann
+
+        # Thread older than the own-post mirror start -> incomplete until seeded after it.
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE mirror_meta SET value='1797450000.000000'")
+            conn.commit()
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEW"]["context_gaps"] == ["thread_predates_own_post_mirror"], ann
+        with get_db_connection(db_path) as conn:
+            conn.execute("INSERT INTO mirror_threads (channel_id, thread_ts, seeded_at) VALUES ('C_X', '1797400000.000100', 1797440000.0)")
+            conn.commit()
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEW"]["context_ok"] is False, "seeded before the mirror start does not count"
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE mirror_threads SET seeded_at = 1797460000.0")
+            conn.commit()
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEW"]["context_ok"] is True, ann
+        with get_db_connection(db_path) as conn:
+            conn.execute("DELETE FROM mirror_meta")
+            conn.commit()
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEW"]["context_gaps"] == ["own_post_mirror_inactive"], ann
+        listener_mod.mark_mirror_since(db_path, now=1797300000.0)
+
+        # Batch-wide health gaps.
+        _write_mirror_health(state, hb_age=600)
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert "listener_heartbeat_stale" in ann["Ev_NEW"]["context_gaps"]
+        _write_mirror_health(state, backfill_ok=False)
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEW"]["context_gaps"] == ["backfill_failed"]
+        _write_mirror_health(state, backfill_ok=None)
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEW"]["context_gaps"] == ["backfill_status_unknown"]
+        _write_mirror_health(state)
+
+        # Batch text budget.
+        with patch.dict(os.environ, {"YAMA_CONTEXT_BATCH_TEXT_BUDGET": "50"}):
+            _, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEW"]["context_gaps"] == ["payload_context_budget"], ann
+    return "events・mirror・台帳を統合し親＋直近20件(26件中6件省略を明記)・編集後本文/削除除外・台帳外の自分の投稿と直前のYama発言を含む・同一スレッドは1回だけ・再処理イベント/親欠落/ミラー開始前の未シードスレッド/listener停止/backfill失敗・不明/予算超過はcontext_ok=falseで理由付き、を確認"
+
+
+def test_dispatcher_context_bundle_payload() -> str:
+    """78. dispatcher の文脈同梱 (PROCESSING確定後に作成・小さい時はpayloadに内包/大きい時はpayload_context.json参照・失敗しても配信は不変・無効化スイッチ)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        db_path = state_dir / "slack_events.db"
+        payload_path = state_dir / "payload.json"
+        mode_file = Path(tmp) / "mode.txt"
+        mode_file.write_text("full\n", encoding="utf-8")
+        _seed_context_db(db_path, since=1797300000.0)
+        _write_mirror_health(state_dir)
+        env = os.environ.copy()
+        for k in ("YAMA_PAYLOAD_INLINE_MAX_BYTES", "YAMA_CONTEXT_BUNDLE", "YAMA_HEARTBEAT_PATH"):
+            env.pop(k, None)
+        env.update({
+            "YAMA_STATE_DIR": str(state_dir), "YAMA_DB_PATH": str(db_path),
+            "YAMA_PAYLOAD_PATH": str(payload_path), "YAMA_LOCK_PATH": str(state_dir / "dispatcher.lock"),
+            "YAMA_MODE_FILE": str(mode_file), "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+            "YAMA_OPS_ALERTS_PATH": str(state_dir / "ops_alerts.jsonl"),
+        })
+
+        def add(eid: str, ts: str, thread: Optional[str], text: str = "新しい投稿") -> None:
+            ev = {"type": "message", "channel": "C_X", "user": "U_NEIRO", "bot_id": "B_N", "text": text, "ts": ts}
+            if thread:
+                ev["thread_ts"] = thread
+            handle_event_payload({"event_id": eid, "event": ev}, bot_user_id="U_YAMA", db_path=db_path)
+
+        def dispatch(extra: Optional[Dict[str, str]] = None, script: Path = DISPATCHER_SH) -> Dict[str, Any]:
+            e = dict(env, **(extra or {}))
+            res = subprocess.run(["bash", str(script)], env=e, capture_output=True, text=True)
+            assert res.returncode == 0, f"rc={res.returncode} out={res.stdout} err={res.stderr}"
+            return json.loads(payload_path.read_text(encoding="utf-8"))
+
+        def finish(p: Dict[str, Any]) -> None:
+            for ev in p["events"]:
+                commit_event(ev["event_id"], "DONE", db_path=db_path)
+
+        # 1) Small batch -> inlined.
+        add("Ev_D1", "1797400030.000100", "1797400000.000100")
+        p = dispatch({"YAMA_PAYLOAD_INLINE_MAX_BYTES": "200000"})
+        e = p["events"][0]
+        assert e["context_ok"] is True and e["context_key"] == "C_X:1797400000.000100", e
+        assert p["contexts"][e["context_key"]]["messages"][0]["text"] == "親の問いかけ"
+        assert "context_file" not in p
+        doc = json.loads((state_dir / "payload_context.json").read_text(encoding="utf-8"))
+        assert doc["event_ids"] == ["Ev_D1"] and e["context_key"] in doc["contexts"]
+        finish(p)
+
+        # 2) Default inline limit (12,000 bytes) exceeded -> pointer to the file only.
+        add("Ev_D2", "1797400031.000100", "1797400000.000100", text="長め" * 300)
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE events SET text = ? WHERE event_id LIKE 'Ev_R%'", ("長い返信本文。" * 120,))
+            conn.commit()
+        p = dispatch()
+        assert "contexts" not in p and p["context_file"] == str(state_dir / "payload_context.json"), list(p)
+        assert p["events"][0]["context_ok"] is True
+        assert len(payload_path.read_bytes()) < 12000 + 4000
+        finish(p)
+
+        # 3) Bundling failure -> dispatch unchanged, events marked context_ok=false.
+        alt = Path(tmp) / "alt"
+        alt.mkdir()
+        shutil.copy(DISPATCHER_SH, alt / "dispatcher.sh")
+        (alt / "context_bundle.py").write_text("raise RuntimeError('broken bundle')\n", encoding="utf-8")
+        add("Ev_D3", "1797400032.000100", "1797400000.000100")
+        p = dispatch(script=alt / "dispatcher.sh")
+        assert [x["event_id"] for x in p["events"]] == ["Ev_D3"] and count_events(db_path, "PROCESSING") == 1
+        assert p["events"][0]["context_ok"] is False and p["events"][0]["context_gaps"] == ["context_build_error"]
+        finish(p)
+
+        # 4) Disabled -> payload exactly as before (no context fields).
+        add("Ev_D4", "1797400033.000100", "1797400000.000100")
+        p = dispatch({"YAMA_CONTEXT_BUNDLE": "0"})
+        assert "context_ok" not in p["events"][0] and "contexts" not in p and "context_file" not in p
+        finish(p)
+    return "PROCESSING確定後に文脈を作りpayloadへ内包(小)・12,000バイト超はpayload_context.jsonを参照(context_file)・同梱処理が壊れても配信件数と状態は不変でcontext_ok=false・YAMA_CONTEXT_BUNDLE=0で従来のpayloadを確認"
+
+
+def test_commit_batch() -> str:
+    """79. commit-batch (返さない件の一括commit・検証は全件一括で1件でも不正なら何もしない・各件はcommitと同じ扱い)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "state" / "slack_events.db"
+        init_db(db_path)
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, error_message) VALUES (?, 'C', 'U', 't', ?, 'PROCESSING', ?)",
+                [("Ev_B1", "1.1", None), ("Ev_B2", "1.2", "old error"), ("Ev_B3", "1.3", None), ("Ev_B4", "1.4", None)],
+            )
+            conn.commit()
+        f = Path(tmp) / "decisions.json"
+
+        def run(obj: Any) -> Tuple[int, Dict[str, Any]]:
+            f.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = agent_tools.main(["--db", str(db_path), "commit-batch", "--file", str(f)])
+            txt = out.getvalue() or err.getvalue()
+            return rc, json.loads(txt)
+
+        def status(eid: str) -> str:
+            with get_db_connection(db_path) as conn:
+                return conn.execute("SELECT status FROM events WHERE event_id=?", (eid,)).fetchone()[0]
+
+        rc, res = run([{"event_id": "Ev_B1", "status": "IGNORED"}, {"event_id": "Ev_NOPE", "status": "DONE"},
+                       {"event_id": "Ev_B2", "status": "maybe"}, {"event_id": "Ev_B1", "status": "DONE"}])
+        assert rc == 1 and res["committed"] == 0 and len(res["errors"]) == 3, res
+        assert status("Ev_B1") == "PROCESSING", "nothing committed on validation error"
+        rc, res = run({"decisions": [
+            {"event_id": "Ev_B1", "status": "ignored", "error": None},
+            {"event_id": "Ev_B2", "status": "DONE"},
+            {"event_id": "Ev_B3", "status": "FAILED", "error": "pre_post_check_unverifiable"},
+        ]})
+        assert rc == 0 and res["ok"] and res["committed"] == 3, res
+        assert [status(x) for x in ("Ev_B1", "Ev_B2", "Ev_B3", "Ev_B4")] == ["IGNORED", "DONE", "PENDING", "PROCESSING"]
+        with get_db_connection(db_path) as conn:
+            r2 = conn.execute("SELECT error_message FROM events WHERE event_id='Ev_B2'").fetchone()[0]
+            r3 = conn.execute("SELECT retry_count, next_retry_at FROM events WHERE event_id='Ev_B3'").fetchone()
+        assert r2 is None and r3[0] == 0 and r3[1] is not None
+        rc, res = run([])
+        assert rc == 1
+    return "不正・重複・未知のIDが1件でもあれば何もcommitしない・正常時は各件をcommit_eventで確定(DONEでerror消去・unverifiableは待ち状態)・対象外の件は不変を確認"
+
+
+def test_seed_mirror() -> str:
+    """80. seed-mirror (ミラー開始前のスレッドを一度だけ全件読みして親投稿と台帳外の自分の投稿を補完・ページ上限/失敗は未シードのまま・開始前は拒否)"""
+    import context_bundle
+    import listener as listener_mod
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "state"
+        state.mkdir()
+        db_path = state / "slack_events.db"
+        init_db(db_path)
+        _write_mirror_health(state)
+        now = time.time()
+        t_ok = f"{now - 7200:.6f}"
+        t_fail = f"{now - 3600:.6f}"
+        with get_db_connection(db_path) as conn:
+            conn.executemany(
+                "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, is_bot, status) VALUES (?, 'C_S', 'U_N', ?, ?, ?, 1, 'DONE')",
+                [("Ev_S1", "返信A", f"{float(t_ok) + 10:.6f}", t_ok), ("Ev_S2", "返信B", f"{float(t_fail) + 10:.6f}", t_fail)],
+            )
+            conn.commit()
+
+        class SeedClient:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+                self.calls.append(kw)
+                if kw["ts"] == t_fail:
+                    raise SlackApiError("x", {"ok": False, "error": "thread_not_found"})
+                if not kw.get("cursor"):
+                    return {"ok": True, "has_more": True, "response_metadata": {"next_cursor": "p2"}, "messages": [
+                        {"user": "U_OWNER", "text": "親の問いかけ（DB外）", "ts": t_ok, "reply_count": 2},
+                        {"user": "U_N", "bot_id": "B_N", "text": "返信A", "ts": f"{float(t_ok) + 10:.6f}", "thread_ts": t_ok},
+                    ]}
+                return {"ok": True, "has_more": False, "messages": [
+                    {"user": agent_tools.YAMA_BOT_USER_ID, "bot_id": "B_Y", "text": "Yama の報告（台帳外）",
+                     "ts": f"{float(t_ok) + 20:.6f}", "thread_ts": t_ok, "edited": {"ts": "1"}},
+                ]}
+
+        res = agent_tools.seed_mirror(days=1, db_path=db_path, client=SeedClient(), sleep_fn=lambda s: None)
+        assert res["ok"] is False and "not active" in res["error"], res
+        listener_mod.mark_mirror_since(db_path, now=now - 60)
+        dry = agent_tools.seed_mirror(days=1, db_path=db_path, client=SeedClient(), dry_run=True)
+        assert dry["threads"] == 2 and len(dry["thread_keys"]) == 2
+        client = SeedClient()
+        res = agent_tools.seed_mirror(days=1, db_path=db_path, client=client, sleep_fn=lambda s: None)
+        assert res["seeded"] == 1 and res["mirrored_messages"] == 2 and res["edits"] == 1, res
+        assert len(res["failed"]) == 1 and res["ok"] is False
+        assert all("oldest" not in c for c in client.calls)
+        ev = {"event_id": "Ev_NEXT", "channel_id": "C_S", "ts": f"{now:.6f}", "thread_ts": t_ok}
+        ctxs, ann = context_bundle.build_batch_contexts(db_path, [ev], state_dir=state)
+        assert ann["Ev_NEXT"]["context_ok"] is True, ann
+        texts = [m["text"] for m in ctxs[f"C_S:{t_ok}"]["messages"]]
+        assert texts == ["親の問いかけ（DB外）", "返信A", "Yama の報告（台帳外）"], texts
+        ev2 = {"event_id": "Ev_NEXT2", "channel_id": "C_S", "ts": f"{now:.6f}", "thread_ts": t_fail}
+        _, ann = context_bundle.build_batch_contexts(db_path, [ev2], state_dir=state)
+        assert ann["Ev_NEXT2"]["context_ok"] is False
+        with get_db_connection(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2, "seed never creates events"
+    return "ミラー開始前は拒否・dry-runは対象一覧のみ・全ページ読みで親投稿と台帳外の自分の投稿を補完しスレッドをシード済みに(以後context_ok=true)・読み取り失敗のスレッドは未シードのまま・eventsは増えないことを確認"
+
+
+def test_hook_supplementary_jobs_after_dispatch() -> str:
+    """81. フックの補完処理の順序 (backfill/reconcile/auto_joinはdispatcherの後・バッチを起こす周期は飛ばしてすぐwake・連続時もbackfillは最低5分に1回)"""
+    assert HOOK_SCRIPT_PATH.exists(), HOOK_SCRIPT_PATH
+    runtime = Path("/home/hatch/hooks/runtime/hatch_hook_runtime.sh")
+    assert runtime.exists()
+    text = HOOK_SCRIPT_PATH.read_text(encoding="utf-8")
+    i_disp = text.index('output=$("$PROJECT_DIR/dispatcher.sh"')
+    for marker in ('"$PROJECT_DIR/backfill.py"', "reconcile-replies --days 7 >", '"$PROJECT_DIR/auto_join.py"'):
+        assert text.index(marker) > i_disp, f"{marker} must run after the dispatcher"
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = Path(tmp) / "proj"
+        (proj / "state").mkdir(parents=True)
+        (proj / "config").mkdir()
+        (proj / "venv").symlink_to(BASE_DIR / "venv")
+        order = Path(tmp) / "order.log"
+        stub_py = (
+            "import sys, time\n"
+            "open(sys.argv[1], 'a').write(sys.argv[2] + '\\n')\n"
+        )
+        (Path(tmp) / "rec.py").write_text(stub_py, encoding="utf-8")
+        rec = f'"{PYTHON_BIN}" "{tmp}/rec.py" "{order}"'
+        (proj / "backfill.py").write_text(
+            f"import subprocess\nsubprocess.run('{rec} backfill', shell=True)\n", encoding="utf-8")
+        (proj / "auto_join.py").write_text(
+            f"import subprocess\nsubprocess.run('{rec} auto_join', shell=True)\n", encoding="utf-8")
+        (proj / "agent_tools.py").write_text(
+            f"import subprocess, sys\nsubprocess.run('{rec} ' + sys.argv[1], shell=True)\n", encoding="utf-8")
+        (proj / "listener.py").write_text("x = 1\n", encoding="utf-8")
+        (proj / "watchdog.sh").write_text(f"#!/usr/bin/env bash\n{rec} watchdog\n", encoding="utf-8")
+        (proj / "dispatcher.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            f"{rec} dispatcher\n"
+            'code="${STUB_DISPATCH_CODE:-1}"\n'
+            'if [[ "$code" == "0" ]]; then echo \'{"count": 1, "events": [{"event_id": "Ev_H"}]}\' > "$(dirname "$0")/state/payload.json"; echo DISPATCHED:1; else echo NO_EVENTS; fi\n'
+            'exit "$code"\n', encoding="utf-8")
+        for f in ("watchdog.sh", "dispatcher.sh"):
+            (proj / f).chmod(0o755)
+        ops = Path(tmp) / "ops.py"
+        ops.write_text("import json\nprint(json.dumps({'ok': True, 'stale': False, 'human_pending': 0, 'oldest_age_sec': 0}))\n", encoding="utf-8")
+        hook_state = Path(tmp) / "hook_state"
+        hook_state.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("YAMA_", "HATCH_HOOK"))}
+        env.update({
+            "HATCH_HOOK_RUNTIME": str(runtime), "HATCH_HOOK_STATE_DIR": str(hook_state),
+            "HATCH_HOOK_ID": "test-hook", "YAMA_PROJECT_DIR": str(proj),
+            "YAMA_UNIT_SOURCE": str(proj / "no-such.service"), "YAMA_ENV_FILE": str(proj / "config" / ".env"),
+            "YAMA_WATCHDOG_LOG": str(proj / "state" / "watchdog.log"), "YAMA_SYSTEMCTL_BIN": "true",
+            "YAMA_OPS_MONITOR_PY": str(ops), "YAMA_OPS_ALERTS_PATH": str(proj / "state" / "ops_alerts.jsonl"),
+        })
+
+        def cycle(code: int, backfill_age: Optional[int]) -> Tuple[List[str], str]:
+            if order.exists():
+                order.unlink()
+            bf = proj / "state" / "backfill_last_run"
+            if backfill_age is None:
+                if bf.exists():
+                    bf.unlink()
+            else:
+                bf.write_text(str(int(time.time()) - backfill_age), encoding="utf-8")
+            for f in ("reconcile_last_run", "auto_join_last_run"):
+                p = proj / "state" / f
+                if p.exists():
+                    p.unlink()
+            res = subprocess.run(["bash", str(HOOK_SCRIPT_PATH)], env=dict(env, STUB_DISPATCH_CODE=str(code)),
+                                 capture_output=True, text=True, timeout=60)
+            assert res.returncode == 0, res.stderr
+            lines = order.read_text(encoding="utf-8").split() if order.exists() else []
+            return lines, res.stdout
+
+        # Dispatch cycle, backfill ran recently -> straight to wake; nothing supplementary.
+        lines, out = cycle(0, backfill_age=10)
+        assert lines == ["watchdog", "dispatcher"], lines
+        assert '"decision":"wake"' in out and "Ev_H" in out, out
+        # Dispatch cycle, backfill overdue (>= 300s) -> insurance backfill after the dispatcher, then wake.
+        lines, out = cycle(0, backfill_age=301)
+        assert lines == ["watchdog", "dispatcher", "backfill"], lines
+        assert '"decision":"wake"' in out
+        # Idle cycle -> dispatcher first, then backfill, reconcile, auto_join.
+        lines, out = cycle(1, backfill_age=10)
+        assert lines == ["watchdog", "dispatcher", "backfill", "reconcile-replies", "auto_join"], lines
+        assert '"decision":"silent"' in out
+        # Locked cycle (batch in flight) -> same as idle.
+        lines, out = cycle(2, backfill_age=None)
+        assert lines[:3] == ["watchdog", "dispatcher", "backfill"], lines
+        # Dry run never runs the supplementary jobs.
+        if order.exists():
+            order.unlink()
+        res = subprocess.run(["bash", str(HOOK_SCRIPT_PATH)], env=dict(env, HATCH_HOOK_DRY_RUN="1"),
+                             capture_output=True, text=True, timeout=60)
+        assert res.returncode == 0 and "dry-run" in res.stdout and not order.exists(), res.stdout
+    return "補完処理はすべてdispatcherの後・バッチを起こす周期はwatchdog→dispatcher→即wake(補完なし)・backfillが300秒以上空いた時だけ保険で実行してからwake・待機/ロック周期はdispatcher→backfill→reconcile→auto_join・dry-runは補完なしを、実フック＋実ランタイムで確認"
+
+
+def test_commit_terminal_guard() -> str:
+    """82. commit_event の終端ガード（第1段、候補19）: 遷移表の各行（PENDING/PROCESSING は従来どおり・DONE/IGNORED の同一状態は no-op・別状態と FAILED は already_terminal で拒否し行は不変＋運用アラート1行・--force --reason は訂正として許可＋運用アラート）、commit-batch の検証での拒否（1件でも不正なら何もしない・同一状態は no-op で通す）、FAILED→requeue→PENDING→PROCESSING→DONE、cmd_reply の内部 commit が拒否されたときの status 表示、reconcile が判定理由を消さないこと"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "state" / "slack_events.db"
+        init_db(db_path)
+        outbox = db_path.parent / "ops_alerts.jsonl"
+        saved_env = os.environ.pop("YAMA_OPS_ALERTS_PATH", None)
+        try:
+            rows = [
+                # event_id, status, retry_count, error_message
+                ("Ev_G_PEND", "PENDING", 0, None),
+                ("Ev_G_PROC", "PROCESSING", 0, None),
+                ("Ev_G_DONE", "DONE", 0, "情報のない往復（ループ防止）"),
+                ("Ev_G_IGN", "IGNORED", 0, "Neiro宛の相槌"),
+                ("Ev_G_FAIL", "FAILED", 3, "ambiguous_post_outcome"),
+                ("Ev_G_REAPED", "FAILED", 0, "reaped_too_many_times: reaped 3 times"),
+                ("Ev_G_FIX", "IGNORED", 0, "誤判定"),
+            ]
+            with get_db_connection(db_path) as conn:
+                for i, (eid, st, rc_, err) in enumerate(rows):
+                    conn.execute(
+                        "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, retry_count, error_message, "
+                        "created_at, updated_at) VALUES (?, 'C', 'U', 't', ?, ?, ?, ?, '2026-11-23 00:00:00', '2026-11-23 00:00:00')",
+                        (eid, f"1795400000.{i:06d}", st, rc_, err),
+                    )
+                conn.commit()
+
+            def snap(eid: str) -> Tuple[Any, ...]:
+                with get_db_connection(db_path) as conn:
+                    r = conn.execute(
+                        "SELECT status, retry_count, error_message, next_retry_at, first_unverifiable_at, updated_at "
+                        "FROM events WHERE event_id=?",
+                        (eid,),
+                    ).fetchone()
+                    return tuple(r)
+
+            def alerts() -> List[Dict[str, Any]]:
+                if not outbox.exists():
+                    return []
+                return [json.loads(x) for x in outbox.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+            def cli(argv: List[str]) -> Tuple[int, Dict[str, Any]]:
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = agent_tools.main(["--db", str(db_path)] + argv)
+                txt = out.getvalue().strip() or err.getvalue().strip().splitlines()[-1]
+                return rc, json.loads(txt)
+
+            # (1) PENDING / PROCESSING -> anything: unchanged behaviour
+            r = agent_tools.commit_event("Ev_G_PEND", "FAILED", error_message="boom", db_path=db_path)
+            assert r["status"] == "PENDING" and r["retry_count"] == 1 and not r.get("noop"), r
+            r = agent_tools.commit_event("Ev_G_PROC", "DONE", db_path=db_path)
+            assert r["status"] == "DONE" and not r.get("noop"), r
+            assert alerts() == [], "normal transitions write no alert"
+
+            # (2) DONE -> DONE / IGNORED -> IGNORED: no-op success, row untouched
+            before = snap("Ev_G_DONE")
+            r = agent_tools.commit_event("Ev_G_DONE", "DONE", db_path=db_path)
+            assert r["noop"] is True and not r.get("rejected") and r["status"] == "DONE", r
+            assert snap("Ev_G_DONE") == before, "no-op must not touch the row (error_message / updated_at kept)"
+            rc, out = cli(["commit", "--event-id", "Ev_G_IGN", "--status", "IGNORED"])
+            assert rc == 0 and out["ok"] is True and out["noop"] is True, out
+            assert alerts() == [], "no-op writes no alert"
+
+            # (3) DONE / IGNORED -> another status: rejected (already_terminal), row untouched, 1 alert line
+            for eid, req in (("Ev_G_DONE", "FAILED"), ("Ev_G_DONE", "IGNORED"), ("Ev_G_IGN", "DONE")):
+                before = snap(eid)
+                r = agent_tools.commit_event(eid, req, error_message="late", db_path=db_path)
+                assert r["noop"] is True and r["rejected"] == "already_terminal", r
+                assert r["status"] == before[0] and snap(eid) == before, (eid, req)
+            assert [a["kind"] for a in alerts()] == ["commit_rejected"] * 3
+            assert alerts()[0]["event_id"] == "Ev_G_DONE" and alerts()[0]["current_status"] == "DONE"
+            assert alerts()[0]["requested_status"] == "FAILED" and alerts()[0]["source"] == "commit"
+            rc, out = cli(["commit", "--event-id", "Ev_G_DONE", "--status", "FAILED", "--error", "x"])
+            assert rc == 1 and out["ok"] is False and out["error"] == "already_terminal", out
+            assert out["current_status"] == "DONE" and out["requested_status"] == "FAILED" and out["noop"] is True
+            assert len(alerts()) == 4
+
+            # (4) FAILED -> anything: rejected (incl. FAILED -> FAILED and the Reaper cap not bypassed)
+            for eid, req in (("Ev_G_FAIL", "DONE"), ("Ev_G_FAIL", "FAILED"), ("Ev_G_FAIL", "IGNORED"),
+                             ("Ev_G_REAPED", "FAILED")):
+                before = snap(eid)
+                r = agent_tools.commit_event(eid, req, db_path=db_path)
+                assert r.get("rejected") == "already_terminal" and snap(eid) == before, (eid, req, r)
+            assert snap("Ev_G_REAPED")[0] == "FAILED", "reaped_too_many_times must not be unblocked by a FAILED commit"
+            assert len(alerts()) == 8
+
+            # (5) --force --reason: allowed correction, reason kept, alert commit_forced
+            rc, out = cli(["commit", "--event-id", "Ev_G_FIX", "--status", "DONE", "--force"])
+            assert rc == 1 and "reason" in out["error"], out
+            assert snap("Ev_G_FIX")[0] == "IGNORED"
+            try:
+                agent_tools.commit_event("Ev_G_FIX", "DONE", force=True, reason="  ", db_path=db_path)
+                raise AssertionError("blank reason must be refused")
+            except ValueError:
+                pass
+            rc, out = cli(["commit", "--event-id", "Ev_G_FIX", "--status", "DONE", "--force",
+                           "--reason", "情報のない往復（ループ防止）への訂正"])
+            assert rc == 0 and out["ok"] and out["forced"] is True, out
+            ev = out["event"]
+            assert ev["status"] == "DONE" and ev["previous_status"] == "IGNORED"
+            assert ev["error_message"] == "[forced IGNORED->DONE] 情報のない往復（ループ防止）への訂正", ev
+            last = alerts()[-1]
+            assert last["kind"] == "commit_forced" and last["previous_status"] == "IGNORED" and last["new_status"] == "DONE"
+            assert len(alerts()) == 9
+
+            # (6) commit-batch: validation rejects a terminal->other item (nothing committed), same status = no-op
+            with get_db_connection(db_path) as conn:
+                conn.executemany(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, status) VALUES (?, 'C', 'U', 't', ?, ?)",
+                    [("Ev_GB1", "1795400100.1", "PROCESSING"), ("Ev_GB2", "1795400100.2", "PROCESSING"),
+                     ("Ev_GB3", "1795400100.3", "IGNORED")],
+                )
+                conn.commit()
+            f = Path(tmp) / "decisions.json"
+            f.write_text(json.dumps([
+                {"event_id": "Ev_GB1", "status": "IGNORED"},
+                {"event_id": "Ev_G_DONE", "status": "FAILED", "error": "late"},
+                {"event_id": "Ev_GB3", "status": "IGNORED"},
+            ]), encoding="utf-8")
+            rc, out = cli(["commit-batch", "--file", str(f)])
+            assert rc == 1 and out["committed"] == 0 and out["already_terminal"] == ["Ev_G_DONE"], out
+            assert any("already_terminal" in e for e in out["errors"]), out
+            assert snap("Ev_GB1")[0] == "PROCESSING", "nothing committed when one item is already terminal"
+            last = alerts()[-1]
+            assert last["kind"] == "commit_rejected" and last["source"] == "commit-batch-validation"
+            assert last["rejected"] == [{"event_id": "Ev_G_DONE", "current_status": "DONE", "requested_status": "FAILED"}]
+            assert len(alerts()) == 10
+            f.write_text(json.dumps([
+                {"event_id": "Ev_GB1", "status": "IGNORED"},
+                {"event_id": "Ev_GB3", "status": "IGNORED"},
+                {"event_id": "Ev_GB2", "status": "DONE"},
+            ]), encoding="utf-8")
+            rc, out = cli(["commit-batch", "--file", str(f)])
+            assert rc == 0 and out["ok"] and out["committed"] == 2 and out["noop"] == 1, out
+            assert [x.get("noop", False) for x in out["results"]] == [False, True, False]
+            assert [snap(x)[0] for x in ("Ev_GB1", "Ev_GB2", "Ev_GB3")] == ["IGNORED", "DONE", "IGNORED"]
+            # force in commit-batch: needs a reason, then corrects
+            f.write_text(json.dumps([{"event_id": "Ev_GB3", "status": "DONE", "force": True}]), encoding="utf-8")
+            rc, out = cli(["commit-batch", "--file", str(f)])
+            assert rc == 1 and out["committed"] == 0 and snap("Ev_GB3")[0] == "IGNORED", out
+            f.write_text(json.dumps([{"event_id": "Ev_GB3", "status": "DONE", "force": True,
+                                      "reason": "11-23型の訂正"}]), encoding="utf-8")
+            rc, out = cli(["commit-batch", "--file", str(f)])
+            assert rc == 0 and out["results"][0]["forced"] is True and snap("Ev_GB3")[0] == "DONE", out
+            assert alerts()[-1]["kind"] == "commit_forced" and alerts()[-1]["source"] == "commit-batch"
+            # race between validation and write: commit_event re-checks and reports already_terminal
+            real_get = agent_tools.get_event_by_id
+
+            def stale_get(eid: str, db_path: Path = db_path) -> Optional[Dict[str, Any]]:
+                row = real_get(eid, db_path=db_path)
+                if row is not None and eid == "Ev_G_DONE":
+                    row = dict(row, status="PROCESSING")
+                return row
+
+            with patch.object(agent_tools, "get_event_by_id", side_effect=stale_get):
+                res = agent_tools.commit_batch([{"event_id": "Ev_G_DONE", "status": "FAILED"}], db_path=db_path)
+            assert res["ok"] is False and res["results"][0]["error"] == "already_terminal", res
+            assert snap("Ev_G_DONE")[0] == "DONE"
+
+            # (7) FAILED -> requeue -> PENDING -> (dispatcher) PROCESSING -> DONE
+            rq = agent_tools.requeue_event("Ev_G_FAIL", db_path=db_path)
+            assert rq["status"] == "PENDING"
+            with get_db_connection(db_path) as conn:
+                conn.execute("UPDATE events SET status='PROCESSING' WHERE event_id='Ev_G_FAIL'")
+                conn.commit()
+            r = agent_tools.commit_event("Ev_G_FAIL", "DONE", db_path=db_path)
+            assert r["status"] == "DONE" and not r.get("noop") and r["error_message"] is None, r
+
+            # (8) cmd_reply skipped_answered: the internal commit is rejected (settled elsewhere
+            #     meanwhile) -> output status is the real one, not "DONE"
+            channel_id, thread_ts = "C_ALL", "1795400200.000100"
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, retry_count, error_message, "
+                    "first_unverifiable_at) VALUES ('Ev_G_REPLY', ?, 'U_Q', '原因が分かりません', ?, 'PROCESSING', 0, "
+                    "'pre_post_check_unverifiable', '2026-11-23 00:00:00')",
+                    (channel_id, thread_ts),
+                )
+                conn.commit()
+            text_file = Path(tmp) / "reply.txt"
+            text_file.write_text("Yamaからの遅延回答です。\n", encoding="utf-8")
+
+            class SettledMeanwhileClient:
+                def auth_test(self) -> Dict[str, Any]:
+                    return {"ok": True, "user_id": "U_YAMA_BOT"}
+
+                def conversations_replies(self, **kwargs: Any) -> Dict[str, Any]:
+                    with get_db_connection(db_path) as conn:
+                        conn.execute("UPDATE events SET status='IGNORED' WHERE event_id='Ev_G_REPLY'")
+                        conn.commit()
+                    return {"ok": True, "has_more": False, "messages": [
+                        {"user": "U_Q", "text": "原因が分かりません", "ts": thread_ts},
+                        {"user": "U_OTHER", "text": "config/.env の権限設定を確認すると直りますよ。",
+                         "ts": "1795400245.000200", "thread_ts": thread_ts},
+                    ]}
+
+                def chat_postMessage(self, **kwargs: Any) -> Dict[str, Any]:
+                    raise AssertionError("must not post")
+
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with patch.object(agent_tools, "get_web_client", return_value=SettledMeanwhileClient()), \
+                    redirect_stdout(out_buf), redirect_stderr(err_buf):
+                rc = agent_tools.main(["--db", str(db_path), "reply", "--channel", channel_id, "--text-file",
+                                       str(text_file), "--thread-ts", thread_ts, "--event-id", "Ev_G_REPLY"])
+            assert rc == 0, err_buf.getvalue()
+            out = json.loads(out_buf.getvalue())
+            assert out["result"] == "skipped_answered" and out["status"] == "IGNORED", out
+            assert out["commit_rejected"] == "already_terminal"
+            assert alerts()[-1]["kind"] == "commit_rejected" and alerts()[-1]["source"] == "reply_skipped_answered"
+            assert snap("Ev_G_REPLY")[0] == "IGNORED"
+
+            # (9) reconcile: only reply/post-path leftovers on DONE are cleared; judgement reasons stay
+            assert agent_tools.is_reconcile_clearable_error("reply not posted, no replies-table record")
+            assert agent_tools.is_reconcile_clearable_error("pre_post_check_unverifiable")
+            assert agent_tools.is_reconcile_clearable_error("IncompleteRead(64 bytes read)")
+            assert not agent_tools.is_reconcile_clearable_error("情報のない往復（ループ防止）")
+            assert not agent_tools.is_reconcile_clearable_error("既存返信あり（リトライ重複防止）")
+            assert not agent_tools.is_reconcile_clearable_error("[forced IGNORED->DONE] reply は不要と判断")
+            recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+            with get_db_connection(db_path) as conn:
+                conn.execute("DELETE FROM events")
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, error_message, created_at, updated_at) "
+                    "VALUES ('Ev_G_REASON', 'C', 'U', 't', '1795400300.000001', 'DONE', '情報のない往復（ループ防止）', ?, ?)",
+                    (recent, recent),
+                )
+                conn.commit()
+
+            class NoCallClient:
+                def __getattr__(self, name: str) -> Any:
+                    raise AssertionError(f"reconcile must not scan a judgement-reason event ({name})")
+
+            res = agent_tools.reconcile_replies(db_path=db_path, client=NoCallClient(), sleep_fn=lambda s: None)
+            assert res["ok"] is True, res
+            with get_db_connection(db_path) as conn:
+                kept = conn.execute("SELECT error_message FROM events WHERE event_id='Ev_G_REASON'").fetchone()[0]
+            assert kept == "情報のない往復（ループ防止）", kept
+        finally:
+            if saved_env is not None:
+                os.environ["YAMA_OPS_ALERTS_PATH"] = saved_env
+    return ("PENDING/PROCESSING従来どおり・DONE/IGNORED同一状態はno-op(行不変・アラートなし)・別状態とFAILED(→FAILED含む・reaped上限の迂回なし)は"
+            "already_terminalで拒否(行不変・exit 1・アラート1行)・--forceは理由必須で訂正(error_messageに理由・commit_forced)・"
+            "commit-batchは検証で拒否(何もcommitせず・集約アラート)/同一状態はno-op/force対応/検証後の競合も再確認・"
+            "FAILED→requeue→PROCESSING→DONE・cmd_replyの内部commit拒否時は実際のstatus表示・reconcileは判定理由を消さない、を確認")
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -10252,6 +11247,15 @@ def main() -> int:
         ("71. リスナー凍結対策 (pong途絶90秒判定・sd_notify WATCHDOG=1・ユニットWatchdogSec/NotifyAccess)", test_listener_freeze_guards_and_sd_notify),
         ("72. 長文バースト対策: history の文量上限 (コンパクト表示・1投稿3,000字・合計40,000字・これ以前あり明記・--limit 50上限・--raw)", test_history_compact_view_and_text_bounds),
         ("73. 長文バースト対策: dispatcher の重さ予算 (重い回は件数を減らし残りPENDING・FIFO・先頭必取・payload本文4,000字＋event-text)", test_dispatcher_batch_weight_budget_and_payload_text_cap),
+        ("74. 滞留対策: 投稿前チェック不能の待ちの段階化 (2→5→15→30→60分・retry_count非消費・24h終端不変・固定値指定の互換)", test_unverifiable_stepped_wait),
+        ("75. 滞留対策: 通信の締切 (文脈用20秒でローカルへ・再試行/SDK/curlを残り時間で制限・安全用は残り時間から逆算しfail-closed)", test_read_deadlines_context_and_safety),
+        ("76. 滞留対策: ミラーの穴埋め (自分の投稿/編集/削除をevents外に記録・backfillも記録・成否ファイル)", test_listener_mirror_own_posts_and_edits),
+        ("77. 滞留対策: 文脈のローカル同梱 (親＋直近20件・編集/削除・直前のYama発言・欠けはcontext_ok=false)", test_context_bundle_local_thread_context),
+        ("78. 滞留対策: dispatcher の文脈同梱 (内包/ファイル参照・失敗しても配信不変・無効化スイッチ)", test_dispatcher_context_bundle_payload),
+        ("79. 滞留対策: commit-batch (一括commit・全件一括検証)", test_commit_batch),
+        ("80. 滞留対策: seed-mirror (ミラー開始前スレッドの一度きりの補完)", test_seed_mirror),
+        ("81. 滞留対策: フックの補完処理をdispatcherの後へ (バッチ周期は即wake・backfill最低5分に1回)", test_hook_supplementary_jobs_after_dispatch),
+        ("82. commit 終端ガード 第1段 (同一状態no-op・別状態/FAILEDはalready_terminal拒否・--force訂正・commit-batch検証・requeue経由DONE・reply表示・reconcile判定理由保持)", test_commit_terminal_guard),
     ]
 
     print("=" * 72)

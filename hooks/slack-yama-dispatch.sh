@@ -9,7 +9,7 @@
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
-PROJECT_DIR="/home/hatch/workspace/slack-yama"
+PROJECT_DIR="${YAMA_PROJECT_DIR:-/home/hatch/workspace/slack-yama}"
 DB_PATH="$PROJECT_DIR/state/slack_events.db"
 PAYLOAD_PATH="$PROJECT_DIR/state/payload.json"
 PYTHON_BIN="$PROJECT_DIR/venv/bin/python"
@@ -81,56 +81,9 @@ if [[ -f "$UNIT_SOURCE" ]] && ! cmp -s "$UNIT_SOURCE" "$UNIT_DEST"; then
   fi
 fi
 
-# Backfill: recover any posts the listener missed (e.g. while it was down)
-# by diffing Slack history against the local events DB. Best-effort.
-# Its stderr is scanned (not stored) only for ops-alert write failures, which
-# are forwarded by the ops alert block below (OPS_EXTRA_ALERTS).
+# Supplementary jobs (backfill / reconcile / auto_join) run AFTER the dispatcher;
+# see "supplementary jobs" below. Alerts they raise are collected here.
 OPS_EXTRA_ALERTS='[]'
-BACKFILL_ERR="$("$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/backfill.py" 2>&1 >/dev/null || true)"
-if _bf_alert_err="$(printf '%s\n' "$BACKFILL_ERR" | grep -E 'could not write ops alert|truncation alert update failed' | head -n 5)" && [[ -n "$_bf_alert_err" ]]; then
-  OPS_EXTRA_ALERTS="$(jq -c --arg e "$_bf_alert_err" '. + [{"kind": "alert_write_failed", "source": "backfill.py", "stderr": $e}]' <<<"$OPS_EXTRA_ALERTS" 2>/dev/null || echo "$OPS_EXTRA_ALERTS")"
-fi
-
-# Reconcile: periodically (at most once per hour) scan candidate threads for
-# late-landed Yama replies and record them into the replies ledger. Best-effort.
-RECONCILE_LAST_RUN_FILE="$PROJECT_DIR/state/reconcile_last_run"
-now_epoch=$(date +%s)
-last_reconcile=0
-if [[ -f "$RECONCILE_LAST_RUN_FILE" ]]; then
-  raw_last=$(cat "$RECONCILE_LAST_RUN_FILE" 2>/dev/null || echo 0)
-  if [[ "$raw_last" =~ ^[0-9]+$ ]]; then
-    last_reconcile="$raw_last"
-  fi
-fi
-if (( now_epoch - last_reconcile >= 3600 )); then
-  mkdir -p "$PROJECT_DIR/state" 2>/dev/null || true
-  echo "$now_epoch" > "$RECONCILE_LAST_RUN_FILE" 2>/dev/null || true
-  {
-    echo "[$(date -Iseconds)] START reconcile-replies --days 7" >> "$PROJECT_DIR/state/reconcile_history.log"
-    "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" reconcile-replies --days 7 > "$PROJECT_DIR/state/reconcile_last_output.log" 2>&1
-    echo "[$(date -Iseconds)] END reconcile-replies (exit: $?)" >> "$PROJECT_DIR/state/reconcile_history.log"
-  } || true
-fi
-
-# Auto-join: periodically (at most once per 5 minutes) join public channels the
-# owner is a member of (skipping channels Yama was removed from) and seed their
-# recent top-level posts as PENDING. Best-effort; never affects dispatch.
-{
-  AUTO_JOIN_LAST_RUN_FILE="$PROJECT_DIR/state/auto_join_last_run"
-  aj_now_epoch=$(date +%s)
-  last_auto_join=0
-  if [[ -f "$AUTO_JOIN_LAST_RUN_FILE" ]]; then
-    raw_aj_last=$(cat "$AUTO_JOIN_LAST_RUN_FILE" 2>/dev/null || echo 0)
-    if [[ "$raw_aj_last" =~ ^[0-9]+$ ]]; then
-      last_auto_join="$raw_aj_last"
-    fi
-  fi
-  if (( aj_now_epoch - last_auto_join >= 300 )); then
-    mkdir -p "$PROJECT_DIR/state" 2>/dev/null || true
-    echo "$aj_now_epoch" > "$AUTO_JOIN_LAST_RUN_FILE" 2>/dev/null || true
-    "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/auto_join.py" >> "$PROJECT_DIR/state/auto_join.log" 2>&1 || true
-  fi
-} || true
 
 # Keep the listener's proxy credentials fresh: the egress proxy credentials
 # rotate, and the systemd service can only read config/.env. This hook runs
@@ -206,6 +159,86 @@ else
   DISP_OK=0
 fi
 set -e
+
+# --- supplementary jobs: begin ---
+# Stall fix (2026-11-22, proposal 4): backfill / reconcile / auto_join used to run
+# BEFORE the dispatcher on every cycle, so a cycle that dispatched a batch woke the
+# worker only after them (wake cycles: p50 4.4s, p90 30s, max 39s of hook time).
+# They now run after the dispatcher and only on cycles that do not wake for a batch
+# (code != 0: no events, locked = batch in flight, error). Missed posts found by
+# backfill are dispatched on the next 30s cycle (not lost). Insurance: during a
+# continuous burst, backfill still runs at least every BACKFILL_MAX_GAP_SEC (300s)
+# even on a dispatch cycle. Reconcile (hourly) and auto_join (5 min) keep their own
+# intervals and simply wait for the next non-dispatch cycle.
+# Backfill: recover any posts the listener missed (e.g. while it was down)
+# by diffing Slack history against the local events DB. Best-effort.
+# Its stderr is scanned (not stored) only for ops-alert write failures, which
+# are forwarded by the ops alert block below (OPS_EXTRA_ALERTS).
+BACKFILL_LAST_RUN_FILE="$PROJECT_DIR/state/backfill_last_run"
+BACKFILL_MAX_GAP_SEC="${YAMA_BACKFILL_MAX_GAP_SEC:-300}"
+bf_now_epoch=$(date +%s)
+last_backfill=0
+if [[ -f "$BACKFILL_LAST_RUN_FILE" ]]; then
+  raw_bf_last=$(cat "$BACKFILL_LAST_RUN_FILE" 2>/dev/null || echo 0)
+  if [[ "$raw_bf_last" =~ ^[0-9]+$ ]]; then
+    last_backfill="$raw_bf_last"
+  fi
+fi
+run_backfill=0
+if [[ "${code:-1}" != "0" ]] || (( bf_now_epoch - last_backfill >= BACKFILL_MAX_GAP_SEC )); then
+  run_backfill=1
+fi
+if [[ "$run_backfill" == "1" ]]; then
+  echo "$bf_now_epoch" > "$BACKFILL_LAST_RUN_FILE" 2>/dev/null || true
+  BACKFILL_ERR="$("$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/backfill.py" 2>&1 >/dev/null || true)"
+  if _bf_alert_err="$(printf '%s\n' "$BACKFILL_ERR" | grep -E 'could not write ops alert|truncation alert update failed' | head -n 5)" && [[ -n "$_bf_alert_err" ]]; then
+    OPS_EXTRA_ALERTS="$(jq -c --arg e "$_bf_alert_err" '. + [{"kind": "alert_write_failed", "source": "backfill.py", "stderr": $e}]' <<<"${OPS_EXTRA_ALERTS:-[]}" 2>/dev/null || echo "${OPS_EXTRA_ALERTS:-[]}")"
+  fi
+fi
+
+if [[ "${code:-1}" != "0" ]]; then
+  # Reconcile: periodically (at most once per hour) scan candidate threads for
+  # late-landed Yama replies and record them into the replies ledger. Best-effort.
+  RECONCILE_LAST_RUN_FILE="$PROJECT_DIR/state/reconcile_last_run"
+  now_epoch=$(date +%s)
+  last_reconcile=0
+  if [[ -f "$RECONCILE_LAST_RUN_FILE" ]]; then
+    raw_last=$(cat "$RECONCILE_LAST_RUN_FILE" 2>/dev/null || echo 0)
+    if [[ "$raw_last" =~ ^[0-9]+$ ]]; then
+      last_reconcile="$raw_last"
+    fi
+  fi
+  if (( now_epoch - last_reconcile >= 3600 )); then
+    mkdir -p "$PROJECT_DIR/state" 2>/dev/null || true
+    echo "$now_epoch" > "$RECONCILE_LAST_RUN_FILE" 2>/dev/null || true
+    {
+      echo "[$(date -Iseconds)] START reconcile-replies --days 7" >> "$PROJECT_DIR/state/reconcile_history.log"
+      "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" reconcile-replies --days 7 > "$PROJECT_DIR/state/reconcile_last_output.log" 2>&1
+      echo "[$(date -Iseconds)] END reconcile-replies (exit: $?)" >> "$PROJECT_DIR/state/reconcile_history.log"
+    } || true
+  fi
+
+  # Auto-join: periodically (at most once per 5 minutes) join public channels the
+  # owner is a member of (skipping channels Yama was removed from) and seed their
+  # recent top-level posts as PENDING. Best-effort; never affects dispatch.
+  {
+    AUTO_JOIN_LAST_RUN_FILE="$PROJECT_DIR/state/auto_join_last_run"
+    aj_now_epoch=$(date +%s)
+    last_auto_join=0
+    if [[ -f "$AUTO_JOIN_LAST_RUN_FILE" ]]; then
+      raw_aj_last=$(cat "$AUTO_JOIN_LAST_RUN_FILE" 2>/dev/null || echo 0)
+      if [[ "$raw_aj_last" =~ ^[0-9]+$ ]]; then
+        last_auto_join="$raw_aj_last"
+      fi
+    fi
+    if (( aj_now_epoch - last_auto_join >= 300 )); then
+      mkdir -p "$PROJECT_DIR/state" 2>/dev/null || true
+      echo "$aj_now_epoch" > "$AUTO_JOIN_LAST_RUN_FILE" 2>/dev/null || true
+      "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/auto_join.py" >> "$PROJECT_DIR/state/auto_join.log" 2>&1 || true
+    fi
+  } || true
+fi
+# --- supplementary jobs: end ---
 
 # --- syntax-guard escalation: begin (extracted verbatim by tests/run_tests.py test 64) ---
 # Neiro's 10-minute split, mapped onto Yama's receivers: a target that keeps
@@ -420,7 +453,7 @@ if [[ "${code:-1}" != "0" ]]; then
     if _ops_payload="$(jq -n -c \
         --argjson alerts "$_ops_all" \
         '{"ops_alert": true,
-          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗。*_recovered は復旧）。",
+          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正。*_recovered は復旧）。",
           "kinds": ($alerts | map(.kind // "unknown") | unique),
           "alerts": $alerts[0:50],
           "omitted_alerts": ([($alerts | length) - 50, 0] | max)}' 2>/dev/null)" \

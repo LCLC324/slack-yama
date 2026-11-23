@@ -14,6 +14,9 @@
 #   Event text longer than PAYLOAD_TEXT_LIMIT is cut in the payload only (DB
 #   keeps the full text) with text_truncated/text_length and a marker telling
 #   the worker to run `agent_tools.py event-text --event-id <id>`.
+# - Context bundling (2026-11-22): events carry context_key / context_ok /
+#   context_gaps; contexts are inlined (small payloads) or in
+#   state/payload_context.json (payload.context_file). See context_bundle.py.
 # - Exit codes & stdout for hook/caller decision:
 #     0 / "DISPATCHED:<N>" : N events transitioned to PROCESSING and written to state/payload.json
 #     1 / "NO_EVENTS"      : No PENDING events found (do not wake agent)
@@ -29,9 +32,15 @@ LOCK_PATH="${YAMA_LOCK_PATH:-${STATE_DIR}/dispatcher.lock}"
 MODE_FILE="${YAMA_MODE_FILE:-${BASE_DIR}/config/mode.txt}"
 PYTHON_BIN="${YAMA_PYTHON_BIN:-${BASE_DIR}/venv/bin/python}"
 # Threshold (in seconds) to distinguish active vs. abandoned PROCESSING events:
-# 900s (15 minutes) is set sufficiently longer than the hook's script_timeout_secs (600s)
-# so that a slow in-flight agent batch (including API backoff retries) is never preempted
-# or overwritten, while PROCESSING events stranded by a timeout/crash are reaped to PENDING.
+# 900s (15 minutes). Note (2026-11-23): the hook's script_timeout_secs (600s) limits
+# the hook *scripts* (watchdog / dispatcher / backfill), NOT the woken worker (the LLM
+# session); nothing here caps a worker's run time. 900s is simply well above the
+# observed batch durations (p99 300s, max 930s once in 335 batches, 2026-11-21..23),
+# so a slow in-flight batch is normally not preempted, while PROCESSING events
+# stranded by a crash are reaped to PENDING. A worker that outlives 900s can still
+# commit late; commit_event's terminal guard keeps such a late commit from undoing an
+# already settled (DONE/IGNORED/FAILED) event, but it cannot tell two holders of the
+# same PROCESSING row apart (that needs a claim token, stage 2).
 PROCESSING_TIMEOUT_SEC="${YAMA_PROCESSING_TIMEOUT_SEC:-900}"
 # Reaper re-queue cap (candidate 12): an event reaped this many times in total
 # (reap_count, separate from retry_count) is moved to FAILED with
@@ -45,6 +54,14 @@ OPS_ALERTS_PATH="${YAMA_OPS_ALERTS_PATH:-${STATE_DIR}/ops_alerts.jsonl}"
 PAYLOAD_TEXT_LIMIT="${YAMA_PAYLOAD_TEXT_LIMIT:-4000}"
 EVENT_WEIGHT_OVERHEAD="${YAMA_EVENT_WEIGHT_OVERHEAD:-1000}"
 BATCH_WEIGHT_BUDGET="${YAMA_BATCH_WEIGHT_BUDGET:-15000}"
+# Context bundling (stall fix 2026-11-22, proposal 2): after the batch is moved to
+# PROCESSING, context_bundle.py builds each thread's context from the local DB and
+# writes it to state/payload_context.json; it is also inlined into payload.json
+# when the whole payload stays within PAYLOAD_INLINE_MAX_BYTES (largest wake
+# payload observed so far: ~15KB). Best-effort: any failure only marks events
+# context_ok=false (the worker then reads Slack via `history`, as before).
+PAYLOAD_INLINE_MAX_BYTES="${YAMA_PAYLOAD_INLINE_MAX_BYTES:-12000}"
+CONTEXT_BUNDLE_ENABLED="${YAMA_CONTEXT_BUNDLE:-1}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN="python3"
@@ -69,7 +86,7 @@ if [[ ! -f "${DB_PATH}" ]]; then
     exit 1
 fi
 
-"${PYTHON_BIN}" - "${DB_PATH}" "${PAYLOAD_PATH}" "${MODE_FILE}" "${PROCESSING_TIMEOUT_SEC}" "${REAP_LIMIT}" "${OPS_ALERTS_PATH}" "${PAYLOAD_TEXT_LIMIT}" "${EVENT_WEIGHT_OVERHEAD}" "${BATCH_WEIGHT_BUDGET}" <<'PYEOF'
+"${PYTHON_BIN}" - "${DB_PATH}" "${PAYLOAD_PATH}" "${MODE_FILE}" "${PROCESSING_TIMEOUT_SEC}" "${REAP_LIMIT}" "${OPS_ALERTS_PATH}" "${PAYLOAD_TEXT_LIMIT}" "${EVENT_WEIGHT_OVERHEAD}" "${BATCH_WEIGHT_BUDGET}" "${BASE_DIR}" "${PAYLOAD_INLINE_MAX_BYTES}" "${CONTEXT_BUNDLE_ENABLED}" <<'PYEOF'
 import fcntl
 import json
 import os
@@ -78,9 +95,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Default 900s (15 minutes): sufficiently longer than hook script_timeout_secs (600s)
-# to prevent concurrent dispatch / payload.json overwrite while a batch is still running,
-# and to reap abandoned PROCESSING events back to PENDING after timeout/crash.
+# Default 900s (15 minutes): well above observed batch durations (the worker itself
+# has no enforced time limit; script_timeout_secs 600s applies to hook scripts only),
+# to avoid concurrent dispatch / payload.json overwrite while a batch is still running,
+# and to reap abandoned PROCESSING events back to PENDING after a crash.
 DEFAULT_PROCESSING_TIMEOUT_SEC = 900
 
 db_path = Path(sys.argv[1])
@@ -94,6 +112,9 @@ ops_alerts_path = Path(sys.argv[6]) if len(sys.argv) > 6 else db_path.parent / "
 payload_text_limit = int(sys.argv[7]) if len(sys.argv) > 7 else 4000
 event_weight_overhead = int(sys.argv[8]) if len(sys.argv) > 8 else 1000
 batch_weight_budget = int(sys.argv[9]) if len(sys.argv) > 9 else 15000
+base_dir = sys.argv[10] if len(sys.argv) > 10 else ""
+payload_inline_max_bytes = int(sys.argv[11]) if len(sys.argv) > 11 else 12000
+context_bundle_enabled = (sys.argv[12] if len(sys.argv) > 12 else "1") == "1"
 BATCH_MAX_EVENTS = 10
 
 
@@ -342,6 +363,30 @@ try:
             item["text_length"] = len(full_text)
         events_data.append(item)
 
+    # Context bundling (best-effort; never changes what was dispatched).
+    contexts = {}
+    if context_bundle_enabled:
+        annotations = {}
+        context_error = None
+        try:
+            if base_dir and base_dir not in sys.path:
+                sys.path.insert(0, base_dir)
+            import context_bundle
+            contexts, annotations = context_bundle.build_batch_contexts(
+                db_path, events_data, state_dir=db_path.parent
+            )
+        except Exception as ctx_exc:
+            context_error = str(ctx_exc)[:300]
+        for item in events_data:
+            item.update(
+                annotations.get(
+                    item["event_id"],
+                    {"context_ok": False, "context_gaps": ["context_build_error"]},
+                )
+            )
+        if context_error:
+            contexts = {"_error": {"complete": False, "gaps": ["context_build_error"], "error": context_error}}
+
     payload = {
         "dispatched_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
@@ -349,6 +394,27 @@ try:
         "events": events_data,
         "batch_weight": batch_weight,
     }
+    if contexts:
+        context_path = payload_path.with_name("payload_context.json")
+        try:
+            context_doc = {
+                "dispatched_at": payload["dispatched_at"],
+                "event_ids": [e["event_id"] for e in events_data],
+                "contexts": contexts,
+            }
+            ctx_tmp = context_path.with_suffix(".json.tmp")
+            ctx_tmp.write_text(json.dumps(context_doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            ctx_tmp.replace(context_path)
+            inline = dict(payload, contexts=contexts)
+            if len(json.dumps(inline, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= payload_inline_max_bytes:
+                payload = inline
+            else:
+                payload["context_file"] = str(context_path)
+        except Exception as ctx_write_exc:
+            for item in events_data:
+                item["context_ok"] = False
+                item["context_gaps"] = ["context_build_error"]
+            payload["context_error"] = str(ctx_write_exc)[:300]
     if deferred_count > 0:
         payload["deferred"] = {
             "count": deferred_count,

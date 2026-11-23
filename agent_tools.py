@@ -9,7 +9,10 @@ Subcommands for the awakened autonomous agent:
   - reconcile-replies [--days 7] [--dry-run]
   - prune-replies [--days 90] [--dry-run]
   - react --channel X --ts T --emoji eyes
-  - commit --event-id E --status DONE|IGNORED|FAILED [--error MSG]
+  - commit --event-id E --status DONE|IGNORED|FAILED [--error MSG] [--force --reason TEXT]
+      (terminal guard: DONE/IGNORED same status = no-op, other status / FAILED = already_terminal)
+  - commit-batch --file decisions.json   (several commits at once; all-or-nothing validation)
+  - seed-mirror [--days 3] [--dry-run]   (one-off read-only fill of the local thread mirror)
   - requeue --event-id E   (manual re-queue FAILED -> PENDING; resets reap_count only)
   - mode
 """
@@ -49,6 +52,17 @@ DEFAULT_MODE_PATH = BASE_DIR / "config" / "mode.txt"
 VALID_MODES = ("shadow", "mention", "full")
 VALID_COMMIT_STATUSES = ("DONE", "IGNORED", "FAILED")
 MAX_RETRIES = 3
+# Terminal guard (2026-11-23, candidate 19, stage 1). commit_event checks the row's
+# current status inside its BEGIN IMMEDIATE transaction:
+#   PENDING / PROCESSING -> anything : applied as before
+#   DONE / IGNORED -> same status    : no-op success (row untouched, "noop": true)
+#   DONE / IGNORED -> other status   : rejected (already_terminal), row untouched
+#   FAILED -> anything               : rejected (requeue is the way back to PENDING)
+#   terminal -> other + force/reason : applied; reason kept in error_message, ops alert
+# Rejections and forced corrections each append one line to the ops alert outbox.
+TERMINAL_STATUSES = ("DONE", "IGNORED", "FAILED")
+COMMIT_REJECTED_CODE = "already_terminal"
+OPS_ALERTS_FILENAME = "ops_alerts.jsonl"
 
 TRANSIENT_CONNECTION_ERRORS: Tuple[type, ...] = (
     urllib.error.URLError,
@@ -99,9 +113,18 @@ DEFAULT_PRUNE_DAYS: int = 90
 DEFAULT_RECONCILE_DAYS: int = 7
 YAMA_BOT_USER_ID: str = "U_YAMA_BOT"
 UNVERIFIABLE_ERROR_CODE: str = "pre_post_check_unverifiable"
-# Wait 1 hour (3600s) before re-dispatching an event that failed with pre_post_check_unverifiable,
-# so the 30-second dispatcher loop does not immediately re-wake the agent during a Slack API outage.
+# Legacy fixed wait (1 hour). Used only when a fixed wait is explicitly requested
+# (commit_event(retry_wait_seconds=...) or env YAMA_UNVERIFIABLE_RETRY_WAIT_SEC);
+# otherwise the stepped ladder below applies.
 UNVERIFIABLE_RETRY_WAIT_SECONDS: int = 3600
+# Stall fix (2026-11-22, proposal 1): stepped wait before re-dispatching an event
+# that failed with pre_post_check_unverifiable: 2 -> 5 -> 15 -> 30 -> 60 min, then
+# 60 min each time until the 24h terminal. The step is derived from the time elapsed
+# since first_unverifiable_at (no new column): elapsed < 2m -> 2m, < 7m -> 5m,
+# < 22m -> 15m, < 52m -> 30m, else 60m. Every re-dispatch re-runs the full pre-post
+# check (fail-closed unchanged). Override with env YAMA_UNVERIFIABLE_RETRY_LADDER_SEC
+# (comma-separated seconds).
+UNVERIFIABLE_RETRY_LADDER_SECONDS: Tuple[int, ...] = (120, 300, 900, 1800, 3600)
 # Give up and transition to terminal FAILED if history remains unreadable 24 hours (86400s)
 # after the first pre_post_check_unverifiable failure.
 UNVERIFIABLE_EXPIRE_SECONDS: int = 86400
@@ -142,8 +165,126 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
 CURL_READ_CONNECT_TIMEOUT_SECS: int = 5
 CURL_READ_TIMEOUT_SECS: int = 15
 
+# ---------------------------------------------------------------------------
+# Read deadlines (stall fix 2026-11-22, proposal 3).
+# Without a deadline one read could stack up to ~6 minutes: _call_with_retry
+# (5 attempts, 1+2+4+8s backoff) x SDK ConnectionErrorRetryHandler (1 retry) x
+# SDK timeout 30s, plus the curl fallback (15s) per attempt.
+# A deadline is an absolute time.monotonic() value. While one is active
+# (read_deadline() context), every read is bounded by it:
+#   - _call_with_retry stops before an attempt / backoff that cannot finish in time,
+#   - _CurlFallbackWebClient caps the SDK socket timeout and curl --max-time at the
+#     remaining time and skips the SDK's own retry handler (retries are already
+#     done by _call_with_retry),
+# and SlackReadDeadlineExceeded (a TimeoutError, i.e. a transient connection
+# error) is raised. Callers keep their existing failure semantics:
+#   - context reads (history) fall back to the local DB (local_db_fallback),
+#   - safety reads (pre-post check, answered check, post-error recovery) fail
+#     closed exactly as before (pre_post_check_unverifiable / ambiguous_post_outcome).
+# POST calls (chat_postMessage) are never bounded or retried by this mechanism.
+# ---------------------------------------------------------------------------
+CONTEXT_READ_DEADLINE_SECONDS: float = 20.0
+# Safety reads: budget = min(SAFETY_READ_MAX_SECONDS,
+#   time left until the Reaper may reclaim the event (PROCESSING_TIMEOUT_SECONDS
+#   since dispatch, i.e. events.updated_at) - SAFETY_READ_RESERVE_SECONDS).
+# Below SAFETY_READ_MIN_SECONDS a thread reply is refused without reading
+# (pre_post_check_unverifiable; fail-closed, re-checked on the next dispatch).
+SAFETY_READ_MAX_SECONDS: float = 180.0
+SAFETY_READ_RESERVE_SECONDS: float = 60.0
+SAFETY_READ_MIN_SECONDS: float = 5.0
+PROCESSING_TIMEOUT_SECONDS: float = 900.0
 
-def _curl_api_read(token: str, method: str, params: Dict[str, Any]) -> SlackResponse:
+_ACTIVE_READ_DEADLINE: Optional[float] = None
+
+
+class SlackReadDeadlineExceeded(TimeoutError):
+    """A read could not complete before the active read deadline."""
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _deadline_remaining(deadline: Optional[float] = None) -> Optional[float]:
+    """Seconds left before `deadline` (or the active read deadline); None if unbounded."""
+    dl = deadline if deadline is not None else _ACTIVE_READ_DEADLINE
+    if dl is None:
+        return None
+    return dl - time.monotonic()
+
+
+class read_deadline:
+    """Context manager that bounds every Slack read inside it to `seconds` from now
+    (nested deadlines keep the earlier one). seconds=None means no new bound."""
+
+    def __init__(self, seconds: Optional[float]):
+        self.seconds = seconds
+        self._saved: Optional[float] = None
+
+    def __enter__(self) -> "read_deadline":
+        global _ACTIVE_READ_DEADLINE
+        self._saved = _ACTIVE_READ_DEADLINE
+        if self.seconds is not None:
+            new_dl = time.monotonic() + max(0.0, float(self.seconds))
+            if _ACTIVE_READ_DEADLINE is None or new_dl < _ACTIVE_READ_DEADLINE:
+                _ACTIVE_READ_DEADLINE = new_dl
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        global _ACTIVE_READ_DEADLINE
+        _ACTIVE_READ_DEADLINE = self._saved
+
+
+def _parse_db_utc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def safety_read_budget_seconds(
+    event_row: Optional[Dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> float:
+    """Time budget for one safety read, counted back from the time the Reaper may
+    reclaim the event (events.updated_at is set when the dispatcher moves it to
+    PROCESSING). Without an event row (no --event-id) only the cap applies."""
+    cap = _env_float("YAMA_SAFETY_READ_MAX_SEC", SAFETY_READ_MAX_SECONDS)
+    if event_row is None or str(event_row.get("status") or "") != "PROCESSING":
+        return cap
+    dispatched = _parse_db_utc(event_row.get("updated_at"))
+    if dispatched is None:
+        return cap
+    now_dt = now or datetime.now(timezone.utc)
+    timeout = _env_float("YAMA_PROCESSING_TIMEOUT_SEC", PROCESSING_TIMEOUT_SECONDS)
+    reserve = _env_float("YAMA_SAFETY_READ_RESERVE_SEC", SAFETY_READ_RESERVE_SECONDS)
+    left = timeout - (now_dt - dispatched).total_seconds() - reserve
+    return max(0.0, min(cap, left))
+
+
+def _curl_api_read(
+    token: str,
+    method: str,
+    params: Dict[str, Any],
+    max_time: Optional[float] = None,
+) -> SlackResponse:
     """Perform one read-only Slack Web API call via a curl subprocess and return
     the parsed response as a SlackResponse. The curl config (including the
     Authorization header) is passed over stdin (`curl -K -`), never via argv,
@@ -151,6 +292,9 @@ def _curl_api_read(token: str, method: str, params: Dict[str, Any]) -> SlackResp
     any curl-side failure (nonzero exit, unparsable output, or ok=false)."""
     if not token or '"' in token or "\n" in token or "\r" in token:
         raise RuntimeError("curl read aborted: token is not safe to pass via config")
+    total_time = CURL_READ_TIMEOUT_SECS
+    if max_time is not None:
+        total_time = max(1, min(CURL_READ_TIMEOUT_SECS, int(max_time)))
     form: Dict[str, str] = {}
     for key, value in (params or {}).items():
         if value is None:
@@ -167,8 +311,8 @@ def _curl_api_read(token: str, method: str, params: Dict[str, Any]) -> SlackResp
             f'data = "{urllib.parse.urlencode(form)}"',
             "silent",
             "show-error",
-            f"connect-timeout = {CURL_READ_CONNECT_TIMEOUT_SECS}",
-            f"max-time = {CURL_READ_TIMEOUT_SECS}",
+            f"connect-timeout = {min(CURL_READ_CONNECT_TIMEOUT_SECS, total_time)}",
+            f"max-time = {total_time}",
             "",
         ]
     )
@@ -177,7 +321,7 @@ def _curl_api_read(token: str, method: str, params: Dict[str, Any]) -> SlackResp
         input=config,
         capture_output=True,
         text=True,
-        timeout=CURL_READ_TIMEOUT_SECS + 10,
+        timeout=total_time + 10,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"curl read failed for {method}: exit={proc.returncode}")
@@ -211,13 +355,37 @@ class _CurlFallbackWebClient(WebClient):
     def _read_with_curl_fallback(
         self, method: str, super_fn: Callable[..., Any], kwargs: Dict[str, Any]
     ) -> Any:
-        try:
-            return super_fn(**kwargs)
-        except TRANSIENT_CONNECTION_ERRORS as exc:
+        remaining = _deadline_remaining()
+        if remaining is None:
             try:
-                return _curl_api_read(self.token, method, kwargs)
-            except Exception:
-                raise exc
+                return super_fn(**kwargs)
+            except TRANSIENT_CONNECTION_ERRORS as exc:
+                try:
+                    return _curl_api_read(self.token, method, kwargs)
+                except Exception:
+                    raise exc
+        # Deadline-bounded read: cap the SDK socket timeout at the remaining time
+        # and skip the SDK's own connection retry (_call_with_retry retries).
+        if remaining <= 0:
+            raise SlackReadDeadlineExceeded(f"{method}: read deadline reached before the call")
+        saved_timeout = self.timeout
+        saved_handlers = self.retry_handlers
+        try:
+            self.timeout = max(1.0, min(float(saved_timeout or 30), remaining))
+            self.retry_handlers = []
+            try:
+                return super_fn(**kwargs)
+            except TRANSIENT_CONNECTION_ERRORS as exc:
+                left = _deadline_remaining()
+                if left is None or left < 1.0:
+                    raise exc
+                try:
+                    return _curl_api_read(self.token, method, kwargs, max_time=left)
+                except Exception:
+                    raise exc
+        finally:
+            self.timeout = saved_timeout
+            self.retry_handlers = saved_handlers
 
     def conversations_replies(self, **kwargs: Any) -> Any:  # type: ignore[override]
         return self._read_with_curl_fallback(
@@ -263,6 +431,90 @@ def get_processing_events(db_path: Path = DEFAULT_DB_PATH) -> List[Dict[str, Any
         return [dict(r) for r in rows]
 
 
+def _parse_retry_ladder(raw: Optional[str]) -> Tuple[int, ...]:
+    """Parse a comma-separated ladder of positive seconds; invalid -> default ladder."""
+    if raw is None or not str(raw).strip():
+        return UNVERIFIABLE_RETRY_LADDER_SECONDS
+    try:
+        steps = tuple(int(float(p)) for p in str(raw).split(",") if p.strip())
+    except ValueError:
+        return UNVERIFIABLE_RETRY_LADDER_SECONDS
+    if not steps or any(s <= 0 for s in steps):
+        return UNVERIFIABLE_RETRY_LADDER_SECONDS
+    return steps
+
+
+def unverifiable_retry_wait_seconds(
+    elapsed_sec: float, ladder: Optional[Tuple[int, ...]] = None
+) -> int:
+    """Stepped wait for the next re-dispatch of a pre_post_check_unverifiable event.
+    Step i is chosen once elapsed_sec (time since first_unverifiable_at) has reached
+    the sum of steps 0..i-1, so each re-dispatch moves one step up the ladder even
+    when the dispatch itself is delayed by a poll cycle or a long batch."""
+    steps = ladder or UNVERIFIABLE_RETRY_LADDER_SECONDS
+    elapsed = max(0.0, float(elapsed_sec))
+    cumulative = 0
+    for i, step in enumerate(steps):
+        if i == len(steps) - 1:
+            return int(step)
+        cumulative += step
+        if elapsed < cumulative:
+            return int(step)
+    return int(steps[-1])
+
+
+def _ops_alerts_path(db_path: Path) -> Path:
+    """Ops alert outbox (same file the dispatch hook delivers; see ops_monitor.py)."""
+    env_path = os.environ.get("YAMA_OPS_ALERTS_PATH", "").strip()
+    return Path(env_path) if env_path else Path(db_path).parent / OPS_ALERTS_FILENAME
+
+
+def _append_ops_alert(entry: Dict[str, Any], db_path: Path) -> bool:
+    """Append one JSON line to the ops alert outbox under an exclusive flock (same
+    format as ops_monitor.outbox_append). Never raises: a failed write is reported on
+    stderr so the caller's commit result is not affected."""
+    import fcntl
+
+    path = _ops_alerts_path(db_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return True
+    except Exception as exc:
+        print(
+            f"[commit] ALERT_WRITE_FAILED ({entry.get('kind')}): {exc} entry={json.dumps(entry, ensure_ascii=False)[:500]}",
+            file=sys.stderr,
+        )
+        return False
+
+
+def classify_commit_transition(current_status: Any, requested_status: str, force: bool = False) -> str:
+    """Terminal guard decision for commit_event: 'apply' | 'noop' | 'reject' | 'force'.
+    See TERMINAL_STATUSES above for the table."""
+    current = str(current_status or "").upper()
+    requested = str(requested_status or "").upper()
+    if current not in TERMINAL_STATUSES:
+        return "apply"
+    if current in ("DONE", "IGNORED") and requested == current:
+        return "noop"
+    return "force" if force else "reject"
+
+
+def _forced_error_message(
+    previous_status: str, new_status: str, reason: str, error_message: Optional[str]
+) -> str:
+    marker = f"[forced {previous_status}->{new_status}] {reason.strip()}"
+    return f"{error_message} {marker}" if error_message else marker
+
+
 def commit_event(
     event_id: str,
     status: str,
@@ -272,13 +524,29 @@ def commit_event(
     now: Optional[Any] = None,
     retry_wait_seconds: Optional[int] = None,
     expire_seconds: Optional[int] = None,
+    force: bool = False,
+    reason: Optional[str] = None,
+    source: str = "commit",
 ) -> Dict[str, Any]:
     """
+    Terminal guard (checked first, inside the same BEGIN IMMEDIATE transaction):
+      - current PENDING / PROCESSING: the rules below apply unchanged.
+      - current DONE / IGNORED and the same status requested: no-op success; the row is
+        not touched and the returned dict has "noop": True.
+      - current DONE / IGNORED and another status, or current FAILED (any status):
+        rejected without raising; the row is not touched, the returned dict (the current
+        row) has "noop": True and "rejected": "already_terminal", and one line goes to
+        the ops alert outbox. FAILED goes back to PENDING only through requeue.
+      - force=True with a non-empty reason: a rejected transition is applied anyway (for
+        corrections such as IGNORED -> DONE). The reason is kept in error_message
+        ("[forced OLD->NEW] reason") and one line goes to the ops alert outbox.
+
     Commit the final or retry state of an event:
       - DONE / IGNORED: transitions status directly to DONE or IGNORED and clears wait timestamps.
       - FAILED (with pre_post_check_unverifiable): treated as an API wait rather than a post failure.
         Does NOT consume retry_count. Instead, keeps status='PENDING' and sets next_retry_at in the
-        future (default 1 hour) so the existing 30-second dispatcher naturally skips it until the wait
+        future (stepped 2/5/15/30/60 min by time since the first failure) so the existing
+        30-second dispatcher naturally skips it until the wait
         elapses and then re-dispatches it to the agent without needing a separate state-transition daemon.
         If >= 24 hours have elapsed since first_unverifiable_at and history is still unreadable,
         transitions permanently to FAILED (abandoned).
@@ -289,6 +557,8 @@ def commit_event(
     status = status.upper()
     if status not in VALID_COMMIT_STATUSES:
         raise ValueError(f"Invalid status '{status}'. Must be one of {VALID_COMMIT_STATUSES}")
+    if force and not (reason and str(reason).strip()):
+        raise ValueError("force requires a non-empty reason (--reason)")
 
     if now is None:
         now_dt = datetime.now(timezone.utc)
@@ -308,11 +578,14 @@ def commit_event(
     else:
         raise TypeError(f"Unsupported now type: {type(now)}")
 
-    active_wait_sec = (
-        int(retry_wait_seconds)
-        if retry_wait_seconds is not None
-        else int(os.environ.get("YAMA_UNVERIFIABLE_RETRY_WAIT_SEC", UNVERIFIABLE_RETRY_WAIT_SECONDS))
-    )
+    # Fixed wait only when explicitly requested (argument or env); otherwise the
+    # stepped ladder (UNVERIFIABLE_RETRY_LADDER_SECONDS) decides per failure below.
+    fixed_wait_sec: Optional[int] = None
+    if retry_wait_seconds is not None:
+        fixed_wait_sec = int(retry_wait_seconds)
+    elif os.environ.get("YAMA_UNVERIFIABLE_RETRY_WAIT_SEC", "").strip():
+        fixed_wait_sec = int(os.environ["YAMA_UNVERIFIABLE_RETRY_WAIT_SEC"].strip())
+    wait_ladder = _parse_retry_ladder(os.environ.get("YAMA_UNVERIFIABLE_RETRY_LADDER_SEC"))
     active_expire_sec = (
         int(expire_seconds)
         if expire_seconds is not None
@@ -334,6 +607,53 @@ def commit_event(
         if not row:
             conn.rollback()
             raise LookupError(f"Event '{event_id}' not found in database")
+
+        # Terminal guard (stage 1): decide on the row read inside this transaction,
+        # so a check here cannot race with another writer.
+        current_status = str(row["status"] or "").upper()
+        decision = classify_commit_transition(current_status, status, force=force)
+        if decision in ("noop", "reject"):
+            current_row = dict(
+                conn.execute(
+                    """
+                    SELECT event_id, channel_id, user_id, text, ts, thread_ts, is_bot,
+                           status, retry_count, error_message, next_retry_at, first_unverifiable_at,
+                           intended_text, attempt_ts, created_at, updated_at
+                    FROM events
+                    WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+            )
+            conn.rollback()
+            current_row["noop"] = True
+            if decision == "noop":
+                return current_row
+            current_row["rejected"] = COMMIT_REJECTED_CODE
+            current_row["requested_status"] = status
+            print(
+                f"[commit] WARN {COMMIT_REJECTED_CODE}: event {event_id} is {current_status}; "
+                f"{status} commit from {source} ignored (row unchanged)",
+                file=sys.stderr,
+            )
+            _append_ops_alert(
+                {
+                    "kind": "commit_rejected",
+                    "reason": COMMIT_REJECTED_CODE,
+                    "event_id": event_id,
+                    "current_status": current_status,
+                    "requested_status": status,
+                    "requested_error": (error_message or "")[:300] or None,
+                    "source": source,
+                    "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                Path(db_path),
+            )
+            return current_row
+        if decision == "force":
+            error_message = _forced_error_message(
+                current_status, status, str(reason), error_message
+            )
 
         current_retries = int(row["retry_count"] or 0)
 
@@ -369,6 +689,11 @@ def commit_event(
                         final_error = error_message
                 else:
                     final_status = "PENDING"
+                    active_wait_sec = (
+                        fixed_wait_sec
+                        if fixed_wait_sec is not None
+                        else unverifiable_retry_wait_seconds(elapsed_sec, wait_ladder)
+                    )
                     next_retry_dt = now_dt + timedelta(seconds=active_wait_sec)
                     next_retry_str = next_retry_dt.strftime("%Y-%m-%d %H:%M:%S")
                     final_error = error_message
@@ -440,7 +765,29 @@ def commit_event(
             """,
             (event_id,),
         ).fetchone()
-        return dict(updated)
+        result = dict(updated)
+    if decision == "force":
+        result["forced"] = True
+        result["previous_status"] = current_status
+        print(
+            f"[commit] WARN forced: event {event_id} {current_status} -> {result.get('status')} "
+            f"(requested {status}) from {source}: {str(reason).strip()}",
+            file=sys.stderr,
+        )
+        _append_ops_alert(
+            {
+                "kind": "commit_forced",
+                "event_id": event_id,
+                "previous_status": current_status,
+                "requested_status": status,
+                "new_status": result.get("status"),
+                "reason": str(reason).strip()[:300],
+                "source": source,
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            Path(db_path),
+        )
+    return result
 
 
 def get_mode(mode_path: Path = DEFAULT_MODE_PATH) -> str:
@@ -514,16 +861,38 @@ def _call_with_retry(
     max_attempts: int = HISTORY_RETRY_MAX_ATTEMPTS,
     backoffs: Tuple[float, ...] = HISTORY_RETRY_BACKOFFS,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    deadline: Optional[float] = None,
 ) -> Any:
     """Call a read-only Slack API function with retry on transient connection errors
     and transient SlackApiError (HTTP 429 / 5xx, ratelimited, internal_error,
     service_unavailable, request_timeout). Respects Retry-After on 429.
-    Permanent SlackApiError (e.g. channel_not_found) is raised immediately."""
+    Permanent SlackApiError (e.g. channel_not_found) is raised immediately.
+    `deadline` (time.monotonic() value; default: the active read_deadline()) bounds
+    the whole call: no attempt starts and no backoff is slept past it."""
     active_sleep = sleep_fn if sleep_fn is not None else time.sleep
     last_exc: Optional[BaseException] = None
+
+    def _sleep_within_deadline(delay: float) -> None:
+        # With an active read deadline, a backoff that would end at or past the
+        # deadline is not taken: the read gives up now (SlackReadDeadlineExceeded,
+        # a transient error, so each caller's existing fallback / fail-closed applies).
+        remaining = _deadline_remaining(deadline)
+        if remaining is not None and delay >= remaining:
+            raise SlackReadDeadlineExceeded(
+                f"read deadline: {remaining:.1f}s left, next backoff {delay:.1f}s"
+            ) from last_exc
+        active_sleep(delay)
+
     for attempt in range(max_attempts):
+        remaining = _deadline_remaining(deadline)
+        if remaining is not None and remaining <= 0:
+            raise SlackReadDeadlineExceeded(
+                f"read deadline reached after {attempt} attempt(s)"
+            ) from last_exc
         try:
             return func()
+        except SlackReadDeadlineExceeded:
+            raise
         except SlackApiError as exc:
             if not _is_transient_slack_api_error(exc):
                 raise
@@ -534,12 +903,12 @@ def _call_with_retry(
                     delay = retry_after
                 else:
                     delay = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
-                active_sleep(delay)
+                _sleep_within_deadline(delay)
         except TRANSIENT_CONNECTION_ERRORS as exc:
             last_exc = exc
             if attempt + 1 < max_attempts:
                 delay = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
-                active_sleep(delay)
+                _sleep_within_deadline(delay)
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Unreachable retry state")
@@ -646,9 +1015,32 @@ def fetch_history(
     db_path: Path = DEFAULT_DB_PATH,
     client: Optional[Any] = None,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    deadline_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Fetch conversation history from Slack API with up to 5 attempts on connection errors,
-    falling back to local SQLite database if all attempts fail with connection errors."""
+    falling back to local SQLite database if all attempts fail with connection errors.
+    deadline_seconds (context reads; cmd_history passes CONTEXT_READ_DEADLINE_SECONDS)
+    bounds the whole read; when it runs out the result is the local DB fallback with
+    fallback_reason="read_deadline"."""
+    with read_deadline(deadline_seconds):
+        return _fetch_history_unbounded(
+            channel=channel,
+            thread_ts=thread_ts,
+            limit=limit,
+            db_path=db_path,
+            client=client,
+            sleep_fn=sleep_fn,
+        )
+
+
+def _fetch_history_unbounded(
+    channel: str,
+    thread_ts: Optional[str],
+    limit: int,
+    db_path: Path,
+    client: Optional[Any],
+    sleep_fn: Optional[Callable[[float], None]],
+) -> Dict[str, Any]:
     try:
         active_client = client if client is not None else get_web_client()
 
@@ -717,14 +1109,14 @@ def fetch_history(
             "count": len(messages),
             "messages": messages,
         }
-    except TRANSIENT_CONNECTION_ERRORS:
+    except TRANSIENT_CONNECTION_ERRORS as exc:
         messages = get_local_history_fallback(
             channel=channel,
             thread_ts=thread_ts,
             limit=limit,
             db_path=db_path,
         )
-        return {
+        out: Dict[str, Any] = {
             "ok": True,
             "source": "local_db_fallback",
             "channel": channel,
@@ -732,6 +1124,9 @@ def fetch_history(
             "count": len(messages),
             "messages": messages,
         }
+        if isinstance(exc, SlackReadDeadlineExceeded):
+            out["fallback_reason"] = "read_deadline"
+        return out
 
 
 def truncate_text_for_worker(text: Any, limit: int) -> Tuple[str, bool, int]:
@@ -894,6 +1289,9 @@ def cmd_history(args: argparse.Namespace) -> int:
             thread_ts=args.thread_ts,
             limit=limit,
             db_path=Path(args.db),
+            deadline_seconds=_env_float(
+                "YAMA_CONTEXT_READ_DEADLINE_SEC", CONTEXT_READ_DEADLINE_SECONDS
+            ),
         )
         if not getattr(args, "raw", False):
             output = compact_history_result(output)
@@ -1393,6 +1791,29 @@ def _scan_thread_yama_messages(
     return yama_messages
 
 
+# Reconcile clears a DONE event's error_message only when it is a leftover of the
+# reply / post path (reply, ambiguous, unverifiable and the transport errors that end
+# up there). Judgement reasons written at commit time (e.g. "情報のない往復（ループ防止）",
+# "既存返信あり（リトライ重複防止）") and forced-correction notes are kept (2026-11-23).
+RECONCILE_CLEARABLE_ERROR_RE = re.compile(
+    r"reply|ambiguous|unverifiable|incompleteread|max attempts|transient|socket"
+    r"|timeout|timed out|connection|http|slack api|error|exception",
+    re.IGNORECASE,
+)
+FORCED_COMMIT_MARKER_RE = re.compile(r"\[forced [A-Z]+->[A-Z]+\]")
+
+
+def is_reconcile_clearable_error(message: Any) -> bool:
+    """True if a DONE event's error_message is a reply/post-path leftover that
+    reconcile may clear; False for judgement reasons and forced-correction notes."""
+    if message is None:
+        return False
+    text = str(message)
+    if not text.strip() or FORCED_COMMIT_MARKER_RE.search(text):
+        return False
+    return bool(RECONCILE_CLEARABLE_ERROR_RE.search(text))
+
+
 def _clear_event_error_message(
     event_id: str,
     db_path: Path = DEFAULT_DB_PATH,
@@ -1605,8 +2026,11 @@ def reconcile_replies(
     candidates: List[Dict[str, Any]] = [
         dict(r) for r in raw_rows if _is_within_window(r)
     ]
+    # Only reply/post-path leftovers are candidates; judgement reasons stay as written.
     done_error_candidates: List[Dict[str, Any]] = [
-        dict(r) for r in raw_done_error_rows if _is_within_window(r)
+        dict(r)
+        for r in raw_done_error_rows
+        if _is_within_window(r) and is_reconcile_clearable_error(r["error_message"])
     ]
 
     recorded: List[Dict[str, str]] = []
@@ -2292,35 +2716,50 @@ def cmd_reply(args: argparse.Namespace) -> int:
 
     read_client: Optional[Any] = None
     answered_msg: Optional[Dict[str, Any]] = None
+    # Safety-read deadline (stall fix proposal 3): counted back from the time the
+    # Reaper may reclaim this event. Too little time left for a thread reply ->
+    # refuse without reading (fail-closed, same pre_post_check_unverifiable path).
+    # Channel posts keep their fail-open pre-check and get at least the minimum budget.
+    safety_min = _env_float("YAMA_SAFETY_READ_MIN_SEC", SAFETY_READ_MIN_SECONDS)
+    safety_budget = safety_read_budget_seconds(event_row)
+    if not args.thread_ts:
+        safety_budget = max(safety_budget, safety_min)
     try:
+        if safety_budget < safety_min:
+            raise SlackReadDeadlineExceeded(
+                f"safety_read_deadline: only {safety_budget:.0f}s left before the "
+                "Reaper may reclaim this event; refusing to post without the "
+                "pre-post check (fail-closed)"
+            )
         read_client = get_web_client()
-        if args.thread_ts and is_delayed_retry:
-            existing_ts, answered_msg = _pre_post_check_thread_for_reply(
-                channel=args.channel,
-                raw_text=raw_text,
-                post_text=post_text,
-                thread_ts=args.thread_ts,
-                client=read_client,
-                is_delayed_retry=True,
-                questioner_user_id=event_row.get("user_id") if event_row else None,
-                db_path=db_path,
-                max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
-                backoffs=HISTORY_RETRY_BACKOFFS,
-                event_ts=event_ts,
-                event_id=event_id,
-            )
-        else:
-            existing_ts = _find_own_recent_message(
-                channel=args.channel,
-                text=post_text,
-                thread_ts=args.thread_ts,
-                client=read_client,
-                max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
-                backoffs=HISTORY_RETRY_BACKOFFS,
-                raise_on_error=True,
-                event_ts=event_ts,
-                event_id=event_id,
-            )
+        with read_deadline(safety_budget):
+            if args.thread_ts and is_delayed_retry:
+                existing_ts, answered_msg = _pre_post_check_thread_for_reply(
+                    channel=args.channel,
+                    raw_text=raw_text,
+                    post_text=post_text,
+                    thread_ts=args.thread_ts,
+                    client=read_client,
+                    is_delayed_retry=True,
+                    questioner_user_id=event_row.get("user_id") if event_row else None,
+                    db_path=db_path,
+                    max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
+                    backoffs=HISTORY_RETRY_BACKOFFS,
+                    event_ts=event_ts,
+                    event_id=event_id,
+                )
+            else:
+                existing_ts = _find_own_recent_message(
+                    channel=args.channel,
+                    text=post_text,
+                    thread_ts=args.thread_ts,
+                    client=read_client,
+                    max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
+                    backoffs=HISTORY_RETRY_BACKOFFS,
+                    raise_on_error=True,
+                    event_ts=event_ts,
+                    event_id=event_id,
+                )
     except Exception as pre_exc:
         if args.thread_ts:
             pre_err: Dict[str, Any] = {
@@ -2385,16 +2824,32 @@ def cmd_reply(args: argparse.Namespace) -> int:
         answered_ts = str(answered_msg["ts"])
         answered_user = str(answered_msg.get("user") or "")
         final_event_status = "DONE"
+        commit_rejected: Optional[str] = None
         if event_id and event_row is not None:
+            # The terminal guard may reject this commit (the event was already settled
+            # elsewhere). Rejections stay non-fatal here, but the output reports the
+            # event's actual status instead of assuming DONE.
             try:
                 committed = commit_event(
                     event_id=event_id,
                     status="DONE",
                     db_path=db_path,
+                    source="reply_skipped_answered",
                 )
-                final_event_status = str(committed.get("status") or "DONE")
-            except Exception:
-                pass
+                final_event_status = str(committed.get("status") or final_event_status)
+                if committed.get("rejected"):
+                    commit_rejected = str(committed["rejected"])
+            except Exception as commit_exc:
+                print(
+                    f"[reply] WARN skipped_answered commit failed for {event_id}: {commit_exc}",
+                    file=sys.stderr,
+                )
+                try:
+                    current = get_event_by_id(event_id, db_path=db_path)
+                    if current and current.get("status"):
+                        final_event_status = str(current["status"])
+                except Exception:
+                    pass
         output = {
             "ok": True,
             "result": SKIPPED_ANSWERED_RESULT,
@@ -2409,6 +2864,8 @@ def cmd_reply(args: argparse.Namespace) -> int:
             "deduplicated": False,
             "status": final_event_status,
         }
+        if commit_rejected:
+            output["commit_rejected"] = commit_rejected
         if event_id:
             output["event_id"] = event_id
         print(json.dumps(output, ensure_ascii=False, indent=2))
@@ -2474,21 +2931,26 @@ def cmd_reply(args: argparse.Namespace) -> int:
         # before reporting failure, so the caller never blindly retries and double-posts.
         rec_oldest, rec_latest = _compute_recovery_window(attempt_epoch)
         recovery_error: Optional[BaseException] = None
+        # Recovery is a safety read: bounded like the pre-post check (at least the
+        # minimum budget). If it runs out the outcome stays ambiguous_post_outcome
+        # (no resend), exactly as for any other recovery failure.
+        rec_budget = max(safety_read_budget_seconds(event_row), safety_min)
         try:
-            recovered = _find_own_recent_message(
-                args.channel,
-                post_text,
-                args.thread_ts,
-                client=read_client,
-                max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
-                backoffs=HISTORY_RETRY_BACKOFFS,
-                raise_on_error=True,
-                event_ts=event_ts,
-                oldest=rec_oldest,
-                latest=rec_latest,
-                event_id=event_id,
-                request_id=request_id,
-            )
+            with read_deadline(rec_budget):
+                recovered = _find_own_recent_message(
+                    args.channel,
+                    post_text,
+                    args.thread_ts,
+                    client=read_client,
+                    max_attempts=HISTORY_RETRY_MAX_ATTEMPTS,
+                    backoffs=HISTORY_RETRY_BACKOFFS,
+                    raise_on_error=True,
+                    event_ts=event_ts,
+                    oldest=rec_oldest,
+                    latest=rec_latest,
+                    event_id=event_id,
+                    request_id=request_id,
+                )
         except Exception as rec_exc:
             recovered = None
             recovery_error = rec_exc
@@ -2740,7 +3202,7 @@ def _lookup_own_recent_message_once(
                 # Candidate 14 (option A, owner-delegated): a thread scan cut off
                 # at the page cap cannot prove that no earlier own reply exists,
                 # so fail closed like the delayed-resend path. cmd_reply turns
-                # this into pre_post_check_unverifiable (no post; 1h wait, 24h
+                # this into pre_post_check_unverifiable (no post; stepped wait, 24h
                 # terminal); the post-error recovery path reports it as
                 # recovery_error under ambiguous_post_outcome (no resend).
                 raise RuntimeError(
@@ -2905,6 +3367,14 @@ def cmd_react(args: argparse.Namespace) -> int:
         return 1
 
 
+def _rejection_message(event_id: str, current: Any, requested: Any) -> str:
+    return (
+        f"Event '{event_id}' is already {current}; {requested} was not applied "
+        "(settled by another run). Do not retry; mention it in the report. "
+        "Corrections: --force --reason <text>. FAILED -> retry: requeue."
+    )
+
+
 def cmd_commit(args: argparse.Namespace) -> int:
     try:
         updated = commit_event(
@@ -2912,12 +3382,343 @@ def cmd_commit(args: argparse.Namespace) -> int:
             status=args.status,
             error_message=args.error,
             db_path=Path(args.db),
+            force=bool(getattr(args, "force", False)),
+            reason=getattr(args, "reason", None),
+            source="commit",
         )
-        print(json.dumps({"ok": True, "event": updated}, ensure_ascii=False, indent=2))
+        if updated.get("rejected"):
+            out = {
+                "ok": False,
+                "error": updated["rejected"],
+                "noop": True,
+                "event_id": args.event_id,
+                "current_status": updated.get("status"),
+                "requested_status": updated.get("requested_status"),
+                "message": _rejection_message(
+                    args.event_id, updated.get("status"), updated.get("requested_status")
+                ),
+            }
+            print(json.dumps(out, ensure_ascii=False), file=sys.stderr)
+            return 1
+        out_ok: Dict[str, Any] = {"ok": True, "event": updated}
+        if updated.get("noop"):
+            out_ok["noop"] = True
+        if updated.get("forced"):
+            out_ok["forced"] = True
+        print(json.dumps(out_ok, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
+
+
+def _load_batch_decisions(path: Path) -> List[Dict[str, Any]]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("decisions"), list):
+        data = data["decisions"]
+    if not isinstance(data, list) or not data:
+        raise ValueError("decisions file must be a non-empty JSON array (or {\"decisions\": [...]})")
+    return data
+
+
+def commit_batch(
+    decisions: List[Dict[str, Any]],
+    db_path: Path = DEFAULT_DB_PATH,
+) -> Dict[str, Any]:
+    """Commit several decisions in one call (stall fix proposal 5: decide all events
+    first, commit the no-reply ones together, then spend the time on replies).
+    Each item is {"event_id", "status": DONE|IGNORED|FAILED, "error"?, "force"?,
+    "reason"?}. Validation is all-or-nothing: if any item is malformed, duplicated,
+    unknown, or would be rejected by the terminal guard (DONE/IGNORED -> another
+    status, FAILED -> anything, without force+reason), nothing is committed. A
+    same-status item on DONE/IGNORED passes validation and becomes a no-op. Each valid
+    item then goes through commit_event() (same semantics as `commit`, including the
+    unverifiable wait for FAILED); commit_event re-checks the status, so a change
+    between validation and write is still caught."""
+    problems: List[str] = []
+    seen: Set[str] = set()
+    terminal_rejects: List[Dict[str, Any]] = []
+    normalized: List[Tuple[str, str, Optional[str], bool, Optional[str]]] = []
+    for i, item in enumerate(decisions):
+        if not isinstance(item, dict):
+            problems.append(f"item {i}: not an object")
+            continue
+        eid = str(item.get("event_id") or "").strip()
+        status = str(item.get("status") or "").strip().upper()
+        err = item.get("error")
+        force = item.get("force") is True
+        reason = item.get("reason")
+        reason = None if reason is None else str(reason)
+        if not eid:
+            problems.append(f"item {i}: event_id missing")
+            continue
+        if status not in VALID_COMMIT_STATUSES:
+            problems.append(f"item {i} ({eid}): invalid status {item.get('status')!r}")
+            continue
+        if eid in seen:
+            problems.append(f"item {i} ({eid}): duplicated event_id")
+            continue
+        if force and not (reason and reason.strip()):
+            problems.append(f"item {i} ({eid}): force requires a non-empty reason")
+            continue
+        current = get_event_by_id(eid, db_path=db_path)
+        if current is None:
+            problems.append(f"item {i} ({eid}): event not found")
+            continue
+        cur_status = str(current.get("status") or "").upper()
+        if classify_commit_transition(cur_status, status, force=force) == "reject":
+            problems.append(
+                f"item {i} ({eid}): {COMMIT_REJECTED_CODE} (current {cur_status}, requested {status})"
+            )
+            terminal_rejects.append(
+                {"event_id": eid, "current_status": cur_status, "requested_status": status}
+            )
+            continue
+        seen.add(eid)
+        normalized.append((eid, status, None if err is None else str(err), force, reason))
+    if problems:
+        if terminal_rejects:
+            print(
+                f"[commit-batch] WARN {COMMIT_REJECTED_CODE}: {len(terminal_rejects)} item(s) "
+                "already terminal; nothing committed",
+                file=sys.stderr,
+            )
+            _append_ops_alert(
+                {
+                    "kind": "commit_rejected",
+                    "reason": COMMIT_REJECTED_CODE,
+                    "source": "commit-batch-validation",
+                    "batch_size": len(decisions),
+                    "rejected": terminal_rejects[:50],
+                    "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                Path(db_path),
+            )
+        out: Dict[str, Any] = {"ok": False, "committed": 0, "errors": problems}
+        if terminal_rejects:
+            out[COMMIT_REJECTED_CODE] = [r["event_id"] for r in terminal_rejects]
+        return out
+
+    results: List[Dict[str, Any]] = []
+    failures = 0
+    noops = 0
+    for eid, status, err, force, reason in normalized:
+        try:
+            updated = commit_event(
+                event_id=eid,
+                status=status,
+                error_message=err,
+                db_path=db_path,
+                force=force,
+                reason=reason,
+                source="commit-batch",
+            )
+            if updated.get("rejected"):
+                failures += 1
+                results.append(
+                    {
+                        "event_id": eid,
+                        "ok": False,
+                        "error": updated["rejected"],
+                        "noop": True,
+                        "status": updated.get("status"),
+                    }
+                )
+                continue
+            entry: Dict[str, Any] = {"event_id": eid, "ok": True, "status": updated.get("status")}
+            if updated.get("noop"):
+                entry["noop"] = True
+                noops += 1
+            if updated.get("forced"):
+                entry["forced"] = True
+            results.append(entry)
+        except Exception as exc:
+            failures += 1
+            results.append({"event_id": eid, "ok": False, "error": str(exc)})
+    return {
+        "ok": failures == 0,
+        "committed": len(results) - failures - noops,
+        "noop": noops,
+        "failed": failures,
+        "results": results,
+    }
+
+
+def cmd_commit_batch(args: argparse.Namespace) -> int:
+    try:
+        decisions = _load_batch_decisions(Path(args.file))
+        out = commit_batch(decisions, db_path=Path(args.db))
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if out.get("ok") else 1
+
+
+SEED_MIRROR_DEFAULT_DAYS: int = 3
+SEED_MIRROR_THREAD_DEADLINE_SECONDS: float = 60.0
+
+
+def seed_mirror(
+    days: float = SEED_MIRROR_DEFAULT_DAYS,
+    db_path: Path = DEFAULT_DB_PATH,
+    client: Optional[Any] = None,
+    dry_run: bool = False,
+    pause_seconds: float = 1.0,
+    max_threads: int = 100,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """One-off, read-only fill of the local thread mirror for threads that started
+    before own-post mirroring (context bundling marks those incomplete). For each
+    thread with events in the last `days`, read the whole thread
+    (conversations.replies, paged), store the messages that are not in events
+    (thread parents, Yama's own posts, ...) into mirror_messages, the current text
+    of edited messages into message_edits, and mark the thread in mirror_threads.
+    A thread whose read fails or hits the page cap is not marked (stays incomplete).
+    Requires the listener's own-post mirror to be active first (mirror_meta), so no
+    own post can fall between the seed read and the listener."""
+    from listener import (
+        MIRROR_SINCE_KEY,
+        _init_mirror_tables,
+        record_message_edit,
+        record_mirror_message,
+    )
+
+    db_path = Path(db_path)
+    init_db(db_path)
+    active_sleep = sleep_fn if sleep_fn is not None else time.sleep
+    current = now if now is not None else time.time()
+    with get_db_connection(db_path) as conn:
+        _init_mirror_tables(conn)
+        conn.commit()
+        since_row = conn.execute(
+            "SELECT value FROM mirror_meta WHERE key = ?", (MIRROR_SINCE_KEY,)
+        ).fetchone()
+        threads = conn.execute(
+            """
+            SELECT channel_id, COALESCE(thread_ts, ts) AS thread_key,
+                   MAX(CAST(ts AS REAL)) AS last_ts
+            FROM events
+            WHERE CAST(ts AS REAL) > ?
+            GROUP BY channel_id, thread_key
+            ORDER BY last_ts DESC
+            LIMIT ?
+            """,
+            (current - float(days) * 86400.0, int(max_threads)),
+        ).fetchall()
+        threads = [(r["channel_id"], str(r["thread_key"])) for r in threads]
+        event_ts: Dict[str, Set[str]] = {}
+        for ch, _ in threads:
+            if ch not in event_ts:
+                event_ts[ch] = {
+                    str(r["ts"])
+                    for r in conn.execute(
+                        "SELECT ts FROM events WHERE channel_id = ?", (ch,)
+                    ).fetchall()
+                }
+    if since_row is None:
+        return {
+            "ok": False,
+            "error": "own-post mirror is not active yet (restart the listener first)",
+            "threads": len(threads),
+        }
+    summary: Dict[str, Any] = {
+        "ok": True,
+        "dry_run": dry_run,
+        "threads": len(threads),
+        "seeded": 0,
+        "mirrored_messages": 0,
+        "edits": 0,
+        "failed": [],
+        "truncated": [],
+    }
+    if dry_run:
+        summary["thread_keys"] = [f"{c}:{t}" for c, t in threads]
+        return summary
+    active_client = client if client is not None else get_web_client()
+    for idx, (channel, thread_key) in enumerate(threads):
+        if idx and pause_seconds > 0:
+            active_sleep(pause_seconds)
+        messages: List[Dict[str, Any]] = []
+        truncated = False
+        try:
+            with read_deadline(SEED_MIRROR_THREAD_DEADLINE_SECONDS):
+                cursor: Optional[str] = None
+                for page in range(1, THREAD_REPLIES_MAX_PAGES + 1):
+                    kw: Dict[str, Any] = {
+                        "channel": channel,
+                        "ts": thread_key,
+                        "limit": THREAD_REPLIES_PAGE_LIMIT,
+                    }
+                    if cursor:
+                        kw["cursor"] = cursor
+                    resp = _call_with_retry(
+                        lambda kw=kw: active_client.conversations_replies(**kw),
+                        sleep_fn=sleep_fn,
+                    )
+                    messages.extend(m for m in (resp.get("messages") or []) if isinstance(m, dict))
+                    meta = resp.get("response_metadata") or {}
+                    nxt = (meta.get("next_cursor") or "").strip() if isinstance(meta, dict) else ""
+                    if not nxt or resp.get("has_more") is False:
+                        break
+                    if page >= THREAD_REPLIES_MAX_PAGES:
+                        truncated = True
+                        break
+                    cursor = nxt
+        except Exception as exc:
+            summary["failed"].append({"thread": f"{channel}:{thread_key}", "error": str(exc)[:200]})
+            continue
+        if truncated:
+            summary["truncated"].append(f"{channel}:{thread_key}")
+            continue
+        known = event_ts.get(channel, set())
+        for m in messages:
+            ts = str(m.get("ts") or "")
+            if not ts:
+                continue
+            if m.get("edited"):
+                record_message_edit(channel, ts, m.get("text"), db_path=db_path)
+                summary["edits"] += 1
+            if ts in known:
+                continue
+            record_mirror_message(
+                channel,
+                ts,
+                m.get("thread_ts") or thread_key,
+                m.get("user") or m.get("bot_id"),
+                _is_bot_message(m) or m.get("user") == YAMA_BOT_USER_ID,
+                m.get("text"),
+                source="seed",
+                db_path=db_path,
+            )
+            summary["mirrored_messages"] += 1
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO mirror_threads (channel_id, thread_ts, seeded_at, message_count)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(channel_id, thread_ts) DO UPDATE SET
+                    seeded_at = excluded.seeded_at, message_count = excluded.message_count
+                """,
+                (channel, thread_key, time.time(), len(messages)),
+            )
+            conn.commit()
+        summary["seeded"] += 1
+    summary["ok"] = not summary["failed"]
+    return summary
+
+
+def cmd_seed_mirror(args: argparse.Namespace) -> int:
+    out = seed_mirror(
+        days=float(args.days),
+        db_path=Path(args.db),
+        dry_run=bool(args.dry_run),
+        pause_seconds=float(args.pause),
+        max_threads=int(args.max_threads),
+    )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if out.get("ok") else 1
 
 
 def requeue_event(event_id: str, db_path: Path = DEFAULT_DB_PATH) -> Dict[str, Any]:
@@ -3118,7 +3919,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target status: DONE | IGNORED | FAILED",
     )
     p_commit.add_argument("--error", default=None, help="Optional error message when FAILED")
+    p_commit.add_argument(
+        "--force",
+        action="store_true",
+        help="Correct an already terminal event (DONE/IGNORED/FAILED) to another status; requires --reason",
+    )
+    p_commit.add_argument(
+        "--reason", default=None, help="Why the forced correction is made (kept in error_message)"
+    )
     p_commit.set_defaults(func=cmd_commit)
+
+    p_cbatch = subparsers.add_parser(
+        "commit-batch",
+        help="Commit several decisions at once from a JSON file "
+        '([{"event_id": ..., "status": "IGNORED", "error": null}, ...])',
+    )
+    p_cbatch.add_argument("--file", required=True, help="JSON file with the decisions array")
+    p_cbatch.set_defaults(func=cmd_commit_batch)
+
+    p_seed = subparsers.add_parser(
+        "seed-mirror",
+        help="One-off read-only fill of the local thread mirror for recent threads",
+    )
+    p_seed.add_argument("--days", default=SEED_MIRROR_DEFAULT_DAYS, help="Threads with events in the last N days")
+    p_seed.add_argument("--pause", default=1.0, help="Seconds to wait between threads")
+    p_seed.add_argument("--max-threads", default=100, help="Upper bound on threads read")
+    p_seed.add_argument("--dry-run", action="store_true", help="List target threads only")
+    p_seed.set_defaults(func=cmd_seed_mirror)
 
     p_requeue = subparsers.add_parser(
         "requeue", help="Manually re-queue a FAILED event to PENDING (resets reap_count)"
