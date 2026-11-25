@@ -3,8 +3,17 @@
 # NOTE: this file is executed every 30s by the dispatch hook, and bash reads
 # it incrementally. Edit it only via tmp-file + bash -n + mv in this directory.
 # - Checks if state/heartbeat.json has not been updated for >= 120 seconds
-#   (restart threshold; the escalation/warning threshold is restart + 60s = 180s,
-#   recorded in IMPROVEMENTS.md - the warning itself is not implemented here)
+#   (restart threshold). This script has no separate "heartbeat stale" warning;
+#   operator alerts come from elsewhere: ops_monitor.py pending-check (human
+#   PENDING waiting >= 600s, delivered by the dispatch hook) and the hook's
+#   syntax-guard escalation.
+# - Logging (since 2026-11-25): a healthy check writes nothing (it used to add an
+#   [OK] line every 30s, ~2,880 lines/day). Anomalies, recoveries on recheck,
+#   restarts and the boot identity below are still logged.
+# - Boot identity (candidate 33): on every restart attempt and whenever the boot
+#   changes, logs "[INFO] Boot identity (...): boot_id=<sha256(boot_id)[:8]>
+#   booted=<uptime -s>" so the three bots can compare whether they ran on the
+#   same VM boot. Never posted anywhere.
 # - Before restarting, waits RECHECK_SEC and reads the heartbeat once more;
 #   if it recovered, no restart is attempted.
 # - After a successful restart, further restarts for the same unchanged
@@ -46,12 +55,52 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN="python3"
 fi
 
+BOOT_ID_PATH="${YAMA_BOOT_ID_PATH:-/proc/sys/kernel/random/boot_id}"
+UPTIME_SINCE_CMD="${YAMA_UPTIME_SINCE_CMD:-uptime -s}"
+BOOT_STATE_PATH="${YAMA_BOOT_STATE_PATH:-${STATE_DIR}/last_boot_id}"
+
 mkdir -p "${STATE_DIR}"
 
 log_msg() {
     local ts
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     echo "${ts} $*" >> "${LOG_PATH}"
+}
+
+boot_identity() {
+    # "<sha256(boot_id)[:8]> <boot time>"; "unknown" parts when not readable.
+    local bid="unknown" since="unknown"
+    if [[ -r "${BOOT_ID_PATH}" ]] && command -v sha256sum >/dev/null 2>&1; then
+        bid="$(tr -d '[:space:]' < "${BOOT_ID_PATH}" 2>/dev/null | sha256sum | cut -c1-8)"
+        [[ -n "${bid}" ]] || bid="unknown"
+    fi
+    since="$(${UPTIME_SINCE_CMD} 2>/dev/null | head -n 1)"
+    [[ -n "${since}" ]] || since="unknown"
+    echo "${bid} ${since}"
+}
+
+log_boot_identity() {
+    local reason="$1" ident bid since
+    ident="$(boot_identity)"
+    bid="${ident%% *}"
+    since="${ident#* }"
+    log_msg "[INFO] Boot identity (${reason}): boot_id=${bid} booted=${since}"
+    echo "${bid}" > "${BOOT_STATE_PATH}" 2>/dev/null || true
+}
+
+check_boot_change() {
+    # Logs once per boot: the first run of a new boot (or with no record yet).
+    local ident bid last=""
+    ident="$(boot_identity)"
+    bid="${ident%% *}"
+    [[ -f "${BOOT_STATE_PATH}" ]] && last="$(cat "${BOOT_STATE_PATH}" 2>/dev/null)"
+    if [[ "${bid}" != "${last}" ]]; then
+        if [[ -z "${last}" ]]; then
+            log_boot_identity "first record"
+        else
+            log_boot_identity "boot changed from boot_id=${last}"
+        fi
+    fi
 }
 
 reset_reinstall_state() {
@@ -335,6 +384,7 @@ restart_listener() {
         return 1
     fi
     log_msg "[WARN] Heartbeat check failed (${reason}). Attempting: ${RESTART_CMD}"
+    log_boot_identity "listener restart"
     local output
     if output=$(${RESTART_CMD} 2>&1); then
         log_msg "[INFO] Restart succeeded: ${RESTART_CMD} ${output}"
@@ -385,6 +435,8 @@ else:
 PYEOF
 }
 
+check_boot_change
+
 if [[ ! -f "${HEARTBEAT_PATH}" ]]; then
     restart_listener "missing heartbeat file: ${HEARTBEAT_PATH}"
     exit $?
@@ -420,6 +472,6 @@ if [[ "${CHECK_RESULT}" == STALE:* ]]; then
     restart_listener "${CHECK_RESULT}" "${HB_TS}"
     exit $?
 else
-    log_msg "[OK] Heartbeat healthy (${CHECK_RESULT})"
+    # Healthy: nothing is logged (review fix 2026-11-25 [mid-7], candidate 23).
     exit 0
 fi

@@ -3,7 +3,10 @@
 Yama Slack Socket Mode Listener (Layer 1)
 - Connects to Slack via Socket Mode using SLACK_APP_TOKEN and SLACK_BOT_TOKEN from config/.env
 - Immediately ACKs incoming events
-- Filters out self-messages, other bots, edits/deletes, and system events
+- Filters out self-messages, edits/deletes, and system events (self-messages,
+  edits and deletes are mirrored into mirror_messages / message_edits for local
+  thread context; they never become events). Other bots' posts are NOT filtered:
+  bot_message is an allowed subtype and they are saved with is_bot=1.
 - Persists valid user messages to SQLite (state/slack_events.db, WAL mode) with status='PENDING'
 - Updates state/heartbeat.json every 30s and exits(1) if WebSocket is disconnected for >= 60s
 - Exits(1) if no Socket Mode pong has been received for >= 90s even though the SDK
@@ -16,6 +19,19 @@ Yama Slack Socket Mode Listener (Layer 1)
   the hook (which runs watchdog.sh, 120s heartbeat threshold) is not running either,
   systemd restarts the listener. WatchdogSec is set above watchdog.sh's effective
   window so the two do not race on the same stall.
+- Review fix 2026-11-25 (candidate 33, [mid-4]):
+  * First-pong guard: a session that has been "connected" for >= 120s without a
+    single pong is treated as frozen at connect time (the SDK's own stale check
+    only starts after the first pong). To never restart-loop against a server
+    that simply does not echo pings, such exits are capped at 2 in a row
+    (state/first_pong_exits.json, reset by the first pong of any later session).
+  * Event handler stall: if one Socket Mode request handler (ACK + DB save, run on
+    the SDK's worker threads) has been running for >= 300s, the process exits(1)
+    so systemd restarts it (receiver-side pongs keep working in that case, so the
+    pong guard does not see it).
+  * The heartbeat / WATCHDOG=1 cadence is scheduled on time.monotonic(), so a wall
+    clock step cannot stall them. heartbeat.json keeps its wall-clock "timestamp"
+    (watchdog.sh compares it with its own wall clock).
 """
 
 import json
@@ -48,6 +64,13 @@ MAX_DISCONNECT_SEC = 60
 MAX_PONG_SILENCE_SEC = 90
 # sd_notify WATCHDOG=1 cadence (must be well below the unit's WatchdogSec=180).
 WATCHDOG_PING_INTERVAL_SEC = 10
+# First-pong guard (review fix 2026-11-25): connected this long without any pong in
+# the current session => frozen at connect. Capped consecutive exits (no loop).
+MAX_FIRST_PONG_WAIT_SEC = 120
+MAX_FIRST_PONG_EXITS = 2
+DEFAULT_FIRST_PONG_EXITS_PATH = BASE_DIR / "state" / "first_pong_exits.json"
+# One request handler running this long => the event worker is stuck.
+MAX_HANDLER_STALL_SEC = 300
 
 # Subtypes allowed to pass the subtype gate (including bot_message from other bots);
 # edits/deletes/joins/leaves (message_changed, message_deleted, channel_join, etc.) are ignored.
@@ -141,6 +164,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
             );
             """
         )
+        _init_mirror_tables(conn)
         cols = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(events);").fetchall()
@@ -166,6 +190,197 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                 "ALTER TABLE events ADD COLUMN reap_count INTEGER NOT NULL DEFAULT 0;"
             )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Local mirror for context bundling (stall fix 2026-11-22, proposal 2).
+# These tables are NEVER a dispatch source and never feed reply decisions by
+# themselves: they only complete the local copy of threads so the dispatcher can
+# hand the worker the thread context without a Slack read. The events table and
+# its filter (self posts / edits / deletes are not events) are unchanged.
+#   mirror_messages : messages that are in a thread but not in events: Yama's own
+#                     posts (the listener receives them and used to drop them as
+#                     self_bot_message; posts without --event-id were nowhere) and
+#                     thread parents / other posts filled in by `seed-mirror`.
+#   message_edits   : latest edited text / deletion of any message in a mirrored
+#                     channel (message_changed / message_deleted).
+#   mirror_threads  : threads fully read once by `seed-mirror` (seeded_at epoch).
+#   mirror_meta     : own_messages_since = epoch from which the listener records
+#                     own posts. A thread that started earlier and was not seeded
+#                     after that moment may miss own posts locally, so its bundled
+#                     context is marked incomplete (the worker reads Slack).
+# ---------------------------------------------------------------------------
+MIRROR_SINCE_KEY = "own_messages_since"
+
+
+def _init_mirror_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mirror_messages (
+            channel_id TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            thread_ts TEXT,
+            user_id TEXT,
+            is_bot INTEGER NOT NULL DEFAULT 0,
+            text TEXT NOT NULL DEFAULT '',
+            source TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (channel_id, ts)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mirror_thread ON mirror_messages(channel_id, thread_ts);
+        CREATE TABLE IF NOT EXISTS message_edits (
+            channel_id TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            text TEXT,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (channel_id, ts)
+        );
+        CREATE TABLE IF NOT EXISTS mirror_threads (
+            channel_id TEXT NOT NULL,
+            thread_ts TEXT NOT NULL,
+            seeded_at REAL NOT NULL,
+            message_count INTEGER,
+            PRIMARY KEY (channel_id, thread_ts)
+        );
+        CREATE TABLE IF NOT EXISTS mirror_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+
+
+def record_mirror_message(
+    channel_id: str,
+    ts: str,
+    thread_ts: Optional[str],
+    user_id: Optional[str],
+    is_bot: bool,
+    text: Optional[str],
+    source: str = "listener",
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Upsert one non-event message (own post, thread parent, ...) into mirror_messages."""
+    with get_db_connection(db_path) as conn:
+        _init_mirror_tables(conn)
+        conn.execute(
+            """
+            INSERT INTO mirror_messages (channel_id, ts, thread_ts, user_id, is_bot, text, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id, ts) DO UPDATE SET
+                thread_ts = COALESCE(excluded.thread_ts, mirror_messages.thread_ts),
+                user_id = COALESCE(excluded.user_id, mirror_messages.user_id),
+                is_bot = excluded.is_bot,
+                text = excluded.text
+            """,
+            (channel_id, str(ts), thread_ts, user_id, 1 if is_bot else 0, text or "", source),
+        )
+        conn.commit()
+
+
+def record_own_message(
+    channel_id: str,
+    ts: str,
+    thread_ts: Optional[str],
+    text: Optional[str],
+    user_id: Optional[str] = None,
+    source: str = "listener",
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Mirror one of Yama's own posts (is_bot=1)."""
+    record_mirror_message(
+        channel_id, ts, thread_ts, user_id, True, text, source=source, db_path=db_path
+    )
+
+
+def record_message_edit(
+    channel_id: str,
+    ts: str,
+    text: Optional[str],
+    deleted: bool = False,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Record the latest edited text (or deletion) of a message (mirror only)."""
+    with get_db_connection(db_path) as conn:
+        _init_mirror_tables(conn)
+        conn.execute(
+            """
+            INSERT INTO message_edits (channel_id, ts, text, deleted, edited_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(channel_id, ts) DO UPDATE SET
+                text = CASE WHEN excluded.deleted = 1 THEN message_edits.text ELSE excluded.text END,
+                deleted = MAX(message_edits.deleted, excluded.deleted),
+                edited_at = CURRENT_TIMESTAMP
+            """,
+            (channel_id, str(ts), text, 1 if deleted else 0),
+        )
+        conn.commit()
+
+
+def mark_mirror_since(db_path: Path = DEFAULT_DB_PATH, now: Optional[float] = None) -> str:
+    """Set mirror_meta.own_messages_since once (first listener start with mirroring)."""
+    value = f"{(now if now is not None else time.time()):.6f}"
+    with get_db_connection(db_path) as conn:
+        _init_mirror_tables(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO mirror_meta (key, value) VALUES (?, ?)",
+            (MIRROR_SINCE_KEY, value),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT value FROM mirror_meta WHERE key = ?", (MIRROR_SINCE_KEY,)
+        ).fetchone()
+        return str(row["value"]) if row else value
+
+
+def mirror_side_event(
+    event: Dict[str, Any],
+    bot_user_id: Optional[str],
+    db_path: Path = DEFAULT_DB_PATH,
+) -> Optional[str]:
+    """Mirror the messages the events table deliberately skips: Yama's own posts,
+    edits and deletions. Returns what was mirrored ("own_message" / "edit" /
+    "delete") or None. Never raises (mirroring must not affect event intake)."""
+    try:
+        if not isinstance(event, dict) or event.get("type", "message") != "message":
+            return None
+        channel = event.get("channel")
+        if not channel:
+            return None
+        subtype = event.get("subtype")
+        if subtype == "message_changed":
+            msg = event.get("message") or {}
+            ts = msg.get("ts")
+            if not ts:
+                return None
+            if bot_user_id and msg.get("user") == bot_user_id:
+                record_own_message(
+                    channel, ts, msg.get("thread_ts"), msg.get("text"),
+                    user_id=bot_user_id, db_path=db_path,
+                )
+            record_message_edit(channel, ts, msg.get("text"), db_path=db_path)
+            return "edit"
+        if subtype == "message_deleted":
+            ts = event.get("deleted_ts") or (event.get("previous_message") or {}).get("ts")
+            if not ts:
+                return None
+            record_message_edit(channel, ts, None, deleted=True, db_path=db_path)
+            return "delete"
+        if (
+            bot_user_id
+            and event.get("user") == bot_user_id
+            and event.get("ts")
+            and (subtype is None or subtype in ALLOWED_SUBTYPES)
+        ):
+            record_own_message(
+                channel, event["ts"], event.get("thread_ts"), event.get("text"),
+                user_id=bot_user_id, db_path=db_path,
+            )
+            return "own_message"
+    except Exception as exc:
+        logger.warning("mirror_side_event failed (ignored): %s", exc)
+    return None
 
 
 def is_bot_event(event: Dict[str, Any]) -> bool:
@@ -289,6 +504,9 @@ def handle_event_payload(
         event, bot_user_id=bot_user_id, ignored_user_ids=ignored_user_ids
     )
     if ignore:
+        # Not an event, but keep the local thread mirror complete (own posts,
+        # edits, deletions). Best-effort; the return value is unchanged.
+        mirror_side_event(event, bot_user_id=bot_user_id, db_path=db_path)
         return False, reason
 
     inserted = save_event(event, event_id=envelope_event_id, db_path=db_path)
@@ -380,6 +598,87 @@ def should_exit_for_pong_silence(
     return bool(connected) and pong_silence is not None and pong_silence >= max_pong_silence_sec
 
 
+def track_session_without_pong(
+    socket_client: Any,
+    mono_now: float,
+    tracker: Dict[str, Any],
+) -> Optional[float]:
+    """Seconds (monotonic) the CURRENT session has existed without receiving any
+    pong. None when there is no session or the session already got a pong.
+    tracker keeps {"session": <object>, "since": <monotonic>} between calls and is
+    reset whenever the SDK swaps in a new session object."""
+    session = getattr(socket_client, "current_session", None)
+    if session is None:
+        tracker.clear()
+        return None
+    if getattr(session, "last_ping_pong_time", None) is not None:
+        tracker.clear()
+        return None
+    if tracker.get("session") is not session:
+        tracker["session"] = session
+        tracker["since"] = mono_now
+        return 0.0
+    return max(0.0, mono_now - float(tracker.get("since", mono_now)))
+
+
+def should_exit_for_no_first_pong(
+    connected: bool,
+    wait_sec: Optional[float],
+    prior_exits: int,
+    max_wait_sec: float = MAX_FIRST_PONG_WAIT_SEC,
+    max_exits: int = MAX_FIRST_PONG_EXITS,
+) -> bool:
+    """True when the socket reports connected, the session has had no pong for
+    max_wait_sec, and fewer than max_exits such exits happened in a row."""
+    return (
+        bool(connected)
+        and wait_sec is not None
+        and wait_sec >= max_wait_sec
+        and int(prior_exits) < int(max_exits)
+    )
+
+
+def load_first_pong_exits(path: Optional[Path] = None) -> int:
+    path = DEFAULT_FIRST_PONG_EXITS_PATH if path is None else path
+    try:
+        return max(0, int(json.loads(Path(path).read_text(encoding="utf-8")).get("count", 0)))
+    except Exception:
+        return 0
+
+
+def save_first_pong_exits(count: int, path: Optional[Path] = None) -> None:
+    path = Path(DEFAULT_FIRST_PONG_EXITS_PATH if path is None else path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps({"count": int(count), "at": time.time()}) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+class HandlerTracker:
+    """Start times (monotonic) of Socket Mode request handlers in flight."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started: Dict[int, float] = {}
+        self._seq = 0
+
+    def begin(self, mono_now: Optional[float] = None) -> int:
+        with self._lock:
+            self._seq += 1
+            self._started[self._seq] = time.monotonic() if mono_now is None else mono_now
+            return self._seq
+
+    def end(self, token: int) -> None:
+        with self._lock:
+            self._started.pop(token, None)
+
+    def oldest_age(self, mono_now: float) -> Optional[float]:
+        with self._lock:
+            if not self._started:
+                return None
+            return max(0.0, mono_now - min(self._started.values()))
+
+
 def sd_notify(message: str, env: Optional[Dict[str, str]] = None) -> bool:
     """Send one sd_notify datagram (e.g. "WATCHDOG=1") to $NOTIFY_SOCKET.
     Returns False without doing anything when NOTIFY_SOCKET is unset (not run by
@@ -453,7 +752,16 @@ def main() -> None:
         auto_reconnect_enabled=True,
     )
 
+    handler_tracker = HandlerTracker()
+
     def on_socket_mode_request(client: SocketModeClient, req: SocketModeRequest) -> None:
+        token = handler_tracker.begin()
+        try:
+            _handle_socket_mode_request(client, req)
+        finally:
+            handler_tracker.end(token)
+
+    def _handle_socket_mode_request(client: SocketModeClient, req: SocketModeRequest) -> None:
         # 1. Immediately return ACK within 3 seconds
         try:
             client.send_socket_mode_response(
@@ -498,15 +806,25 @@ def main() -> None:
 
     logger.info("Connecting to Slack Socket Mode...")
     socket_client.connect()
+    try:
+        since = mark_mirror_since(DEFAULT_DB_PATH)
+        logger.info("Own-message mirror active since %s", since)
+    except Exception as mirror_exc:
+        logger.warning("Could not mark own-message mirror start: %s", mirror_exc)
 
     disconnected_since: Optional[float] = None
-    last_heartbeat: float = 0.0
-    last_watchdog_ping: float = 0.0
+    # Monotonic schedule for heartbeat / WATCHDOG=1 (None = due now).
+    last_heartbeat: Optional[float] = None
+    last_watchdog_ping: Optional[float] = None
     watchdog_ping_error_logged = False
+    first_pong_tracker: Dict[str, Any] = {}
+    first_pong_exits = load_first_pong_exits()
+    first_pong_cap_logged = False
 
     try:
         while not stop_event.is_set():
             now = time.time()
+            mono = time.monotonic()
             try:
                 connected = bool(socket_client.is_connected())
             except Exception:
@@ -550,17 +868,72 @@ def main() -> None:
                 logging.shutdown()
                 os._exit(1)
 
-            if (now - last_heartbeat) >= HEARTBEAT_INTERVAL_SEC:
+            # First-pong guard (review fix 2026-11-25).
+            if pong_silence is not None and first_pong_exits:
+                first_pong_exits = 0
+                try:
+                    save_first_pong_exits(0)
+                except Exception as fp_exc:
+                    logger.warning("Could not reset first-pong exit counter: %s", fp_exc)
+            try:
+                no_pong_for = track_session_without_pong(socket_client, mono, first_pong_tracker)
+            except Exception:
+                no_pong_for = None
+            if should_exit_for_no_first_pong(connected, no_pong_for, first_pong_exits):
+                try:
+                    save_first_pong_exits(first_pong_exits + 1)
+                except Exception as fp_exc:
+                    logger.warning("Could not save first-pong exit counter: %s", fp_exc)
+                write_heartbeat(
+                    connected=False,
+                    bot_user_id=bot_user_id,
+                    heartbeat_path=DEFAULT_HEARTBEAT_PATH,
+                )
+                logger.error(
+                    "No Socket Mode pong at all for %d seconds since this session connected "
+                    "(frozen at connect; exit %d/%d in a row). Exiting(1) for systemd restart.",
+                    int(no_pong_for), first_pong_exits + 1, MAX_FIRST_PONG_EXITS,
+                )
+                logging.shutdown()
+                os._exit(1)
+            if (
+                no_pong_for is not None
+                and no_pong_for >= MAX_FIRST_PONG_WAIT_SEC
+                and not first_pong_cap_logged
+            ):
+                logger.warning(
+                    "No pong yet after %d seconds, but %d first-pong exits already happened in a "
+                    "row; not exiting again (the server may not echo pings).",
+                    int(no_pong_for), first_pong_exits,
+                )
+                first_pong_cap_logged = True
+
+            stalled = handler_tracker.oldest_age(mono)
+            if stalled is not None and stalled >= MAX_HANDLER_STALL_SEC:
+                write_heartbeat(
+                    connected=False,
+                    bot_user_id=bot_user_id,
+                    heartbeat_path=DEFAULT_HEARTBEAT_PATH,
+                )
+                logger.error(
+                    "A Socket Mode request handler has been running for %d seconds (event worker "
+                    "stuck). Exiting(1) for systemd restart.",
+                    int(stalled),
+                )
+                logging.shutdown()
+                os._exit(1)
+
+            if last_heartbeat is None or (mono - last_heartbeat) >= HEARTBEAT_INTERVAL_SEC:
                 write_heartbeat(
                     connected=connected,
                     bot_user_id=bot_user_id,
                     heartbeat_path=DEFAULT_HEARTBEAT_PATH,
                     last_pong_age_sec=pong_silence,
                 )
-                last_heartbeat = now
+                last_heartbeat = mono
 
-            if (now - last_watchdog_ping) >= WATCHDOG_PING_INTERVAL_SEC:
-                last_watchdog_ping = now
+            if last_watchdog_ping is None or (mono - last_watchdog_ping) >= WATCHDOG_PING_INTERVAL_SEC:
+                last_watchdog_ping = mono
                 try:
                     sd_notify("WATCHDOG=1")
                     watchdog_ping_error_logged = False

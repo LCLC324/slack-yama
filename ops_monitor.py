@@ -16,7 +16,8 @@ Subcommands:
         AND user_id is not in IGNORED_USER_IDS
         AND user_id is not a bot_id placeholder ("B...", set by backfill)
         AND user_id never appeared with is_bot = 1 in events (known bot users)
-        AND next_retry_at is not in the future (deliberate 1h unverifiable wait)
+        AND next_retry_at is not in the future (deliberate unverifiable wait,
+            stepped 2/5/15/30/60 min; agent_tools.UNVERIFIABLE_RETRY_WAIT_LADDER)
       Age is measured from when the event last became dispatchable:
         max(created_at, updated_at, next_retry_at)
       so a FAILED->PENDING retry or a reaped event does not look instantly stale.
@@ -28,6 +29,12 @@ Subcommands:
   outbox-restore [--path PATH]
       Read a JSON array from stdin and append it back to the outbox (used by
       the hook when the alert wake could not be emitted).
+
+  outbox-append --kind KIND [--detail JSON_OBJECT] [--path PATH]
+      Append one alert line {"kind", "at", ...detail} to the outbox under the
+      same flock (review fix 2026-11-25 [mid-5]: lets the shell hooks report
+      dispatcher.sh exit >= 3 and owner_dm_poll.py failures). Exits 2 on a bad
+      --detail or a failed write.
 
 Permanent archive (candidate 26, 2026-11-23):
   outbox-take is the single recording point. Every entry it takes out of the
@@ -421,11 +428,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--heartbeat",
         default=os.environ.get("YAMA_HEARTBEAT_PATH", str(DEFAULT_HEARTBEAT_PATH)),
     )
-    for name in ("outbox-take", "outbox-restore"):
+    for name in ("outbox-take", "outbox-restore", "outbox-append"):
         p = sub.add_parser(name)
         p.add_argument(
             "--path", default=os.environ.get("YAMA_OPS_ALERTS_PATH", str(DEFAULT_OUTBOX_PATH))
         )
+        if name == "outbox-append":
+            p.add_argument("--kind", required=True)
+            p.add_argument("--detail", default="{}")
     args = parser.parse_args(argv)
 
     try:
@@ -457,6 +467,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if ARCHIVED_MARKER not in entry and entry.get("kind") != "archive_write_failed":
                         entry = dict(entry, **{ARCHIVED_MARKER: True})
                     outbox_append(entry, Path(args.path))
+            return 0
+        if args.cmd == "outbox-append":
+            detail = json.loads(args.detail or "{}")
+            if not isinstance(detail, dict):
+                raise ValueError("--detail must be a JSON object")
+            kind = str(args.kind).strip()
+            if not kind:
+                raise ValueError("--kind must not be empty")
+            entry = dict(detail)
+            entry["kind"] = kind
+            entry.setdefault("at", _utc_now_iso())
+            outbox_append(entry, Path(args.path))
             return 0
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))

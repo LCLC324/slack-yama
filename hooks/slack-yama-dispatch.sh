@@ -109,7 +109,9 @@ fi
 # Best-effort listener watchdog: restarts the listener only when its
 # heartbeat has been stale for 120 seconds or more (= watchdog.sh
 # THRESHOLD_SEC=120; it re-checks after RECHECK_SEC=5 before restarting and
-# applies RESTART_COOLDOWN_SEC=60 after a restart). Silent when healthy.
+# applies RESTART_COOLDOWN_SEC=60 after a restart). Silent when healthy: no
+# stdout, and (since 2026-11-25) no watchdog.log line either; watchdog.log only
+# gets anomalies, recoveries, restarts and the boot_id record.
 # Guard: never execute a child script whose syntax is broken (e.g. mid-edit
 # or a bad save). bash reads scripts incrementally, so a torn file could
 # otherwise run half-old/half-new code. Skip this cycle and log it; the
@@ -151,6 +153,7 @@ if bash -n "$PROJECT_DIR/dispatcher.sh" 2>/dev/null; then
         OPS_EXTRA_ALERTS="$(jq -c --arg e "$_disp_alert_err" '. + [{"kind": "alert_write_failed", "source": "dispatcher.sh", "stderr": $e}]' <<<"${OPS_EXTRA_ALERTS:-[]}" 2>/dev/null || echo "${OPS_EXTRA_ALERTS:-[]}")"
       fi
     fi
+    _disp_err_tail="$(tail -c 500 "$_disp_err_file" 2>/dev/null)"
     rm -f "$_disp_err_file"
   fi
 else
@@ -159,6 +162,30 @@ else
   output="NO_EVENTS"
   code=1
   DISP_OK=0
+fi
+
+# Dispatcher failure alert (review fix 2026-11-25 [mid-5]): exit >= 3 used to end
+# as a silent "Dispatcher error" cycle. Write one ops alert line; the ops alert
+# block below (which runs on every code != 0 cycle) delivers it in this cycle.
+# Edge + reminder: first failure, then at most once per 10 minutes while it keeps
+# failing, and one *_recovered line on the first good cycle (stamp file).
+DISP_ERR_STAMP="$PROJECT_DIR/state/dispatcher_error_alerted"
+_disp_now=$(date +%s)
+if [[ "${code:-1}" =~ ^[0-9]+$ ]] && (( code >= 3 )); then
+  _disp_last=0
+  [[ -f "$DISP_ERR_STAMP" ]] && _disp_last="$(cat "$DISP_ERR_STAMP" 2>/dev/null || echo 0)"
+  [[ "$_disp_last" =~ ^[0-9]+$ ]] || _disp_last=0
+  if (( _disp_now - _disp_last >= 600 )); then
+    _disp_detail="$(jq -c -n --argjson c "$code" --arg e "${_disp_err_tail:-}" '{"source": "dispatcher.sh", "exit_code": $c, "stderr_tail": $e}' 2>/dev/null || echo '{}')"
+    if "$PYTHON_BIN" "${YAMA_OPS_MONITOR_PY:-$PROJECT_DIR/ops_monitor.py}" outbox-append --path "${YAMA_OPS_ALERTS_PATH:-$PROJECT_DIR/state/ops_alerts.jsonl}" --kind dispatcher_error --detail "$_disp_detail" >/dev/null 2>&1; then
+      echo "$_disp_now" > "$DISP_ERR_STAMP" 2>/dev/null
+    else
+      echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] dispatcher exit ${code}; ops alert write failed" >> "$WATCHDOG_LOG" 2>/dev/null
+    fi
+  fi
+elif [[ -f "$DISP_ERR_STAMP" ]]; then
+  "$PYTHON_BIN" "${YAMA_OPS_MONITOR_PY:-$PROJECT_DIR/ops_monitor.py}" outbox-append --path "${YAMA_OPS_ALERTS_PATH:-$PROJECT_DIR/state/ops_alerts.jsonl}" --kind dispatcher_error_recovered --detail '{"source": "dispatcher.sh"}' >/dev/null 2>&1 \
+    && rm -f "$DISP_ERR_STAMP"
 fi
 set -e
 
@@ -217,6 +244,10 @@ if [[ "${code:-1}" != "0" ]]; then
       echo "[$(date -Iseconds)] START reconcile-replies --days 7" >> "$PROJECT_DIR/state/reconcile_history.log"
       "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" reconcile-replies --days 7 > "$PROJECT_DIR/state/reconcile_last_output.log" 2>&1
       echo "[$(date -Iseconds)] END reconcile-replies (exit: $?)" >> "$PROJECT_DIR/state/reconcile_history.log"
+      # Housekeeping (review fix 2026-11-25 [mid-7], candidate 23), same hourly slot:
+      # reply-<event_id>.txt of events DONE >= 7 days ago and decisions-*.json older
+      # than 7 days. FAILED / PENDING / PROCESSING drafts are never deleted.
+      echo "[$(date -Iseconds)] prune-state-files: $("$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" prune-state-files --days 7 2>&1 | head -c 500)" >> "$PROJECT_DIR/state/reconcile_history.log"
     } || true
   fi
 
@@ -377,7 +408,8 @@ fi
 # this runs inside the 30s hook.
 #  - Transient noise is removed by elapsed time: ops_monitor.py pending-check
 #    counts only human PENDING events waiting >= YAMA_PENDING_STALE_WARN_SEC
-#    (default 600s); own posts, other bots and deliberate 1h waits are excluded.
+#    (default 600s); own posts, other bots and deliberate unverifiable waits
+#    (stepped 2/5/15/30/60 min, next_retry_at in the future) are excluded.
 #  - Edge notification: one wake when a condition starts, one when it clears
 #    (hook_state "ops_monitor", same idea as "syntax_guard").
 #  - A failure of the monitor itself (pending-check / outbox read) is surfaced
@@ -455,7 +487,7 @@ if [[ "${code:-1}" != "0" ]]; then
     if _ops_payload="$(jq -n -c \
         --argjson alerts "$_ops_all" \
         '{"ops_alert": true,
-          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正／reply_rejected=reply の event-id ガードで投稿を拒否（--event-id と --no-event-id のどちらも無い・両方ある・events に無い --event-id 等、何も投稿していない）／reply_forced=events に無い --event-id を --force --reason で投稿／archive_write_failed=永続ログ（ops_alerts_archive.jsonl）への記録失敗、配送は継続／failed_with_landed_reply=返信の着地が台帳にあるのに FAILED のイベントを reconcile が検知（状態は変えていない。requeue しないこと）／requeue_blocked=台帳に返信の着地があるため requeue を拒否（行は不変）／requeue_forced=台帳に着地があるイベントを --force --reason で requeue（台帳は残るので reply は重複排除される）。*_recovered は復旧）。",
+          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正／reply_rejected=reply の event-id ガードで投稿を拒否（--event-id と --no-event-id のどちらも無い・両方ある・events に無い --event-id 等、何も投稿していない）／reply_forced=events に無い --event-id を --force --reason で投稿／archive_write_failed=永続ログ（ops_alerts_archive.jsonl）への記録失敗、配送は継続／failed_with_landed_reply=返信の着地が台帳にあるのに FAILED のイベントを reconcile が検知（状態は変えていない。requeue しないこと）／requeue_blocked=台帳に返信の着地があるため requeue を拒否（行は不変）／requeue_forced=台帳に着地があるイベントを --force --reason で requeue（台帳は残るので reply は重複排除される）／dispatcher_error=dispatcher.sh が exit 3 以上で失敗（その周期の配信なし。続く間は10分ごとに再通知）／auto_join_state_error=auto_join の状態ファイルが本体・.bak とも読めず自動参加を停止中／owner_dm_poll_failed=DM 代行の poll が失敗（その周期の DM 確認なし）。*_recovered は復旧）。",
           "kinds": ($alerts | map(.kind // "unknown") | unique),
           "alerts": $alerts[0:50],
           "omitted_alerts": ([($alerts | length) - 50, 0] | max)}' 2>/dev/null)" \

@@ -482,7 +482,8 @@ def test_watchdog_and_mode() -> str:
         )
         assert res_ok.returncode == 0
         log_text = log_path.read_text(encoding="utf-8")
-        assert "[OK] Heartbeat healthy" in log_text
+        # review fix 2026-11-25: a healthy check no longer writes an [OK] line
+        assert "[OK] Heartbeat healthy" not in log_text and "Attempting" not in log_text, log_text
 
         # 2) Stale heartbeat (4 minutes old >= 180s) -> triggers restart and logs
         stale_data = {
@@ -878,8 +879,11 @@ def test_backfill() -> str:
                     }
                 raise AssertionError(f"Unexpected channel: {channel}")
 
-            def conversations_replies(self, channel: str, ts: str, limit: int = 30) -> Dict[str, Any]:
+            def conversations_replies(self, channel: str, ts: str, limit: int = 30,
+                                      oldest: Optional[str] = None, cursor: Optional[str] = None) -> Dict[str, Any]:
+                # review fix 2026-11-25 [mid-6]: backfill always passes oldest (no TypeError fallback)
                 assert channel == ch_welcome and ts == "1700099100.000100" and limit == 30
+                assert oldest is not None and cursor is None
                 return {
                     "ok": True,
                     "messages": [
@@ -5372,7 +5376,7 @@ def test_delayed_retry_skipped_answered() -> str:
 
 
 def test_delayed_retry_not_answered_conservative_cases() -> str:
-    """35. 答え済みにならない保守判定ケース: ボットの投稿のみ／短文（10文字以下）のみ／質問者本人の追記のみ／Yama自身の投稿のみの場合は答え済みと判定せず印を付けて通常送信する"""
+    """35. 答え済みにならないケース（2026-11-25 にフック定義へ統一）: subtype=bot_message 等のみ／空白だけの本文のみ／質問者本人（Bot の質問者を含む）の追記のみ／Yama自身の投稿のみの場合は答え済みと判定せず印を付けて通常送信する"""
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "slack_events.db"
         init_db(db_path)
@@ -5388,53 +5392,66 @@ def test_delayed_retry_not_answered_conservative_cases() -> str:
         text_file = Path(tmp) / "reply_conservative.txt"
         text_file.write_text(reply_body + "\n", encoding="utf-8")
 
+        # Review fix 2026-11-25 [mid-1]: bot posts and short posts now DO count as
+        # answers (hook definition). What stays "not answered": subtype=bot_message
+        # (subtype rule unchanged), whitespace-only bodies, the questioner (even a bot
+        # questioner) and Yama itself.
         cases = [
             (
-                "bot_only",
+                "bot_message_subtype_only",
                 "Ev_DELAYED_BOT_ONLY",
                 "1795300100.000100",
                 [
                     {"user": questioner_uid, "text": "親の質問投稿です", "ts": "1795300100.000100"},
                     {
-                        "user": "U_NEIRO_BOT",
-                        "bot_id": "B_NEIRO",
-                        "text": "これはボットによる10文字を超える長い自動応答メッセージです。",
-                        "ts": "1795300110.000200",
-                        "thread_ts": "1795300100.000100",
-                    },
-                    {
                         "user": "U_SUBTYPE_BOT",
                         "subtype": "bot_message",
-                        "text": "こちらもsubtype=bot_messageによる10文字超の投稿です。",
+                        "text": "subtype=bot_messageの投稿はsubtype条件で対象外のまま",
                         "ts": "1795300120.000300",
                         "thread_ts": "1795300100.000100",
                     },
                     {
-                        "user": "U_IS_BOT_FLAG",
-                        "is_bot": 1,
-                        "text": "こちらもis_bot=1フラグ付きの10文字を超える投稿です。",
-                        "ts": "1795300130.000400",
+                        "user": "U_JOINER",
+                        "subtype": "channel_join",
+                        "text": "参加しました",
+                        "ts": "1795300125.000300",
                         "thread_ts": "1795300100.000100",
                     },
                 ],
             ),
             (
-                "short_text_only",
+                "whitespace_only",
                 "Ev_DELAYED_SHORT_ONLY",
                 "1795300200.000100",
                 [
                     {"user": questioner_uid, "text": "親の質問投稿です", "ts": "1795300200.000100"},
                     {
                         "user": other_human_uid,
-                        "text": "  1234567890  ",  # stripped length == 10 (<= 10)
+                        "text": "   \n\t  ",  # stripped length == 0
                         "ts": "1795300210.000200",
                         "thread_ts": "1795300200.000100",
                     },
                     {
                         "user": other_human_uid,
-                        "text": "たしかに！",  # stripped length == 5 (<= 10)
+                        "text": "",
                         "ts": "1795300220.000300",
                         "thread_ts": "1795300200.000100",
+                    },
+                ],
+            ),
+            (
+                "bot_questioner_followup_only",
+                "Ev_DELAYED_BOTQ_ONLY",
+                "1795300500.000100",
+                [
+                    {"user": "U_ASKING_BOT", "bot_id": "B_ASKING", "text": "Botからの質問です",
+                     "ts": "1795300500.000100"},
+                    {
+                        "user": "U_ASKING_BOT",
+                        "bot_id": "B_ASKING",
+                        "text": "質問したBot自身の追記（質問者なので答えではない）",
+                        "ts": "1795300510.000200",
+                        "thread_ts": "1795300500.000100",
                     },
                 ],
             ),
@@ -5548,7 +5565,7 @@ def test_delayed_retry_not_answered_conservative_cases() -> str:
             assert out["delayed_retry"] is True
             assert out["retry_mark_added"] is True
 
-        return "ボット投稿のみ(bot_id/bot_message/is_bot)・短文(空白除去後10文字以下)のみ・質問者本人の追記のみ・Yama自身の投稿のみの全4ケースで誤沈黙せず印付き送信されることを確認"
+        return "subtype=bot_message/channel_joinのみ・空白だけの本文のみ・Botの質問者自身の追記のみ・質問者本人の追記のみ・Yama自身の投稿のみの全5ケースで誤沈黙せず印付き送信されることを確認"
 
 
 def test_delayed_retry_history_failure_unverifiable() -> str:
@@ -8025,7 +8042,9 @@ def test_delayed_retry_answered_check_single_page_cap() -> str:
 
     parent_msg = {"user": questioner_uid, "text": "エラーの原因が分かりません", "ts": thread_ts}
     answer_msg = {"user": answerer_uid, "text": answer_text, "ts": answer_ts, "thread_ts": thread_ts}
-    filler_msg = {"user": answerer_uid, "text": "あ", "ts": filler_ts, "thread_ts": thread_ts}
+    # Review fix 2026-11-25 [mid-1]: any non-empty post by someone else now counts as
+    # an answer, so the non-answer filler is the questioner's own follow-up.
+    filler_msg = {"user": questioner_uid, "text": "あ", "ts": filler_ts, "thread_ts": thread_ts}
 
     # (A) Answer inside the single page, more replies remain -> skipped_answered, exactly one read with limit=100
     rc_a, out_a, err_a, calls_a, posts_a = run_case([parent_msg, answer_msg], True, "cursor-2")
@@ -9293,8 +9312,9 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
                 })
             )
             s1 = owner_dm_poll.send(uid, "返信1")
-            assert s1 == {"ok": True, "ts": "1795000002.100000"}, s1
-            assert read_st()["convs"][uid]["auto_streak"] == 0, "send must not increment auto_streak"
+            assert s1 == {"ok": True, "ts": "1795000002.100000", "auto_streak": 1}, s1
+            # review fix 2026-11-25: send itself counts the reply; resolve does not count it again
+            assert read_st()["convs"][uid]["auto_streak"] == 1, "send must count the proxy reply"
             assert "1795000002.100000" in read_st()["convs"][uid]["proxy_ts"]
 
             r1 = call_resolve(item1, "replied")
@@ -9319,7 +9339,7 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
                 })
             )
             s2 = owner_dm_poll.send(uid, "返信2", thread_ts="1795000003.100000")
-            assert s2 == {"ok": True, "ts": "1795000004.200000"}, s2
+            assert s2 == {"ok": True, "ts": "1795000004.200000", "auto_streak": 2}, s2
             assert send_calls[-1] == (uid, "返信2", "1795000003.100000")
             r2 = call_resolve(item2, "replied")
             assert r2["ok"] is True and r2["auto_streak"] == 2
@@ -9333,13 +9353,7 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
             assert read_st()["convs"][uid]["auto_streak"] == 2
             item3 = p3["pending"][0]["id"]
 
-            # ts_not_found check (while streak < 3)
-            send_responses.append(
-                json.dumps({"result": {"content": [{"type": "text", "text": "sent without ts"}]}})
-            )
-            s_missing = owner_dm_poll.send(uid, "ts欠落テスト")
-            assert s_missing["ok"] is False and s_missing["error"] == "ts_not_found", s_missing
-            assert s_missing.get("message"), "ts_not_found should include explanation message"
+            # (ts_not_found is covered by test 88: it now counts toward the streak)
 
             # Round 3 -> streak reaches 3
             send_responses.append(
@@ -9350,7 +9364,7 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
                 })
             )
             s3 = owner_dm_poll.send(uid, "返信3")
-            assert s3 == {"ok": True, "ts": "1795000006.300000"}, s3
+            assert s3 == {"ok": True, "ts": "1795000006.300000", "auto_streak": 3}, s3
             r3 = call_resolve(item3, "replied")
             assert r3["ok"] is True and r3["auto_streak"] == 3
 
@@ -9415,12 +9429,12 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
                 })
             )
             s_zero = owner_dm_poll.send(uid, "末尾ゼロ保持確認")
-            assert s_zero == {"ok": True, "ts": "1795000100.100000"}
+            assert s_zero == {"ok": True, "ts": "1795000100.100000", "auto_streak": 2}, s_zero
             assert "1795000100.100000" in read_st()["convs"][uid]["proxy_ts"]
             # Exact string match -> does NOT reset streak
             dm_feeds[uid] = [{"author": owner, "ts": "1795000100.100000", "thread_latest": None}]
             owner_dm_poll.poll()
-            assert read_st()["convs"][uid]["auto_streak"] == 1
+            assert read_st()["convs"][uid]["auto_streak"] == 2
             # Numerically equal string without trailing zeros -> must NOT match, so resets streak!
             st_mod = read_st()
             st_mod["convs"][uid]["top_ts"] = "1795000099.000000"
@@ -9438,6 +9452,9 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
             state_path.write_text(json.dumps(st_cap), encoding="utf-8")
             for i in range(55):
                 ts_val = f"1795001{i:03d}.100000"
+                st_i = read_st()
+                st_i["convs"][uid]["auto_streak"] = 0  # keep under the cap; this checks the 50-entry cap only
+                state_path.write_text(json.dumps(st_i), encoding="utf-8")
                 send_responses.append(
                     json.dumps({
                         "result": {
@@ -9446,7 +9463,7 @@ def test_owner_dm_poll_proxy_ts_and_auto_streak() -> str:
                     })
                 )
                 res_i = owner_dm_poll.send(uid, f"msg-{i}")
-                assert res_i == {"ok": True, "ts": ts_val}
+                assert res_i == {"ok": True, "ts": ts_val, "auto_streak": 1}, res_i
             final_proxy_ts = read_st()["convs"][uid]["proxy_ts"]
             assert len(final_proxy_ts) == 50, f"expected 50 proxy_ts entries, got {len(final_proxy_ts)}"
             assert final_proxy_ts[0] == "1795001005.100000"
@@ -10972,7 +10989,9 @@ def test_hook_supplementary_jobs_after_dispatch() -> str:
         assert '"decision":"wake"' in out
         # Idle cycle -> dispatcher first, then backfill, reconcile, auto_join.
         lines, out = cycle(1, backfill_age=10)
-        assert lines == ["watchdog", "dispatcher", "backfill", "reconcile-replies", "auto_join"], lines
+        # prune-state-files (review fix 2026-11-25) shares reconcile's hourly slot
+        assert lines == ["watchdog", "dispatcher", "backfill", "reconcile-replies", "prune-state-files",
+                         "auto_join"], lines
         assert '"decision":"silent"' in out
         # Locked cycle (batch in flight) -> same as idle.
         lines, out = cycle(2, backfill_age=None)
@@ -11999,6 +12018,690 @@ def test_audit_fix_2026_11_23() -> str:
             "failed_with_landed_replyのkeys・2関数はTypeErrorで呼び直さず1回で例外、を確認")
 
 
+def test_review_fix_2026_11_25_commit_guard() -> str:
+    """87. 点検（2026-11-25）の修正・commit 周り: [重大-1] DONE/IGNORED に --force --status FAILED しても FAILED のまま（PENDING に戻らない・unverifiable の理由でも同じ・CLI も同じ）、[軽微-3](a) unverifiable 以外の FAILED で first_unverifiable_at を消す、(b) DONE->DONE --force --reason で理由文言を訂正できる（force なしは従来どおり no-op）、(c) _save_event_intended_text は DONE/IGNORED 行を書き換えない（FAILED/PROCESSING は従来どおり）、(d) commit_batch は書き込みも1トランザクションで、途中失敗なら全件ロールバック、[中-1] 答え済み判定は Bot の投稿・短文も数え、空白だけの本文は数えない"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "state" / "slack_events.db"
+        init_db(db_path)
+
+        def ins(eid: str, status: str, err: Optional[str] = None, first_unv: Optional[str] = None) -> None:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, retry_count, "
+                    "error_message, first_unverifiable_at, created_at, updated_at) VALUES "
+                    "(?, 'C_RF', 'U_Q', 't', ?, ?, 0, ?, ?, '2026-11-25 00:00:00', '2026-11-25 00:00:00')",
+                    (eid, f"17956{abs(hash(eid)) % 100000:05d}.000000", status, err, first_unv),
+                )
+                conn.commit()
+
+        def row(eid: str) -> Dict[str, Any]:
+            with get_db_connection(db_path) as conn:
+                return dict(conn.execute(
+                    "SELECT status, retry_count, error_message, next_retry_at, first_unverifiable_at, "
+                    "intended_text, attempt_ts, updated_at FROM events WHERE event_id = ?", (eid,)).fetchone())
+
+        # [major-1] DONE / IGNORED -> FAILED with force: stays FAILED
+        for src in ("DONE", "IGNORED"):
+            for extra in ("", " pre_post_check_unverifiable"):
+                eid = f"Ev_RF_{src}{'_UNV' if extra else ''}"
+                ins(eid, src)
+                with redirect_stderr(io.StringIO()):
+                    res = agent_tools.commit_event(eid, "FAILED", error_message=f"訂正{extra}",
+                                                   db_path=db_path, force=True, reason=f"誤確定の訂正{extra}")
+                r = row(eid)
+                assert res["status"] == "FAILED" and r["status"] == "FAILED", (eid, res, r)
+                assert r["retry_count"] == 0 and r["next_retry_at"] is None, (eid, r)
+                assert f"[forced {src}->FAILED]" in (r["error_message"] or ""), (eid, r)
+        ins("Ev_RF_DONE_CLI", "DONE")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = agent_tools.main(["--db", str(db_path), "commit", "--event-id", "Ev_RF_DONE_CLI",
+                                   "--status", "FAILED", "--force", "--reason", "CLI での訂正"])
+        assert rc == 0 and row("Ev_RF_DONE_CLI")["status"] == "FAILED", row("Ev_RF_DONE_CLI")
+
+        # (b) same-state force corrects the reason; without force it is a no-op
+        ins("Ev_RF_SAME", "DONE", err="古い理由")
+        with redirect_stderr(io.StringIO()):
+            res = agent_tools.commit_event("Ev_RF_SAME", "DONE", db_path=db_path)
+        assert res.get("noop") is True and row("Ev_RF_SAME")["error_message"] == "古い理由", row("Ev_RF_SAME")
+        with redirect_stderr(io.StringIO()):
+            res = agent_tools.commit_event("Ev_RF_SAME", "DONE", db_path=db_path, force=True, reason="新しい理由")
+        r = row("Ev_RF_SAME")
+        assert not res.get("noop") and r["status"] == "DONE", (res, r)
+        assert "[forced DONE->DONE] 新しい理由" in (r["error_message"] or ""), r
+
+        # (a) non-unverifiable FAILED clears first_unverifiable_at
+        ins("Ev_RF_UNV", "PROCESSING", err="pre_post_check_unverifiable", first_unv="2026-11-25 00:00:00")
+        with redirect_stderr(io.StringIO()):
+            agent_tools.commit_event("Ev_RF_UNV", "FAILED", error_message="agent error", db_path=db_path)
+        r = row("Ev_RF_UNV")
+        assert r["status"] == "PENDING" and r["retry_count"] == 1 and r["first_unverifiable_at"] is None, r
+        # the unverifiable path still sets it
+        ins("Ev_RF_UNV2", "PROCESSING")
+        with redirect_stderr(io.StringIO()):
+            agent_tools.commit_event("Ev_RF_UNV2", "FAILED", error_message="pre_post_check_unverifiable: x",
+                                     db_path=db_path)
+        r = row("Ev_RF_UNV2")
+        assert r["status"] == "PENDING" and r["retry_count"] == 0 and r["first_unverifiable_at"], r
+
+        # (c) intended_text is not written to settled rows
+        ins("Ev_RF_INT_DONE", "DONE")
+        ins("Ev_RF_INT_FAIL", "FAILED")
+        ins("Ev_RF_INT_PROC", "PROCESSING")
+        before = row("Ev_RF_INT_DONE")
+        assert agent_tools._save_event_intended_text("Ev_RF_INT_DONE", "本文", db_path=db_path) is False
+        assert row("Ev_RF_INT_DONE") == before, (before, row("Ev_RF_INT_DONE"))
+        assert agent_tools._save_event_intended_text("Ev_RF_INT_FAIL", "本文F", db_path=db_path) is True
+        assert row("Ev_RF_INT_FAIL")["intended_text"] == "本文F"
+        assert agent_tools._save_event_intended_text("Ev_RF_INT_PROC", "本文P", db_path=db_path) is True
+        assert row("Ev_RF_INT_PROC")["intended_text"] == "本文P"
+
+        # (d) commit_batch: a failure in the write phase rolls back every item
+        ins("Ev_RF_B1", "PROCESSING")
+        ins("Ev_RF_B2", "PROCESSING")
+        real_core = agent_tools._commit_event_in_tx
+
+        def flaky_core(conn: Any, event_id: str, *a: Any, **k: Any) -> Any:
+            if event_id == "Ev_RF_B2":
+                raise RuntimeError("simulated write failure")
+            return real_core(conn, event_id, *a, **k)
+
+        with patch.object(agent_tools, "_commit_event_in_tx", side_effect=flaky_core), \
+                redirect_stderr(io.StringIO()):
+            res = agent_tools.commit_batch(
+                [{"event_id": "Ev_RF_B1", "status": "DONE"}, {"event_id": "Ev_RF_B2", "status": "IGNORED"}],
+                db_path=db_path,
+            )
+        assert res["ok"] is False and res.get("rolled_back") is True and res["committed"] == 0, res
+        assert row("Ev_RF_B1")["status"] == "PROCESSING" and row("Ev_RF_B2")["status"] == "PROCESSING"
+        with redirect_stderr(io.StringIO()):
+            res = agent_tools.commit_batch(
+                [{"event_id": "Ev_RF_B1", "status": "DONE"}, {"event_id": "Ev_RF_B2", "status": "IGNORED"}],
+                db_path=db_path,
+            )
+        assert res["ok"] is True and res["committed"] == 2, res
+        assert row("Ev_RF_B1")["status"] == "DONE" and row("Ev_RF_B2")["status"] == "IGNORED"
+
+    # [mid-1] answered check: bots and short posts count, whitespace does not
+    parent = {"user": "U_Q", "text": "質問", "ts": "1795700000.000100"}
+    find = agent_tools._find_answering_message_in_thread
+    bot_ans = {"user": "U_OTHER_BOT", "bot_id": "B_OTHER", "text": "回答です", "ts": "1795700010.000100"}
+    short_ans = {"user": "U_OTHER", "text": "OK", "ts": "1795700011.000100"}
+    blank = {"user": "U_OTHER", "text": "  \n ", "ts": "1795700012.000100"}
+    yama = {"user": "U_YAMA_SELF", "bot_id": "B_YAMA", "text": "Yama の投稿", "ts": "1795700013.000100"}
+    assert find([parent, bot_ans], parent["ts"], {"U_Q"}, {"U_YAMA_SELF"}) == bot_ans
+    assert find([parent, short_ans], parent["ts"], {"U_Q"}, {"U_YAMA_SELF"}) == short_ans
+    assert find([parent, blank, yama], parent["ts"], {"U_Q"}, {"U_YAMA_SELF"}) is None
+    assert find([parent, bot_ans], parent["ts"], {"U_Q"}, {"U_YAMA_SELF"},
+                bot_ts_set={bot_ans["ts"]}) == bot_ans
+
+    return ("DONE/IGNORED→FAILED --forceはFAILEDのまま(unverifiable理由でも・CLIも)・DONE→DONE --forceで理由訂正(forceなしはno-op)・"
+            "unverifiable以外のFAILEDでfirst_unverifiable_at消去・intended_textは終端行を書換えず(FAILED/PROCESSINGは保存)・"
+            "commit_batchは書込途中失敗で全件ロールバック・答え済みはBot投稿/短文を数え空白は数えない、を確認")
+
+
+def test_review_fix_2026_11_25_owner_dm() -> str:
+    """88. 点検（2026-11-25）の修正・DM代行: [重大-2](b) auto_streak の加算は _count_proxy_reply 一か所（send が加算し、resolve は同じ ts を二重に数えない・resolve 前に send を繰り返しても上限で止まる・ts_not_found/タイムアウトも数え、後から判明した ts や着地した投稿で二重に数えない・非0終了は数えない）、[軽微-4] 代行自身のスレッド返信では pending を立てない・resolve --owner-active でスレッド内の本人返信もリセット"""
+    uid = sorted(owner_dm_poll.CONVS)[0]  # a configured DM partner; no ID literal in the test
+    owner = owner_dm_poll.OWNER_ID
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "slack-owner-dm.json"
+
+        def fresh() -> None:
+            state_path.write_text(json.dumps({
+                "convs": {u: {"top_ts": "1795000000.000000", "threads": {}, "handled": [], "auto_streak": 0,
+                              "proxy_ts": []} for u in owner_dm_poll.CONVS},
+                "pending": [], "last_wake_at": 0}), encoding="utf-8")
+
+        def st() -> Dict[str, Any]:
+            return json.loads(state_path.read_text(encoding="utf-8"))["convs"][uid]
+
+        feeds: Dict[str, List[Dict[str, Any]]] = {u: [] for u in owner_dm_poll.CONVS}
+        responses: List[Any] = []
+        calls: List[Any] = []
+
+        def fake_send(user_id: str, message: str, thread_ts: Optional[str] = None) -> Any:
+            calls.append(message)
+            return responses.pop(0)
+
+        def ok_ts(ts: str) -> str:
+            return json.dumps({"result": {"content": [{"type": "text", "text": json.dumps({"ok": True, "ts": ts})}]}})
+
+        def resolve(item_id: str, action: str, **kw: Any) -> Dict[str, Any]:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                owner_dm_poll.resolve(item_id, action, **kw)
+            return json.loads(buf.getvalue())
+
+        with patch.object(owner_dm_poll, "STATE_PATH", str(state_path)), \
+                patch.object(owner_dm_poll, "read_dm", lambda u, limit=6: list(feeds.get(u, []))), \
+                patch.object(owner_dm_poll, "send_dm", fake_send):
+            # repeated send before resolve: the cap still holds
+            fresh()
+            for i in range(3):
+                responses.append(ok_ts(f"179500001{i}.000000"))
+                assert owner_dm_poll.send(uid, f"m{i}")["auto_streak"] == i + 1
+            n = len(calls)
+            assert owner_dm_poll.send(uid, "4th") == {"ok": False, "error": "auto_streak_limit"}
+            assert len(calls) == n, "send_dm must not be called at the cap"
+
+            # send then resolve (with and without the same reply_ts): counted once
+            fresh()
+            feeds[uid] = [{"author": uid, "ts": "1795000020.000000", "thread_latest": None}]
+            item = owner_dm_poll.poll()["pending"][0]["id"]
+            responses.append(ok_ts("1795000021.000000"))
+            assert owner_dm_poll.send(uid, "r")["auto_streak"] == 1
+            assert resolve(item, "replied", reply_ts="1795000021.000000")["auto_streak"] == 1
+            feeds[uid] = [{"author": uid, "ts": "1795000022.000000", "thread_latest": None}]
+            item = owner_dm_poll.poll()["pending"][0]["id"]
+            responses.append(ok_ts("1795000023.000000"))
+            owner_dm_poll.send(uid, "r2")
+            assert resolve(item, "replied")["auto_streak"] == 2
+
+            # ts_not_found: counted now; a later --reply-ts for that message is not counted again
+            fresh()
+            feeds[uid] = [{"author": uid, "ts": "1795000030.000000", "thread_latest": None}]
+            item = owner_dm_poll.poll()["pending"][0]["id"]
+            responses.append(json.dumps({"result": {"content": [{"type": "text", "text": "sent"}]}}))
+            r = owner_dm_poll.send(uid, "no ts")
+            assert r["ok"] is False and r["error"] == "ts_not_found" and r["auto_streak"] == 1, r
+            assert "再送せず" in r["message"], r
+            assert st()["unconfirmed_sends"] == 1
+            assert resolve(item, "replied", reply_ts="1795000031.000000")["auto_streak"] == 1
+            assert st()["unconfirmed_sends"] == 0 and "1795000031.000000" in st()["proxy_ts"]
+
+            # ts_not_found, then poll sees the landed message (owner-authored, not in proxy_ts):
+            # adopted as the proxy reply, no streak reset, not counted twice
+            fresh()
+            responses.append(json.dumps({"result": {"content": [{"type": "text", "text": "sent"}]}}))
+            owner_dm_poll.send(uid, "no ts 2")
+            feeds[uid] = [{"author": owner, "ts": "1795000040.000000", "thread_latest": None}]
+            owner_dm_poll.poll()
+            assert st()["auto_streak"] == 1 and st()["unconfirmed_sends"] == 0, st()
+            assert "1795000040.000000" in st()["proxy_ts"]
+            # a real owner post afterwards still resets
+            feeds[uid] = [{"author": owner, "ts": "1795000041.000000", "thread_latest": None}]
+            owner_dm_poll.poll()
+            assert st()["auto_streak"] == 0
+
+            # timeout counts (may have landed) and says so; a non-zero exit does not count
+            fresh()
+            responses.append(owner_dm_poll.SEND_TIMEOUT)
+            r = owner_dm_poll.send(uid, "timeout")
+            assert r["ok"] is False and r["error"] == "send_timeout" and r["auto_streak"] == 1, r
+            responses.append(None)
+            r = owner_dm_poll.send(uid, "fail")
+            assert r["error"] == "send_failed" and st()["auto_streak"] == 1, (r, st())
+
+            # thread: our own proxy reply as the latest reply -> no pending, watermark advanced
+            fresh()
+            parent = "1795000050.000000"
+            responses.append(ok_ts("1795000060.123456"))
+            owner_dm_poll.send(uid, "thread reply", thread_ts=parent)
+            feeds[uid] = [{"author": uid, "ts": parent, "thread_latest": 1795000060.0}]
+            p1 = owner_dm_poll.poll()
+            assert not [x for x in p1["pending"] if x["kind"] == "thread"], p1
+            assert st()["threads"][parent] == 1795000060.0
+            # the counterpart replies later in the thread -> pending
+            feeds[uid] = [{"author": uid, "ts": parent, "thread_latest": 1795000070.0}]
+            p2 = owner_dm_poll.poll()
+            th_items = [x for x in p2["pending"] if x["kind"] == "thread"]
+            assert len(th_items) == 1, p2
+            # the worker saw Owner's own reply in the thread -> --owner-active resets
+            assert st()["auto_streak"] == 1
+            assert resolve(th_items[0]["id"], "skipped", owner_active=True)["auto_streak"] == 0
+
+        cli = subprocess.run([str(PYTHON_BIN), str(BASE_DIR / "owner_dm_poll.py"), "resolve", "--help"],
+                             capture_output=True, text=True)
+        assert "--owner-active" in cli.stdout, cli.stdout
+    return ("sendが加算しresolveは同じtsを二重に数えない・resolve前のsend連打も上限で停止・ts_not_found/タイムアウトは数え後のts判明や"
+            "着地投稿で二重計上なし(本人扱いの誤リセットもなし)・非0終了は数えない・代行自身のスレッド返信でpendingなし・"
+            "相手の後続返信はpending・--owner-activeでリセット、を確認")
+
+
+def test_review_fix_2026_11_25_alerts_and_housekeeping() -> str:
+    """89. 点検（2026-11-25）の修正・通知と掃除: [中-5] ops_monitor outbox-append・dispatch フックの dispatcher exit>=3 を ops_alerts へ（同じ周期で配送・10分以内の再通知なし・復旧1回）・owner-dm フックの poll 非0終了を ops_alerts へ（握りつぶさない）・auto_join の StateLoadError を1回だけ ops_alerts へ（復旧1回）、[中-3] triage-log（JSON検証・末尾改行の補修・1行1件）、[中-7] prune-state-files（DONE 7日超の下書きと7日超の decisions だけ削除）"""
+    import ops_monitor
+
+    runtime = Path("/home/hatch/hooks/runtime/hatch_hook_runtime.sh")
+    owner_hook = Path("/home/hatch/hooks/scripts/slack-owner-dm.sh")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_p = Path(tmp)
+        # --- outbox-append CLI ---
+        ob = tmp_p / "o.jsonl"
+        assert ops_monitor.main(["outbox-append", "--path", str(ob), "--kind", "k1", "--detail", '{"a": 1}']) == 0
+        line = json.loads(ob.read_text(encoding="utf-8"))
+        assert line["kind"] == "k1" and line["a"] == 1 and line["at"], line
+        with redirect_stdout(io.StringIO()):
+            assert ops_monitor.main(["outbox-append", "--path", str(ob), "--kind", "k", "--detail", "[1]"]) == 2
+
+        # --- dispatch hook: dispatcher exit >= 3 ---
+        proj = tmp_p / "proj"
+        (proj / "state").mkdir(parents=True)
+        (proj / "config").mkdir()
+        (proj / "venv").symlink_to(BASE_DIR / "venv")
+        for name in ("backfill.py", "auto_join.py", "agent_tools.py"):
+            (proj / name).write_text("pass\n", encoding="utf-8")
+        (proj / "listener.py").write_text("x = 1\n", encoding="utf-8")
+        (proj / "watchdog.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (proj / "dispatcher.sh").write_text(
+            "#!/usr/bin/env bash\necho 'boom: sqlite locked' >&2\nexit \"${STUB_DISPATCH_CODE:-1}\"\n",
+            encoding="utf-8")
+        for f in ("watchdog.sh", "dispatcher.sh"):
+            (proj / f).chmod(0o755)
+        ops_stub = tmp_p / "ops.py"
+        ops_stub.write_text(
+            "import json, sys\n"
+            f"sys.path.insert(0, {str(BASE_DIR)!r})\n"
+            "import ops_monitor\n"
+            "if sys.argv[1] == 'pending-check':\n"
+            "    print(json.dumps({'ok': True, 'stale': False, 'human_pending': 0, 'oldest_age_sec': 0}))\n"
+            "    sys.exit(0)\n"
+            "sys.exit(ops_monitor.main(sys.argv[1:]))\n", encoding="utf-8")
+        alerts_path = proj / "state" / "ops_alerts.jsonl"
+        hook_state = tmp_p / "hook_state"
+        hook_state.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("YAMA_", "HATCH_HOOK"))}
+        env.update({
+            "HATCH_HOOK_RUNTIME": str(runtime), "HATCH_HOOK_STATE_DIR": str(hook_state),
+            "HATCH_HOOK_ID": "test-hook", "YAMA_PROJECT_DIR": str(proj),
+            "YAMA_UNIT_SOURCE": str(proj / "no-such.service"), "YAMA_ENV_FILE": str(proj / "config" / ".env"),
+            "YAMA_WATCHDOG_LOG": str(proj / "state" / "watchdog.log"), "YAMA_SYSTEMCTL_BIN": "true",
+            "YAMA_OPS_MONITOR_PY": str(ops_stub), "YAMA_OPS_ALERTS_PATH": str(alerts_path),
+        })
+
+        def run_dispatch(code: int) -> str:
+            for f in ("reconcile_last_run", "auto_join_last_run", "backfill_last_run"):
+                (proj / "state" / f).write_text(str(int(time.time())), encoding="utf-8")
+            res = subprocess.run(["bash", str(HOOK_SCRIPT_PATH)], env=dict(env, STUB_DISPATCH_CODE=str(code)),
+                                 capture_output=True, text=True, timeout=60)
+            assert res.returncode == 0, res.stderr
+            return res.stdout
+
+        out = run_dispatch(3)
+        assert '"decision":"wake"' in out and "dispatcher_error" in out, out
+        assert "boom: sqlite locked" in out, "stderr tail must be carried in the alert"
+        stamp = proj / "state" / "dispatcher_error_alerted"
+        assert stamp.exists()
+        out = run_dispatch(3)  # within 10 minutes: no repeat
+        assert "dispatcher_error" not in out, out
+        stamp.write_text(str(int(time.time()) - 601), encoding="utf-8")
+        out = run_dispatch(4)  # reminder after 10 minutes
+        assert "dispatcher_error" in out and '"exit_code":4' in out.replace(" ", ""), out
+        out = run_dispatch(1)  # recovered once
+        assert "dispatcher_error_recovered" in out and not stamp.exists(), out
+        out = run_dispatch(1)
+        assert "dispatcher_error" not in out, out
+
+        # --- owner DM hook: poll failure is not swallowed ---
+        dm_proj = tmp_p / "dmproj"
+        (dm_proj / "state").mkdir(parents=True)
+        (dm_proj / "venv").symlink_to(BASE_DIR / "venv")
+        (dm_proj / "ops_monitor.py").symlink_to(BASE_DIR / "ops_monitor.py")
+        (dm_proj / "owner_dm_poll.py").write_text(
+            "import os, sys\n"
+            "if os.environ.get('STUB_POLL_FAIL') == '1':\n"
+            "    sys.stderr.write('json.decoder.JSONDecodeError: state broken\\n'); sys.exit(1)\n"
+            "print('{\"wake\": false, \"pending\": [], \"observed\": {}}')\n", encoding="utf-8")
+        dm_alerts = dm_proj / "state" / "ops_alerts.jsonl"
+        dm_stamp = tmp_p / "owner_dm_stamp"
+        dm_state = tmp_p / "dm_hook_state"
+        dm_state.mkdir()
+        dm_env = {k: v for k, v in os.environ.items() if not k.startswith(("YAMA_", "HATCH_HOOK"))}
+        dm_env.update({
+            "HATCH_HOOK_RUNTIME": str(runtime), "HATCH_HOOK_STATE_DIR": str(dm_state),
+            "HATCH_HOOK_ID": "test-dm-hook", "YAMA_PROJECT_DIR": str(dm_proj),
+            "YAMA_DISPATCH_SCRIPT": str(HOOK_SCRIPT_PATH), "YAMA_OPS_ALERTS_PATH": str(dm_alerts),
+            "OWNER_DM_POLL_ERR_STAMP": str(dm_stamp),
+        })
+
+        def run_dm(fail: bool) -> str:
+            res = subprocess.run(["bash", str(owner_hook)], env=dict(dm_env, STUB_POLL_FAIL="1" if fail else "0"),
+                                 capture_output=True, text=True, timeout=60)
+            assert res.returncode == 0, res.stderr
+            return res.stdout
+
+        def dm_kinds() -> List[str]:
+            if not dm_alerts.exists():
+                return []
+            return [json.loads(x)["kind"] for x in dm_alerts.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+        out = run_dm(True)
+        assert '"decision":"silent"' in out, out
+        assert dm_kinds() == ["owner_dm_poll_failed"], dm_kinds()
+        first = json.loads(dm_alerts.read_text(encoding="utf-8").splitlines()[0])
+        assert first["exit_code"] == 1 and "state broken" in first["stderr_tail"], first
+        run_dm(True)
+        assert dm_kinds() == ["owner_dm_poll_failed"], "no repeat within 10 minutes"
+        run_dm(False)
+        assert dm_kinds() == ["owner_dm_poll_failed", "owner_dm_poll_failed_recovered"] and not dm_stamp.exists()
+        run_dm(False)
+        assert len(dm_kinds()) == 2
+
+        # --- auto_join StateLoadError -> one alert per episode ---
+        aj_dir = tmp_p / "aj"
+        aj_dir.mkdir()
+        state_path = aj_dir / "auto_join_state.json"
+        state_path.write_text("garbage", encoding="utf-8")
+        auto_join._bak_path(state_path).write_text("also garbage", encoding="utf-8")
+        aj_alerts = aj_dir / "ops_alerts.jsonl"
+
+        class EmptyClient:
+            def conversations_list(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"ok": True, "channels": [], "response_metadata": {"next_cursor": ""}}
+
+        saved = os.environ.pop("YAMA_OPS_ALERTS_PATH", None)
+        try:
+            def run_aj() -> Dict[str, Any]:
+                with redirect_stdout(io.StringIO()):
+                    return auto_join.run_auto_join(
+                        db_path=aj_dir / "db.sqlite", env_path=aj_dir / ".env", state_path=state_path,
+                        client=EmptyClient(), dry_run=False, now=1797100000.0, sleep_fn=lambda _s: None)
+
+            def aj_kinds() -> List[str]:
+                if not aj_alerts.exists():
+                    return []
+                return [json.loads(x)["kind"] for x in aj_alerts.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+            assert run_aj().get("state_error") is True
+            assert aj_kinds() == ["auto_join_state_error"], aj_kinds()
+            run_aj()
+            assert aj_kinds() == ["auto_join_state_error"], "once per episode"
+            state_path.write_text(json.dumps({"known_member": [], "opted_out": []}), encoding="utf-8")
+            assert not run_aj().get("state_error")
+            assert aj_kinds() == ["auto_join_state_error", "auto_join_state_error_recovered"], aj_kinds()
+            run_aj()
+            assert len(aj_kinds()) == 2
+        finally:
+            if saved is not None:
+                os.environ["YAMA_OPS_ALERTS_PATH"] = saved
+
+        # --- triage-log ---
+        db_path = tmp_p / "state2" / "slack_events.db"
+        init_db(db_path)
+        tlog = db_path.parent / "triage_log.jsonl"
+        tlog.write_text('{"event_id": "Ev_OLD", "decision": "x"}', encoding="utf-8")  # torn: no trailing newline
+        out_buf = io.StringIO()
+        with redirect_stdout(out_buf):
+            rc = agent_tools.main(["--db", str(db_path), "triage-log", "--json",
+                                   json.dumps({"event_id": "Ev_T1", "mode": "full", "decision": "返さない",
+                                               "reason": "改行\nを含む理由"}, ensure_ascii=False)])
+        assert rc == 0 and json.loads(out_buf.getvalue())["repaired_missing_newline"] is True, out_buf.getvalue()
+        entry_file = tmp_p / "entry.json"
+        entry_file.write_text(json.dumps({"event_id": "Ev_T2", "decision": "返信すべき"}), encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            assert agent_tools.main(["--db", str(db_path), "triage-log", "--file", str(entry_file)]) == 0
+        for bad in ('[1, 2]', '{"decision": "no id"}', '{"event_id": "x"'):
+            with redirect_stderr(io.StringIO()):
+                assert agent_tools.main(["--db", str(db_path), "triage-log", "--json", bad]) == 1, bad
+        raw = tlog.read_text(encoding="utf-8")
+        assert raw.endswith("\n")
+        lines = raw.splitlines()
+        assert [json.loads(x)["event_id"] for x in lines] == ["Ev_OLD", "Ev_T1", "Ev_T2"], lines
+        assert json.loads(lines[1])["reason"] == "改行\nを含む理由" and json.loads(lines[1])["logged_at"]
+
+        # --- prune-state-files ---
+        state = db_path.parent
+        old = time.time() - 8 * 86400
+        with get_db_connection(db_path) as conn:
+            for eid, st, upd in (
+                ("Ev_P_DONE_OLD", "DONE", "2026-11-01 00:00:00"),
+                ("Ev_P_DONE_NEW", "DONE", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+                ("Ev_P_FAILED", "FAILED", "2026-11-01 00:00:00"),
+                ("Ev_P_PENDING", "PENDING", "2026-11-01 00:00:00"),
+                ("Ev_P_IGN", "IGNORED", "2026-11-01 00:00:00"),
+            ):
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, status, retry_count, "
+                    "created_at, updated_at) VALUES (?, 'C', 'U', 't', ?, ?, 0, ?, ?)",
+                    (eid, f"17950{len(eid)}{abs(hash(eid)) % 1000:03d}.0", st, upd, upd))
+            conn.commit()
+        names = ["Ev_P_DONE_OLD", "Ev_P_DONE_NEW", "Ev_P_FAILED", "Ev_P_PENDING", "Ev_P_IGN", "Ev_P_UNKNOWN"]
+        for eid in names:
+            f = state / f"reply-{eid}.txt"
+            f.write_text("draft", encoding="utf-8")
+            os.utime(f, (old, old))
+        fresh_file_done = state / "reply-Ev_P_DONE_OLD.txt"
+        dec_old = state / "decisions-old.json"
+        dec_new = state / "decisions-new.json"
+        for f in (dec_old, dec_new):
+            f.write_text("[]", encoding="utf-8")
+        os.utime(dec_old, (old, old))
+        other = state / "payload.json"
+        other.write_text("{}", encoding="utf-8")
+        os.utime(other, (old, old))
+        with redirect_stdout(io.StringIO()):
+            assert agent_tools.main(["--db", str(db_path), "prune-state-files", "--dry-run"]) == 0
+        assert fresh_file_done.exists() and dec_old.exists(), "dry-run deletes nothing"
+        res = agent_tools.prune_state_files(days=7, db_path=db_path)
+        assert res["deleted_reply_drafts"] == 1 and res["deleted_decision_files"] == 1, res
+        left = sorted(x.name for x in state.glob("reply-*.txt"))
+        assert left == sorted(f"reply-{e}.txt" for e in names if e != "Ev_P_DONE_OLD"), left
+        assert not dec_old.exists() and dec_new.exists() and other.exists()
+
+    return ("outbox-append・dispatcher exit>=3を同周期でwake配送(stderr末尾つき・10分以内は再通知なし・10分後に再通知・復旧1回)・"
+            "owner-dm pollの非0終了をops_alertsへ(再通知抑止・復旧1回)・auto_join StateLoadErrorは1エピソード1行＋復旧1行・"
+            "triage-logは末尾改行を補修して1行1件(JSON検証・event_id必須)・prune-state-filesはDONE 7日超の下書きと7日超の"
+            "decisionsだけ削除(FAILED/PENDING/IGNORED/不明/新しいDONEは残す・dry-runは削除なし)、を確認")
+
+
+def _load_listener_module(path: Path) -> Any:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(f"listener_under_test_{uuid.uuid4().hex}", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+def test_review_fix_2026_11_25_listener_and_watchdog() -> str:
+    """90. 点検（2026-11-25）の修正・リスナーとウォッチドッグ: [中-4](a) 初回 pong 前の凍結を検知（接続中なのに120秒 pong なし→exit・連続2回で打ち止めにしてループしない・pong 受信でカウンタ0）、(c) イベント処理ハンドラが300秒詰まったら exit、(b) heartbeat.json は壁時計 timestamp のまま、main() のループを偽クライアントで実際に回して確認。[中-7] watchdog.sh は正常時に何も書かない、候補33 boot_id（sha256 先頭8文字）と起動日時を初回・ブート変化・再起動時に記録、[中-6] backfill は TypeError で引数を落として呼び直さない"""
+    listener_path = Path(os.environ.get("YAMA_TEST_LISTENER_PATH", str(BASE_DIR / "listener.py")))
+    lm = _load_listener_module(listener_path)
+
+    # --- unit: first-pong tracker / decision ---
+    class Sess:
+        def __init__(self, pong: Any) -> None:
+            self.last_ping_pong_time = pong
+
+    class Cli:
+        def __init__(self, sess: Any) -> None:
+            self.current_session = sess
+
+    tr: Dict[str, Any] = {}
+    s1 = Sess(None)
+    assert lm.track_session_without_pong(Cli(None), 100.0, tr) is None
+    assert lm.track_session_without_pong(Cli(s1), 100.0, tr) == 0.0
+    assert lm.track_session_without_pong(Cli(s1), 230.0, tr) == 130.0
+    assert lm.track_session_without_pong(Cli(Sess(None)), 231.0, tr) == 0.0, "new session restarts the clock"
+    assert lm.track_session_without_pong(Cli(Sess(5.0)), 232.0, tr) is None, "a pong ends the wait"
+    assert lm.should_exit_for_no_first_pong(True, 120.0, 0) is True
+    assert lm.should_exit_for_no_first_pong(True, 119.9, 0) is False
+    assert lm.should_exit_for_no_first_pong(False, 500.0, 0) is False
+    assert lm.should_exit_for_no_first_pong(True, 500.0, 2) is False, "capped: no restart loop"
+    assert lm.should_exit_for_no_first_pong(True, None, 0) is False
+    ht = lm.HandlerTracker()
+    t1 = ht.begin(10.0)
+    t2 = ht.begin(20.0)
+    assert ht.oldest_age(320.0) == 310.0
+    ht.end(t1)
+    assert ht.oldest_age(320.0) == 300.0
+    ht.end(t2)
+    assert ht.oldest_age(320.0) is None
+
+    # --- main() loop with a fake Socket Mode client ---
+    class ExitCalled(Exception):
+        def __init__(self, code: int) -> None:
+            self.code = code
+
+    def run_main(tmp: Path, pong: Any, iterations: int, prior_exits: Optional[int] = None,
+                 stall_handler: bool = False) -> Tuple[Optional[int], Dict[str, Any], List[str]]:
+        state = tmp / "state"
+        state.mkdir(exist_ok=True)
+        lm.DEFAULT_DB_PATH = state / "slack_events.db"
+        lm.DEFAULT_HEARTBEAT_PATH = state / "heartbeat.json"
+        lm.DEFAULT_FIRST_PONG_EXITS_PATH = state / "first_pong_exits.json"
+        lm.DEFAULT_ENV_PATH = tmp / "no.env"
+        if prior_exits is not None:
+            lm.save_first_pong_exits(prior_exits, lm.DEFAULT_FIRST_PONG_EXITS_PATH)
+        clock = {"mono": 1000.0}
+        notes: List[str] = []
+
+        class FakeSocketClient:
+            def __init__(self, **kw: Any) -> None:
+                self.socket_mode_request_listeners: List[Any] = []
+                self.current_session = Sess(pong)
+
+            def connect(self) -> None:
+                pass
+
+            def is_connected(self) -> bool:
+                return True
+
+            def close(self) -> None:
+                pass
+
+            def send_socket_mode_response(self, resp: Any) -> None:
+                pass
+
+        holder: Dict[str, Any] = {}
+
+        class CountingEvent:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def is_set(self) -> bool:
+                self.n += 1
+                if self.n == 2 and "client" in holder:
+                    cli = holder["client"]
+                    req = Namespace(type="hello", envelope_id="e1", payload={})
+                    if stall_handler:
+                        # a handler that started 301s ago and is still running
+                        holder["tracker_token"] = None
+                    for fn in cli.socket_mode_request_listeners:
+                        fn(cli, req)
+                return self.n > iterations
+
+            def set(self) -> None:
+                self.n = 10 ** 9
+
+            def wait(self, timeout: float = 0.0) -> bool:
+                clock["mono"] += 10.0
+                return False
+
+        def make_client(**kw: Any) -> Any:
+            c = FakeSocketClient(**kw)
+            holder["client"] = c
+            return c
+
+        real_tracker_cls = lm.HandlerTracker
+
+        class StuckTracker(real_tracker_cls):  # type: ignore[misc,valid-type]
+            def oldest_age(self, mono_now: float) -> Optional[float]:
+                return 301.0 if stall_handler else super().oldest_age(mono_now)
+
+        def fake_exit(code: int) -> None:
+            raise ExitCalled(code)
+
+        env = {"SLACK_APP_TOKEN": "xapp-test", "SLACK_BOT_TOKEN": "xoxb-test"}
+        code: Optional[int] = None
+        with patch.dict(os.environ, env), \
+                patch.object(lm, "SocketModeClient", side_effect=make_client), \
+                patch.object(lm, "authenticate_bot", return_value={"user_id": "U_YAMA_TEST"}), \
+                patch.object(lm, "mark_mirror_since", return_value="x"), \
+                patch.object(lm.threading, "Event", CountingEvent), \
+                patch.object(lm, "HandlerTracker", StuckTracker), \
+                patch.object(lm, "sd_notify", side_effect=lambda m, env=None: notes.append(m) or True), \
+                patch.object(lm.time, "monotonic", side_effect=lambda: clock["mono"]), \
+                patch.object(lm.os, "_exit", side_effect=fake_exit), \
+                patch.object(lm.signal, "signal"), \
+                patch.object(lm.logging, "shutdown"):
+            try:
+                lm.main()
+            except ExitCalled as e:
+                code = e.code
+        hb = json.loads(lm.DEFAULT_HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        return code, hb, notes
+
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        # never a pong, connected -> exits after 120s (12 x 10s ticks), counter 1
+        code, hb, notes = run_main(t, None, iterations=40)
+        assert code == 1, code
+        assert lm.load_first_pong_exits(lm.DEFAULT_FIRST_PONG_EXITS_PATH) == 1
+        assert hb["connected"] is False and abs(hb["timestamp"] - time.time()) < 60, hb  # wall clock kept
+        assert "WATCHDOG=1" in notes
+        # second time -> exits again (2/2)
+        code, _, _ = run_main(t, None, iterations=40)
+        assert code == 1 and lm.load_first_pong_exits(lm.DEFAULT_FIRST_PONG_EXITS_PATH) == 2
+        # third time -> capped, keeps running (no loop), heartbeat + WATCHDOG=1 continue
+        code, hb, notes = run_main(t, None, iterations=40)
+        assert code is None and hb["connected"] is True, (code, hb)
+        assert notes.count("WATCHDOG=1") >= 30, len(notes)
+        # a healthy session with pongs resets the counter and never exits
+        code, hb, _ = run_main(t, time.time(), iterations=20)
+        assert code is None and lm.load_first_pong_exits(lm.DEFAULT_FIRST_PONG_EXITS_PATH) == 0
+        assert isinstance(hb["timestamp"], float) and "iso_time" in hb
+        # stuck event handler -> exit(1)
+        code, _, _ = run_main(t, time.time(), iterations=20, stall_handler=True)
+        assert code == 1, code
+
+    # --- watchdog.sh: silent when healthy, boot identity ---
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp) / "state"
+        state_dir.mkdir()
+        hb_path = state_dir / "heartbeat.json"
+        log_path = state_dir / "watchdog.log"
+        boot = Path(tmp) / "boot_id"
+        boot.write_text("11111111-2222-3333-4444-555555555555\n", encoding="utf-8")
+        import hashlib
+        expect = hashlib.sha256(b"11111111-2222-3333-4444-555555555555").hexdigest()[:8]
+        write_heartbeat(connected=True, bot_user_id="U_YAMA_BOT", heartbeat_path=hb_path)
+        env = dict(os.environ)
+        env.update({
+            "YAMA_STATE_DIR": str(state_dir), "YAMA_HEARTBEAT_PATH": str(hb_path),
+            "YAMA_WATCHDOG_LOG": str(log_path), "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+            "YAMA_RESTART_CMD": "echo MOCK_RESTART", "YAMA_BOOT_ID_PATH": str(boot),
+            "YAMA_UPTIME_SINCE_CMD": "echo 2026-11-25 21:19:00", "YAMA_WATCHDOG_RECHECK_SEC": "0",
+        })
+
+        def wd() -> str:
+            r = subprocess.run(["bash", str(WATCHDOG_SH)], env=env, capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr
+            return log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+
+        log1 = wd()
+        assert log1.count("Boot identity (first record)") == 1, log1
+        assert f"boot_id={expect} booted=2026-11-25 21:19:00" in log1, log1
+        assert "11111111-2222" not in log1, "raw boot_id must not be logged"
+        assert wd() == log1, "healthy + same boot: nothing logged"
+        boot.write_text("99999999-2222-3333-4444-555555555555\n", encoding="utf-8")
+        log3 = wd()
+        assert f"Boot identity (boot changed from boot_id={expect})" in log3, log3
+        hb_path.write_text(json.dumps({"timestamp": time.time() - 300, "connected": True}), encoding="utf-8")
+        log4 = wd()
+        assert "MOCK_RESTART" in log4 and "Boot identity (listener restart)" in log4, log4
+        assert "[OK]" not in log4
+
+    # --- backfill: no TypeError fallback ---
+    calls: List[Dict[str, Any]] = []
+
+    class OldSdk:
+        def conversations_replies(self, channel: str, ts: str, limit: int = 30) -> Dict[str, Any]:
+            calls.append({"channel": channel})
+            return {"ok": True, "messages": []}
+
+    src = (BASE_DIR / "backfill.py").read_text(encoding="utf-8")
+    assert "except TypeError" not in src and "fallback_kw" not in src
+    try:
+        OldSdk().conversations_replies(channel="C", ts="1", limit=30, oldest="0")  # type: ignore[call-arg]
+        raise AssertionError("expected TypeError")
+    except TypeError:
+        pass
+
+    return ("初回pong前の凍結を120秒で検知しexit(連続2回で打ち止め・ループしない・pongで0リセット)・ハンドラ300秒詰まりでexit・"
+            "heartbeat.jsonは壁時計timestampのまま・間隔は単調時計で継続(WATCHDOG=1)をmain()ループで確認、watchdog.shは正常時に無記録・"
+            "boot_id(sha256先頭8字)と起動日時を初回/ブート変化/再起動時に記録(生のboot_idは書かない)、backfillのTypeErrorフォールバック削除、を確認")
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -12034,8 +12737,8 @@ def main() -> int:
         ("31. エラー分類適正化＆listener auth_testリトライ (429 Retry-After/5xxリトライ・503時local_db_fallback・恒常エラー即時失敗)", test_transient_slack_api_error_retry_and_listener_auth_retry),
         ("32. バッチD検証 (commit IGNORED時errorクリア・watchdog初回60s backoff・フック自己修復ログ・busy_timeout統一・未使用定数削除)", test_batch_d_ignored_error_clear_watchdog_and_busy_timeout),
         ("33. 遅延再送の印付加 (Asia/Tokyo整形1行前置・通常返信不付加・新旧両形式の二重付加防止)", test_delayed_retry_mark_prefix),
-        ("34. 遅延再送の答え済み送信抑止 (他者10文字超回答でskipped_answered・判定ts出力・DONE遷移)", test_delayed_retry_skipped_answered),
-        ("35. 遅延再送の答え済み非該当ケース (ボットのみ・10文字以下短文のみ・質問者追記のみ・Yama投稿のみ)", test_delayed_retry_not_answered_conservative_cases),
+        ("34. 遅延再送の答え済み送信抑止 (他者の本文あり回答でskipped_answered・判定ts出力・DONE遷移)", test_delayed_retry_skipped_answered),
+        ("35. 遅延再送の答え済み非該当ケース (subtype=bot_message等のみ・空白本文のみ・Bot質問者の追記のみ・質問者追記のみ・Yama投稿のみ)", test_delayed_retry_not_answered_conservative_cases),
         ("36. 遅延再送の履歴取得失敗時 fail-closed (既存pre_post_check_unverifiable経路維持)", test_delayed_retry_history_failure_unverifiable),
         ("37. 再送ヘッダー3者統一形＆移行期二重付加防止 (新形式生成・新旧両形式の正規表現判定)", test_delayed_retry_legacy_and_new_header_dedup),
         ("38. Ambiguous 送信文面保存 (ambiguous時のみintended_text保存・再送ヘッダー込み最終文字列・ALTER TABLE冪等移行)", test_ambiguous_saves_intended_text),
@@ -12087,6 +12790,10 @@ def main() -> int:
         ("84. 候補27 代替案A (台帳に着地ありのFAILEDを検知して1行通知・状態は不変・PROCESSING等は対象外・requeueは台帳ありでブロック・--force --reasonで通過)", test_failed_with_landed_reply_detect_and_requeue_guard),
         ("85. 候補28 event-id 付け忘れ・打ち間違い防止 (reply の二択必須・実在確認と--force --reason・--no-event-idは台帳に記録しない・読み取りのinclude_all_metadataフォールバック削除)", test_reply_event_id_guard_and_metadata_read_no_fallback),
         ("86. 監査（2026-11-23 夜）の修正 (force FAILED->FAILEDはFAILEDのまま・requeue拒否のstderrはJSON1行・アーカイブ失敗行に印を付けない・failed_with_landed_replyのkeys・2関数のTypeErrorフォールバック削除)", test_audit_fix_2026_11_23),
+        ("87. 点検（2026-11-25）の修正・commit周り (DONE/IGNORED→FAILED --forceはFAILEDのまま・同一状態--forceで理由訂正・first_unverifiable_at消去・終端行のintended_text不変・commit-batch全件ロールバック・答え済みはBot/短文を数える)", test_review_fix_2026_11_25_commit_guard),
+        ("88. 点検（2026-11-25）の修正・DM代行 (auto_streakの加算を一か所に・二重加算なし・ts_not_found/タイムアウトを数える・自分のスレッド返信でpendingなし・--owner-activeでリセット)", test_review_fix_2026_11_25_owner_dm),
+        ("89. 点検（2026-11-25）の修正・通知と掃除 (dispatcher exit>=3・owner-dm poll失敗・auto_join状態破損をops_alertsへ・triage-log・prune-state-files)", test_review_fix_2026_11_25_alerts_and_housekeeping),
+        ("90. 点検（2026-11-25）の修正・リスナーとウォッチドッグ (初回pong前の凍結検知・打ち止め・ハンドラ詰まり検知・heartbeat壁時計維持・watchdog正常時無記録・boot_id記録・backfill TypeErrorフォールバック削除)", test_review_fix_2026_11_25_listener_and_watchdog),
     ]
 
     print("=" * 72)

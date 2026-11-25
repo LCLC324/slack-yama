@@ -63,6 +63,8 @@ MAX_RETRIES = 3
 #   DONE / IGNORED -> other status   : rejected (already_terminal), row untouched
 #   FAILED -> anything               : rejected (requeue is the way back to PENDING)
 #   terminal -> other + force/reason : applied; reason kept in error_message, ops alert
+#   DONE / IGNORED -> same + force/reason : applied (reason text corrected; 2026-11-25)
+#   terminal -> FAILED + force/reason     : stays FAILED, never PENDING (2026-11-25)
 # Rejections and forced corrections each append one line to the ops alert outbox.
 TERMINAL_STATUSES = ("DONE", "IGNORED", "FAILED")
 COMMIT_REJECTED_CODE = "already_terminal"
@@ -148,7 +150,10 @@ DELAYED_RETRY_PREFIX_RE = re.compile(
     r")(?:\r?\n|$)"
 )
 SKIPPED_ANSWERED_RESULT: str = "skipped_answered"
-ANSWERED_MIN_TEXT_LENGTH: int = 10
+# Review fix 2026-11-25 [mid-1]: aligned with the hook definition ("an answer is
+# any post with body text by someone other than the questioner and Yama, bots
+# included"). 0 means: at least one non-whitespace character.
+ANSWERED_MIN_TEXT_LENGTH: int = 0
 
 
 def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
@@ -513,9 +518,13 @@ def classify_commit_transition(current_status: Any, requested_status: str, force
     requested = str(requested_status or "").upper()
     if current not in TERMINAL_STATUSES:
         return "apply"
+    if force:
+        # review fix 2026-11-25 [minor-3](b): force is checked before the same-state
+        # no-op so a DONE -> DONE --force --reason can correct the reason text.
+        return "force"
     if current in ("DONE", "IGNORED") and requested == current:
         return "noop"
-    return "force" if force else "reject"
+    return "reject"
 
 
 def _forced_error_message(
@@ -525,48 +534,15 @@ def _forced_error_message(
     return f"{error_message} {marker}" if error_message else marker
 
 
-def commit_event(
-    event_id: str,
+def _resolve_commit_params(
     status: str,
-    error_message: Optional[str] = None,
-    db_path: Path = DEFAULT_DB_PATH,
-    max_retries: int = MAX_RETRIES,
-    now: Optional[Any] = None,
-    retry_wait_seconds: Optional[int] = None,
-    expire_seconds: Optional[int] = None,
-    force: bool = False,
-    reason: Optional[str] = None,
-    source: str = "commit",
+    force: bool,
+    reason: Optional[str],
+    now: Optional[Any],
+    retry_wait_seconds: Optional[int],
+    expire_seconds: Optional[int],
 ) -> Dict[str, Any]:
-    """
-    Terminal guard (checked first, inside the same BEGIN IMMEDIATE transaction):
-      - current PENDING / PROCESSING: the rules below apply unchanged.
-      - current DONE / IGNORED and the same status requested: no-op success; the row is
-        not touched and the returned dict has "noop": True.
-      - current DONE / IGNORED and another status, or current FAILED (any status):
-        rejected without raising; the row is not touched, the returned dict (the current
-        row) has "noop": True and "rejected": "already_terminal", and one line goes to
-        the ops alert outbox. FAILED goes back to PENDING only through requeue.
-      - force=True with a non-empty reason: a rejected transition is applied anyway (for
-        corrections such as IGNORED -> DONE). The reason is kept in error_message
-        ("[forced OLD->NEW] reason") and one line goes to the ops alert outbox.
-        A forced FAILED -> FAILED only rewrites error_message: the row stays FAILED and
-        the retry rules below are skipped (retry_count unchanged), so force is never
-        a way around requeue.
-
-    Commit the final or retry state of an event:
-      - DONE / IGNORED: transitions status directly to DONE or IGNORED and clears wait timestamps.
-      - FAILED (with pre_post_check_unverifiable): treated as an API wait rather than a post failure.
-        Does NOT consume retry_count. Instead, keeps status='PENDING' and sets next_retry_at in the
-        future (stepped 2/5/15/30/60 min by time since the first failure) so the existing
-        30-second dispatcher naturally skips it until the wait
-        elapses and then re-dispatches it to the agent without needing a separate state-transition daemon.
-        If >= 24 hours have elapsed since first_unverifiable_at and history is still unreadable,
-        transitions permanently to FAILED (abandoned).
-      - FAILED (other errors): increments retry_count; if retry_count < max_retries (3),
-        reverts status to PENDING for retry; if retry_count >= max_retries (3),
-        transitions status permanently to FAILED (DLQ).
-    """
+    """Validate the commit request and resolve clock / wait settings (no DB access)."""
     status = status.upper()
     if status not in VALID_COMMIT_STATUSES:
         raise ValueError(f"Invalid status '{status}'. Must be one of {VALID_COMMIT_STATUSES}")
@@ -604,201 +580,234 @@ def commit_event(
         if expire_seconds is not None
         else int(os.environ.get("YAMA_UNVERIFIABLE_EXPIRE_SEC", UNVERIFIABLE_EXPIRE_SECONDS))
     )
+    return {
+        "status": status,
+        "now_dt": now_dt,
+        "fixed_wait_sec": fixed_wait_sec,
+        "wait_ladder": wait_ladder,
+        "active_expire_sec": active_expire_sec,
+    }
 
-    init_db(db_path)
-    with get_db_connection(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE;")
-        row = conn.execute(
-            """
-            SELECT event_id, status, retry_count, error_message,
-                   next_retry_at, first_unverifiable_at, created_at, updated_at
-            FROM events
-            WHERE event_id = ?
-            """,
-            (event_id,),
-        ).fetchone()
-        if not row:
-            conn.rollback()
-            raise LookupError(f"Event '{event_id}' not found in database")
 
-        # Terminal guard (stage 1): decide on the row read inside this transaction,
-        # so a check here cannot race with another writer.
-        current_status = str(row["status"] or "").upper()
-        decision = classify_commit_transition(current_status, status, force=force)
-        if decision in ("noop", "reject"):
-            current_row = dict(
-                conn.execute(
-                    """
-                    SELECT event_id, channel_id, user_id, text, ts, thread_ts, is_bot,
-                           status, retry_count, error_message, next_retry_at, first_unverifiable_at,
-                           intended_text, attempt_ts, created_at, updated_at
-                    FROM events
-                    WHERE event_id = ?
-                    """,
-                    (event_id,),
-                ).fetchone()
-            )
-            conn.rollback()
-            current_row["noop"] = True
-            if decision == "noop":
-                return current_row
+_COMMIT_ROW_COLUMNS = """event_id, channel_id, user_id, text, ts, thread_ts, is_bot,
+                   status, retry_count, error_message, next_retry_at, first_unverifiable_at,
+                   intended_text, attempt_ts, created_at, updated_at"""
+
+
+def _commit_event_in_tx(
+    conn: Any,
+    event_id: str,
+    params: Dict[str, Any],
+    error_message: Optional[str],
+    max_retries: int,
+    force: bool,
+    reason: Optional[str],
+) -> Tuple[Dict[str, Any], str, str]:
+    """Core of commit_event, run inside a transaction the caller has opened
+    (BEGIN IMMEDIATE). Never begins, commits or rolls back by itself, and has no side
+    effects outside the DB, so commit_batch can run several of these in one
+    transaction (review fix 2026-11-25, [minor-3](d)).
+    Returns (row_dict, decision, current_status). For decision 'noop' / 'reject'
+    nothing was written and row_dict is the current row."""
+    status = params["status"]
+    now_dt = params["now_dt"]
+    row = conn.execute(
+        """
+        SELECT event_id, status, retry_count, error_message,
+               next_retry_at, first_unverifiable_at, created_at, updated_at
+        FROM events
+        WHERE event_id = ?
+        """,
+        (event_id,),
+    ).fetchone()
+    if not row:
+        raise LookupError(f"Event '{event_id}' not found in database")
+
+    # Terminal guard (stage 1): decide on the row read inside this transaction,
+    # so a check here cannot race with another writer.
+    current_status = str(row["status"] or "").upper()
+    decision = classify_commit_transition(current_status, status, force=force)
+    if decision in ("noop", "reject"):
+        current_row = dict(
+            conn.execute(
+                f"SELECT {_COMMIT_ROW_COLUMNS} FROM events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        )
+        current_row["noop"] = True
+        if decision == "reject":
             current_row["rejected"] = COMMIT_REJECTED_CODE
             current_row["requested_status"] = status
-            print(
-                f"[commit] WARN {COMMIT_REJECTED_CODE}: event {event_id} is {current_status}; "
-                f"{status} commit from {source} ignored (row unchanged)",
-                file=sys.stderr,
-            )
-            _append_ops_alert(
-                {
-                    "kind": "commit_rejected",
-                    "reason": COMMIT_REJECTED_CODE,
-                    "event_id": event_id,
-                    "current_status": current_status,
-                    "requested_status": status,
-                    "requested_error": (error_message or "")[:300] or None,
-                    "source": source,
-                    "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                },
-                Path(db_path),
-            )
-            return current_row
-        if decision == "force":
-            error_message = _forced_error_message(
-                current_status, status, str(reason), error_message
-            )
+        return current_row, decision, current_status
+    if decision == "force":
+        error_message = _forced_error_message(
+            current_status, status, str(reason), error_message
+        )
 
-        current_retries = int(row["retry_count"] or 0)
+    current_retries = int(row["retry_count"] or 0)
 
-        if decision == "force" and current_status == "FAILED" and status == "FAILED":
-            # Audit fix 2026-11-23 (#3): a forced FAILED -> FAILED is only a
-            # correction of error_message. It must not run the retry branch
-            # below (retry_count < max_retries would flip it to PENDING and
-            # bypass the requeue ledger check). FAILED -> PENDING stays
-            # requeue-only.
+    if decision == "force" and status == "FAILED":
+        # Audit fix 2026-11-23 (#3), widened by review fix 2026-11-25 ([major-1],
+        # candidate 29(a)): a forced commit to FAILED from any terminal state
+        # (DONE / IGNORED / FAILED) settles as FAILED. It must not run the retry
+        # branch below (retry_count < max_retries, or pre_post_check_unverifiable in
+        # the reason, would flip it to PENDING and bypass the requeue ledger check).
+        # Getting back to PENDING stays requeue-only. retry_count is unchanged.
+        new_retries = current_retries
+        final_status = "FAILED"
+        conn.execute(
+            """
+            UPDATE events
+            SET status = 'FAILED',
+                error_message = ?,
+                next_retry_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE event_id = ?
+            """,
+            (error_message, event_id),
+        )
+    elif status == "FAILED":
+        is_unverifiable = bool(
+            error_message and UNVERIFIABLE_ERROR_CODE in error_message.lower()
+        )
+        if is_unverifiable:
             new_retries = current_retries
-            final_status = "FAILED"
-            conn.execute(
-                """
-                UPDATE events
-                SET status = 'FAILED',
-                    error_message = ?,
-                    next_retry_at = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE event_id = ?
-                """,
-                (error_message, event_id),
-            )
-        elif status == "FAILED":
-            is_unverifiable = bool(
-                error_message and UNVERIFIABLE_ERROR_CODE in error_message.lower()
-            )
-            if is_unverifiable:
-                new_retries = current_retries
-                first_dt = _parse_reply_created_at(row["first_unverifiable_at"])
+            first_dt = _parse_reply_created_at(row["first_unverifiable_at"])
+            if (
+                first_dt is None
+                and row["error_message"]
+                and UNVERIFIABLE_ERROR_CODE in str(row["error_message"]).lower()
+            ):
+                first_dt = _parse_reply_created_at(row["created_at"]) or _parse_reply_created_at(
+                    row["updated_at"]
+                )
+            if first_dt is None:
+                first_dt = now_dt
+            first_unverifiable_str = first_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            elapsed_sec = (now_dt - first_dt).total_seconds()
+            if elapsed_sec >= params["active_expire_sec"]:
+                final_status = "FAILED"
+                next_retry_str: Optional[str] = None
                 if (
-                    first_dt is None
-                    and row["error_message"]
-                    and UNVERIFIABLE_ERROR_CODE in str(row["error_message"]).lower()
+                    "abandoned" not in error_message.lower()
+                    and "expired" not in error_message.lower()
                 ):
-                    first_dt = _parse_reply_created_at(row["created_at"]) or _parse_reply_created_at(
-                        row["updated_at"]
-                    )
-                if first_dt is None:
-                    first_dt = now_dt
-                first_unverifiable_str = first_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-                elapsed_sec = (now_dt - first_dt).total_seconds()
-                if elapsed_sec >= active_expire_sec:
-                    final_status = "FAILED"
-                    next_retry_str: Optional[str] = None
-                    if (
-                        "abandoned" not in error_message.lower()
-                        and "expired" not in error_message.lower()
-                    ):
-                        final_error = f"{error_message} (abandoned after 24h)"
-                    else:
-                        final_error = error_message
+                    final_error = f"{error_message} (abandoned after 24h)"
                 else:
-                    final_status = "PENDING"
-                    active_wait_sec = (
-                        fixed_wait_sec
-                        if fixed_wait_sec is not None
-                        else unverifiable_retry_wait_seconds(elapsed_sec, wait_ladder)
-                    )
-                    next_retry_dt = now_dt + timedelta(seconds=active_wait_sec)
-                    next_retry_str = next_retry_dt.strftime("%Y-%m-%d %H:%M:%S")
                     final_error = error_message
-
-                conn.execute(
-                    """
-                    UPDATE events
-                    SET status = ?,
-                        retry_count = ?,
-                        error_message = ?,
-                        next_retry_at = ?,
-                        first_unverifiable_at = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE event_id = ?
-                    """,
-                    (
-                        final_status,
-                        new_retries,
-                        final_error,
-                        next_retry_str,
-                        first_unverifiable_str,
-                        event_id,
-                    ),
-                )
             else:
-                new_retries = current_retries + 1
-                if new_retries < max_retries:
-                    final_status = "PENDING"
-                else:
-                    final_status = "FAILED"
-                conn.execute(
-                    """
-                    UPDATE events
-                    SET status = ?,
-                        retry_count = ?,
-                        error_message = ?,
-                        next_retry_at = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE event_id = ?
-                    """,
-                    (final_status, new_retries, error_message, event_id),
+                final_status = "PENDING"
+                fixed_wait_sec = params["fixed_wait_sec"]
+                active_wait_sec = (
+                    fixed_wait_sec
+                    if fixed_wait_sec is not None
+                    else unverifiable_retry_wait_seconds(elapsed_sec, params["wait_ladder"])
                 )
-        else:
-            # Both DONE and IGNORED are terminal states: clear any stale error_message
-            # from previous retry attempts unless an explicit error_message was provided.
-            new_retries = current_retries
-            final_status = status
+                next_retry_dt = now_dt + timedelta(seconds=active_wait_sec)
+                next_retry_str = next_retry_dt.strftime("%Y-%m-%d %H:%M:%S")
+                final_error = error_message
+
             conn.execute(
                 """
                 UPDATE events
                 SET status = ?,
+                    retry_count = ?,
+                    error_message = ?,
+                    next_retry_at = ?,
+                    first_unverifiable_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE event_id = ?
+                """,
+                (
+                    final_status,
+                    new_retries,
+                    final_error,
+                    next_retry_str,
+                    first_unverifiable_str,
+                    event_id,
+                ),
+            )
+        else:
+            # A failure for any other reason ends the unverifiable wait: clear
+            # first_unverifiable_at so later retries are not treated as delayed
+            # resends (candidate 19 remainder, review fix 2026-11-25 [minor-3](a)).
+            new_retries = current_retries + 1
+            if new_retries < max_retries:
+                final_status = "PENDING"
+            else:
+                final_status = "FAILED"
+            conn.execute(
+                """
+                UPDATE events
+                SET status = ?,
+                    retry_count = ?,
                     error_message = ?,
                     next_retry_at = NULL,
                     first_unverifiable_at = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE event_id = ?
                 """,
-                (final_status, error_message, event_id),
+                (final_status, new_retries, error_message, event_id),
             )
-        conn.commit()
-
-        updated = conn.execute(
+    else:
+        # Both DONE and IGNORED are terminal states: clear any stale error_message
+        # from previous retry attempts unless an explicit error_message was provided.
+        new_retries = current_retries
+        final_status = status
+        conn.execute(
             """
-            SELECT event_id, channel_id, user_id, text, ts, thread_ts, is_bot,
-                   status, retry_count, error_message, next_retry_at, first_unverifiable_at,
-                   intended_text, attempt_ts, created_at, updated_at
-            FROM events
+            UPDATE events
+            SET status = ?,
+                error_message = ?,
+                next_retry_at = NULL,
+                first_unverifiable_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
             WHERE event_id = ?
             """,
-            (event_id,),
-        ).fetchone()
-        result = dict(updated)
-    if decision == "force":
+            (final_status, error_message, event_id),
+        )
+
+    updated = conn.execute(
+        f"SELECT {_COMMIT_ROW_COLUMNS} FROM events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    return dict(updated), decision, current_status
+
+
+def _report_commit_outcome(
+    result: Dict[str, Any],
+    decision: str,
+    current_status: str,
+    event_id: str,
+    status: str,
+    error_message: Optional[str],
+    reason: Optional[str],
+    source: str,
+    db_path: Path,
+) -> None:
+    """Side effects of a commit that has been applied (stderr line + ops alert).
+    Called only after the transaction is committed."""
+    if decision == "reject":
+        print(
+            f"[commit] WARN {COMMIT_REJECTED_CODE}: event {event_id} is {current_status}; "
+            f"{status} commit from {source} ignored (row unchanged)",
+            file=sys.stderr,
+        )
+        _append_ops_alert(
+            {
+                "kind": "commit_rejected",
+                "reason": COMMIT_REJECTED_CODE,
+                "event_id": event_id,
+                "current_status": current_status,
+                "requested_status": status,
+                "requested_error": (error_message or "")[:300] or None,
+                "source": source,
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            Path(db_path),
+        )
+    elif decision == "force":
         result["forced"] = True
         result["previous_status"] = current_status
         print(
@@ -819,6 +828,72 @@ def commit_event(
             },
             Path(db_path),
         )
+
+
+def commit_event(
+    event_id: str,
+    status: str,
+    error_message: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+    max_retries: int = MAX_RETRIES,
+    now: Optional[Any] = None,
+    retry_wait_seconds: Optional[int] = None,
+    expire_seconds: Optional[int] = None,
+    force: bool = False,
+    reason: Optional[str] = None,
+    source: str = "commit",
+) -> Dict[str, Any]:
+    """
+    Terminal guard (checked first, inside the same BEGIN IMMEDIATE transaction):
+      - current PENDING / PROCESSING: the rules below apply unchanged.
+      - current DONE / IGNORED and the same status requested (without force): no-op
+        success; the row is not touched and the returned dict has "noop": True.
+      - current DONE / IGNORED and another status, or current FAILED (any status):
+        rejected without raising; the row is not touched, the returned dict (the current
+        row) has "noop": True and "rejected": "already_terminal", and one line goes to
+        the ops alert outbox. FAILED goes back to PENDING only through requeue.
+      - force=True with a non-empty reason: a rejected transition is applied anyway (for
+        corrections such as IGNORED -> DONE). The reason is kept in error_message
+        ("[forced OLD->NEW] reason") and one line goes to the ops alert outbox.
+        A forced same-state DONE -> DONE / IGNORED -> IGNORED rewrites the reason text
+        (review fix 2026-11-25 [minor-3](b)).
+        A forced commit to FAILED from any terminal state (DONE / IGNORED / FAILED)
+        settles as FAILED: the retry rules below are skipped (retry_count unchanged),
+        so force is never a way around requeue (review fix 2026-11-25 [major-1]).
+
+    Commit the final or retry state of an event:
+      - DONE / IGNORED: transitions status directly to DONE or IGNORED and clears wait timestamps.
+      - FAILED (with pre_post_check_unverifiable): treated as an API wait rather than a post failure.
+        Does NOT consume retry_count. Instead, keeps status='PENDING' and sets next_retry_at in the
+        future (stepped 2/5/15/30/60 min by time since the first failure) so the existing
+        30-second dispatcher naturally skips it until the wait
+        elapses and then re-dispatches it to the agent without needing a separate state-transition daemon.
+        If >= 24 hours have elapsed since first_unverifiable_at and history is still unreadable,
+        transitions permanently to FAILED (abandoned).
+      - FAILED (other errors): increments retry_count and clears first_unverifiable_at;
+        if retry_count < max_retries (3), reverts status to PENDING for retry; if
+        retry_count >= max_retries (3), transitions status permanently to FAILED (DLQ).
+    """
+    params = _resolve_commit_params(status, force, reason, now, retry_wait_seconds, expire_seconds)
+    status = params["status"]
+
+    init_db(db_path)
+    with get_db_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            result, decision, current_status = _commit_event_in_tx(
+                conn, event_id, params, error_message, max_retries, force, reason
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        if decision in ("noop", "reject"):
+            conn.rollback()
+        else:
+            conn.commit()
+    _report_commit_outcome(
+        result, decision, current_status, event_id, status, error_message, reason, source, Path(db_path)
+    )
     return result
 
 
@@ -1546,6 +1621,156 @@ def cmd_prune_replies(args: argparse.Namespace) -> int:
         return 1
 
 
+TRIAGE_LOG_FILENAME = "triage_log.jsonl"
+DEFAULT_STATE_FILE_RETENTION_DAYS = 7
+
+
+def append_triage_log(entry: Any, db_path: Path = DEFAULT_DB_PATH) -> Dict[str, Any]:
+    """Append one triage decision to state/triage_log.jsonl (review fix 2026-11-25
+    [mid-3], candidate 32). The agents used to append ad hoc; a missing trailing
+    newline glued the next record on as `}{` (4 of 764 lines were broken that way).
+    Here: the entry must be a JSON object with a non-empty event_id; it is written as
+    one compact line under an exclusive flock; if the file does not end with "\\n"
+    (a torn earlier write) one is added first; then flush + fsync."""
+    import fcntl
+
+    if isinstance(entry, str):
+        entry = json.loads(entry)
+    if not isinstance(entry, dict):
+        raise ValueError("triage-log entry must be a JSON object")
+    if not str(entry.get("event_id") or "").strip():
+        raise ValueError("triage-log entry needs a non-empty event_id")
+    entry = dict(entry)
+    entry.setdefault("logged_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    path = Path(db_path).parent / TRIAGE_LOG_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    repaired = False
+    with open(path, "a+b") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0, os.SEEK_END)
+            if f.tell() > 0:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    f.seek(0, os.SEEK_END)
+                    f.write(b"\n")
+                    repaired = True
+            f.seek(0, os.SEEK_END)
+            f.write(line.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return {"ok": True, "path": str(path), "event_id": entry["event_id"], "repaired_missing_newline": repaired}
+
+
+def cmd_triage_log(args: argparse.Namespace) -> int:
+    try:
+        if args.json is not None and args.file is not None:
+            raise ValueError("use only one of --json / --file")
+        if args.json is not None:
+            raw = args.json
+        elif args.file is not None:
+            raw = Path(args.file).read_text(encoding="utf-8")
+        else:
+            raw = sys.stdin.read()
+        result = append_triage_log(json.loads(raw), db_path=Path(args.db))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+def prune_state_files(
+    days: int = DEFAULT_STATE_FILE_RETENTION_DAYS,
+    dry_run: bool = False,
+    db_path: Path = DEFAULT_DB_PATH,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Delete old working files in state/ (review fix 2026-11-25 [mid-7], candidate 23):
+      - reply-<event_id>.txt: only when that event is DONE and was settled (updated_at)
+        at least `days` ago, and the file itself was not touched for `days`.
+        FAILED / PENDING / PROCESSING / IGNORED / unknown events keep their draft
+        (FAILED drafts are evidence for reconcile and a later retry).
+      - decisions-*.json (commit-batch inputs): file mtime older than `days`.
+    Never touches anything else."""
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    db_path = Path(db_path)
+    state_dir = db_path.parent
+    now_ts = time.time() if now is None else float(now)
+    cutoff_ts = now_ts - days * 86400
+    cutoff_dt = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc)
+    deleted_replies: List[str] = []
+    deleted_decisions: List[str] = []
+    kept_not_done = 0
+    errors: List[str] = []
+
+    reply_files = sorted(state_dir.glob("reply-*.txt"))
+    statuses: Dict[str, Tuple[str, Any]] = {}
+    if reply_files and db_path.exists():
+        with get_db_connection(db_path) as conn:
+            for f in reply_files:
+                eid = f.name[len("reply-"):-len(".txt")]
+                row = conn.execute(
+                    "SELECT status, updated_at FROM events WHERE event_id = ?", (eid,)
+                ).fetchone()
+                if row is not None:
+                    statuses[eid] = (str(row["status"] or "").upper(), row["updated_at"])
+    for f in reply_files:
+        eid = f.name[len("reply-"):-len(".txt")]
+        status, updated_at = statuses.get(eid, ("", None))
+        settled = _parse_reply_created_at(updated_at)
+        try:
+            old_file = f.stat().st_mtime < cutoff_ts
+        except OSError:
+            continue
+        if status != "DONE" or settled is None or settled >= cutoff_dt or not old_file:
+            if status != "DONE":
+                kept_not_done += 1
+            continue
+        if not dry_run:
+            try:
+                f.unlink()
+            except OSError as exc:
+                errors.append(f"{f.name}: {exc}")
+                continue
+        deleted_replies.append(f.name)
+
+    for f in sorted(state_dir.glob("decisions-*.json")):
+        try:
+            if f.stat().st_mtime >= cutoff_ts:
+                continue
+            if not dry_run:
+                f.unlink()
+        except OSError as exc:
+            errors.append(f"{f.name}: {exc}")
+            continue
+        deleted_decisions.append(f.name)
+
+    return {
+        "ok": not errors,
+        "dry_run": bool(dry_run),
+        "days": int(days),
+        "deleted_reply_drafts": len(deleted_replies),
+        "deleted_decision_files": len(deleted_decisions),
+        "kept_reply_drafts_not_done": kept_not_done,
+        "errors": errors[:20],
+    }
+
+
+def cmd_prune_state_files(args: argparse.Namespace) -> int:
+    try:
+        result = prune_state_files(days=args.days, dry_run=bool(args.dry_run), db_path=Path(args.db))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result["ok"] else 1
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
 def _compute_thread_scan_oldest(
     thread_ts: str,
     event_ts: Optional[str] = None,
@@ -1852,12 +2077,17 @@ def _save_event_intended_text(
     intended_text: str,
     db_path: Path = DEFAULT_DB_PATH,
     attempt_ts: Optional[Any] = None,
-) -> None:
+) -> bool:
     """Save the final post_text sent to chat.postMessage into events.intended_text
     and the attempt timestamp into events.attempt_ts when a reply post results in
-    ambiguous_post_outcome."""
+    ambiguous_post_outcome.
+
+    Review fix 2026-11-25 [minor-3](c): a row that is already DONE / IGNORED is not
+    touched (the settled row keeps its intended_text / attempt_ts / updated_at).
+    FAILED rows are still updated so reconcile-replies can find a landed reply and
+    failed_with_landed_reply can report it. Returns True when a row was updated."""
     if not event_id:
-        return
+        return False
     db_path = Path(db_path)
     init_db(db_path)
     parsed_attempt = _parse_attempt_ts(attempt_ts)
@@ -1867,17 +2097,19 @@ def _save_event_intended_text(
         else f"{time.time():.6f}"
     )
     with get_db_connection(db_path) as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE events
             SET intended_text = ?,
                 attempt_ts = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE event_id = ?
+              AND UPPER(COALESCE(status, '')) NOT IN ('DONE', 'IGNORED')
             """,
             (intended_text, attempt_ts_str, event_id),
         )
         conn.commit()
+        return cur.rowcount > 0
 
 
 def _normalize_reconcile_text(text: Any) -> str:
@@ -2579,22 +2811,25 @@ def _find_answering_message_in_thread(
     bot_ts_set: Optional[Set[str]] = None,
     min_text_length: int = ANSWERED_MIN_TEXT_LENGTH,
 ) -> Optional[Dict[str, Any]]:
-    """Conservative answered check over thread messages:
+    """Answered check over thread messages, matching the hook definition
+    (slack-yama-dispatch.json: "a post with body text by someone other than the
+    questioner and Yama, bots included"; review fix 2026-11-25 [mid-1]).
     Returns the first message strictly after parent_ts that satisfies ALL of:
-      1. Poster is neither the original questioner nor Yama itself
-      2. Not a bot message (excludes bot_id / subtype=bot_message / is_bot equivalents)
-      3. Stripped body text length > min_text_length (10 chars)"""
+      1. Poster (user) is neither the original questioner nor Yama itself.
+         Bot posts count as answers (bot_ts_set is accepted for compatibility
+         but no longer excludes anything).
+      2. subtype is None, file_share or thread_broadcast (unchanged)
+      3. Stripped body text length > min_text_length (default 0, i.e. at least
+         one non-whitespace character)"""
+    del bot_ts_set  # kept in the signature for callers; bots are not excluded
     effective_questioners = set(questioner_user_ids)
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         if str(msg.get("ts") or "") == str(parent_ts):
             parent_user = str(msg.get("user") or "").strip()
-            if (
-                parent_user
-                and parent_user not in yama_user_ids
-                and not _is_bot_message(msg, bot_ts_set)
-            ):
+            # The poster of the parent is the questioner even when it is a bot.
+            if parent_user and parent_user not in yama_user_ids:
                 effective_questioners.add(parent_user)
 
     for msg in messages:
@@ -2605,8 +2840,6 @@ def _find_answering_message_in_thread(
             continue
         subtype = msg.get("subtype")
         if subtype is not None and subtype not in ("file_share", "thread_broadcast"):
-            continue
-        if _is_bot_message(msg, bot_ts_set):
             continue
         msg_user = str(msg.get("user") or "").strip()
         if not msg_user:
@@ -3225,16 +3458,23 @@ def cmd_reply(args: argparse.Namespace) -> int:
             print(json.dumps(output, ensure_ascii=False, indent=2))
             return 0
 
+        intended_saved: Optional[bool] = None
         if event_id:
             try:
-                _save_event_intended_text(
+                intended_saved = _save_event_intended_text(
                     event_id=event_id,
                     intended_text=post_text,
                     db_path=db_path,
                     attempt_ts=attempt_epoch,
                 )
-            except Exception:
-                pass
+            except Exception as save_exc:
+                # review fix 2026-11-25 [minor-3](c): no silent discard. Without
+                # intended_text, reconcile can only match by metadata, so say so.
+                intended_saved = False
+                print(
+                    f"[reply] WARN intended_text_save_failed: event {event_id}: {save_exc}",
+                    file=sys.stderr,
+                )
 
         ambiguous_err: Dict[str, Any] = {
             "ok": False,
@@ -3245,6 +3485,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
         }
         if event_id:
             ambiguous_err["event_id"] = event_id
+            ambiguous_err["intended_text_saved"] = bool(intended_saved)
         if recovery_error is not None:
             ambiguous_err["recovery_error"] = str(recovery_error)
         print(json.dumps(ambiguous_err, ensure_ascii=False, indent=2), file=sys.stderr)
@@ -3660,9 +3901,10 @@ def commit_batch(
     unknown, or would be rejected by the terminal guard (DONE/IGNORED -> another
     status, FAILED -> anything, without force+reason), nothing is committed. A
     same-status item on DONE/IGNORED passes validation and becomes a no-op. Each valid
-    item then goes through commit_event() (same semantics as `commit`, including the
-    unverifiable wait for FAILED); commit_event re-checks the status, so a change
-    between validation and write is still caught."""
+    item then goes through the commit_event core (same semantics as `commit`,
+    including the unverifiable wait for FAILED), all in one transaction: the status
+    is re-checked inside it, and if any item is rejected there (changed since
+    validation) or fails, the whole batch is rolled back ("rolled_back": true)."""
     problems: List[str] = []
     seen: Set[str] = set()
     terminal_rejects: List[Dict[str, Any]] = []
@@ -3727,21 +3969,39 @@ def commit_batch(
             out[COMMIT_REJECTED_CODE] = [r["event_id"] for r in terminal_rejects]
         return out
 
+    # Write phase (review fix 2026-11-25 [minor-3](d)): all items in ONE
+    # BEGIN IMMEDIATE transaction, so the batch is all-or-nothing on write too.
+    # If any item is rejected by the in-transaction re-check (changed since
+    # validation) or raises, everything is rolled back and nothing is committed.
+    # Side effects (stderr / ops alerts) run only after the commit.
+    try:
+        prepared = [
+            (eid, status, err, force, reason,
+             _resolve_commit_params(status, force, reason, None, None, None))
+            for eid, status, err, force, reason in normalized
+        ]
+    except Exception as exc:
+        return {"ok": False, "committed": 0, "errors": [str(exc)]}
+
     results: List[Dict[str, Any]] = []
+    outcomes: List[Tuple[Dict[str, Any], str, str, str, str, Optional[str], Optional[str]]] = []
     failures = 0
     noops = 0
-    for eid, status, err, force, reason in normalized:
-        try:
-            updated = commit_event(
-                event_id=eid,
-                status=status,
-                error_message=err,
-                db_path=db_path,
-                force=force,
-                reason=reason,
-                source="commit-batch",
-            )
-            if updated.get("rejected"):
+    rolled_back = False
+    init_db(db_path)
+    with get_db_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        for eid, status, err, force, reason, params in prepared:
+            try:
+                updated, decision, cur = _commit_event_in_tx(
+                    conn, eid, params, err, MAX_RETRIES, force, reason
+                )
+            except Exception as exc:
+                failures += 1
+                results.append({"event_id": eid, "ok": False, "error": str(exc)})
+                continue
+            outcomes.append((updated, decision, cur, eid, status, err, reason))
+            if decision == "reject":
                 failures += 1
                 results.append(
                     {
@@ -3754,20 +4014,50 @@ def commit_batch(
                 )
                 continue
             entry: Dict[str, Any] = {"event_id": eid, "ok": True, "status": updated.get("status")}
-            if updated.get("noop"):
+            if decision == "noop":
                 entry["noop"] = True
                 noops += 1
-            if updated.get("forced"):
+            if decision == "force":
                 entry["forced"] = True
             results.append(entry)
-        except Exception as exc:
-            failures += 1
-            results.append({"event_id": eid, "ok": False, "error": str(exc)})
+        if failures:
+            conn.rollback()
+            rolled_back = True
+        else:
+            conn.commit()
+
+    if rolled_back:
+        # Report only the rejections (the rows really are terminal); forced or
+        # applied items were rolled back, so they write no alert.
+        for updated, decision, cur, eid, status, err, reason in outcomes:
+            if decision == "reject":
+                _report_commit_outcome(
+                    updated, decision, cur, eid, status, err, reason, "commit-batch", Path(db_path)
+                )
+        for entry in results:
+            if entry.get("ok"):
+                entry["ok"] = False
+                entry["rolled_back"] = True
+                entry.pop("forced", None)
+                entry.pop("noop", None)
+        return {
+            "ok": False,
+            "committed": 0,
+            "noop": 0,
+            "failed": failures,
+            "rolled_back": True,
+            "results": results,
+        }
+
+    for updated, decision, cur, eid, status, err, reason in outcomes:
+        _report_commit_outcome(
+            updated, decision, cur, eid, status, err, reason, "commit-batch", Path(db_path)
+        )
     return {
-        "ok": failures == 0,
-        "committed": len(results) - failures - noops,
+        "ok": True,
+        "committed": len(results) - noops,
         "noop": noops,
-        "failed": failures,
+        "failed": 0,
         "results": results,
     }
 
@@ -4263,6 +4553,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     p_prune.set_defaults(func=cmd_prune_replies)
+
+    # triage-log (review fix 2026-11-25 [mid-3])
+    p_tlog = subparsers.add_parser(
+        "triage-log",
+        help="Append one triage decision (JSON object with event_id) to state/triage_log.jsonl",
+    )
+    p_tlog.add_argument("--json", default=None, help="The entry as a JSON object string")
+    p_tlog.add_argument("--file", default=None, help="Read the JSON object from this file (default: stdin)")
+    p_tlog.add_argument("--db", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_tlog.set_defaults(func=cmd_triage_log)
+
+    # prune-state-files (review fix 2026-11-25 [mid-7])
+    p_psf = subparsers.add_parser(
+        "prune-state-files",
+        help="Delete reply-*.txt of events DONE for N days and decisions-*.json older than N days",
+    )
+    p_psf.add_argument("--days", type=int, default=DEFAULT_STATE_FILE_RETENTION_DAYS)
+    p_psf.add_argument("--dry-run", action="store_true")
+    p_psf.add_argument("--db", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_psf.set_defaults(func=cmd_prune_state_files)
 
     # react
     p_react = subparsers.add_parser("react", help="Add an emoji reaction to a message")

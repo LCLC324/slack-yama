@@ -27,7 +27,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -156,6 +156,68 @@ def write_last_status(
 
 def empty_state() -> Dict[str, List[str]]:
     return {"known_member": [], "opted_out": []}
+
+
+OPS_ALERTS_FILENAME = "ops_alerts.jsonl"
+STATE_ERROR_ALERT_MARKER = "auto_join_state_error_alerted"
+
+
+def _ops_alerts_path_for(state_path: Path) -> Path:
+    env_path = os.environ.get("YAMA_OPS_ALERTS_PATH", "").strip()
+    return Path(env_path) if env_path else Path(state_path).parent / OPS_ALERTS_FILENAME
+
+
+def _append_ops_alert_line(entry: Dict[str, Any], state_path: Path) -> bool:
+    """One JSON line to the ops alert outbox (same format/flock as
+    ops_monitor.outbox_append). Never raises."""
+    import fcntl
+
+    path = _ops_alerts_path_for(state_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return True
+    except Exception as exc:
+        _log(f"error: could not write ops alert ({entry.get('kind')}): {exc}")
+        return False
+
+
+def _state_error_alert_edge(state_path: Path, failed: bool, detail: str = "") -> None:
+    """Review fix 2026-11-25 [mid-5]: a StateLoadError (main and .bak both unreadable,
+    auto-join stopped) writes ONE line to ops_alerts.jsonl per episode (a marker file
+    next to the state suppresses repeats every 5 minutes); the first good load after
+    that writes one recovered line and removes the marker."""
+    marker = Path(state_path).parent / STATE_ERROR_ALERT_MARKER
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if failed:
+        if marker.exists():
+            return
+        if _append_ops_alert_line(
+            {"kind": "auto_join_state_error", "source": "auto_join.py",
+             "error": detail[:300], "at": now_iso},
+            state_path,
+        ):
+            try:
+                marker.write_text(now_iso + "\n", encoding="utf-8")
+            except Exception:
+                pass
+    elif marker.exists():
+        if _append_ops_alert_line(
+            {"kind": "auto_join_state_error_recovered", "source": "auto_join.py", "at": now_iso},
+            state_path,
+        ):
+            try:
+                marker.unlink()
+            except Exception:
+                pass
 
 
 class StateLoadError(RuntimeError):
@@ -523,7 +585,11 @@ def run_auto_join(
         _log(f"error: {exc}; auto-join aborted")
         summary["errors"] += 1
         summary["state_error"] = True
+        if not dry_run:
+            _state_error_alert_edge(state_path, True, str(exc))
         return _finish()
+    if not dry_run:
+        _state_error_alert_edge(state_path, False)
     if load_source == "bak":
         if dry_run:
             _log("dry-run: state main file unreadable; would restore from .bak backup")

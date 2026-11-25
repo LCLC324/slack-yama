@@ -30,6 +30,8 @@ from listener import (
     get_db_connection,
     init_db,
     load_env_file,
+    record_message_edit,
+    record_own_message,
     save_event,
     should_ignore_event,
 )
@@ -172,6 +174,7 @@ def backfill_channel(
         )
 
     collected_messages: List[Dict[str, Any]] = list(history_messages)
+    reply_errors = 0
 
     for msg in history_messages:
         try:
@@ -192,14 +195,12 @@ def backfill_channel(
                     if cursor:
                         replies_kwargs["cursor"] = cursor
 
+                    # Review fix 2026-11-25 [mid-6] (candidate 29(b)): no TypeError
+                    # fallback that silently drops oldest/cursor (it re-read page 1 up
+                    # to THREAD_REPLIES_MAX_PAGES times and hid unrelated TypeErrors);
+                    # same as agent_tools since candidate 28.
                     def _do_replies_call(kw: Dict[str, Any] = replies_kwargs) -> Any:
-                        try:
-                            return client.conversations_replies(**kw)
-                        except TypeError:
-                            fallback_kw = {
-                                k: v for k, v in kw.items() if k in ("channel", "ts", "limit")
-                            }
-                            return client.conversations_replies(**fallback_kw)
+                        return client.conversations_replies(**kw)
 
                     replies_resp = _call_with_retry(
                         _do_replies_call,
@@ -219,6 +220,7 @@ def backfill_channel(
                         break
                     cursor = next_cursor
             except Exception as exc:
+                reply_errors += 1
                 print(
                     f"[backfill] Failed conversations_replies for channel={channel_id} ts={parent_ts}: {exc}",
                     file=sys.stderr,
@@ -231,11 +233,14 @@ def backfill_channel(
             return 0.0
 
     collected_messages.sort(key=_ts_sort_key)
+    if page_info is not None and reply_errors:
+        page_info["reply_errors"] = reply_errors
 
     inserted_count = 0
     for msg in collected_messages:
         if not isinstance(msg, dict):
             continue
+        _mirror_backfilled_message(msg, channel_id, bot_user_id, db_path)
         event = message_to_event(msg, channel_id)
         ignore, _reason = should_ignore_event(
             event,
@@ -260,6 +265,28 @@ def backfill_channel(
             inserted_count += 1
 
     return inserted_count
+
+
+def _mirror_backfilled_message(
+    msg: Dict[str, Any], channel_id: str, bot_user_id: Optional[str], db_path: Path
+) -> None:
+    """Keep the local thread mirror (mirror_messages / message_edits) complete for
+    what backfill reads anyway: Yama's own posts (missed while the listener was
+    down) and the current text of edited messages. Mirror only; never an event.
+    Best-effort: a failure here never affects backfill."""
+    try:
+        ts = msg.get("ts")
+        if not ts:
+            return
+        if bot_user_id and msg.get("user") == bot_user_id:
+            record_own_message(
+                channel_id, ts, msg.get("thread_ts"), msg.get("text"),
+                user_id=bot_user_id, source="backfill", db_path=db_path,
+            )
+        if msg.get("edited"):
+            record_message_edit(channel_id, ts, msg.get("text"), db_path=db_path)
+    except Exception as exc:
+        print(f"[backfill] mirror update failed (ignored): {exc}", file=sys.stderr)
 
 
 def _ops_alerts_path(db_path: Path) -> Path:
@@ -364,6 +391,7 @@ def run_backfill(
         "truncated": [],
     }
     page_infos: Dict[str, Dict[str, Any]] = {}
+    errors: List[str] = []
 
     try:
         load_env_file(env_path)
@@ -401,6 +429,7 @@ def run_backfill(
                 channels_map[channel_id] = ch_inserted
                 total_inserted += ch_inserted
             except Exception as ch_exc:
+                errors.append(f"channel {channel_id}: {ch_exc}")
                 print(
                     f"[backfill] Error processing channel {channel_id}: {ch_exc}",
                     file=sys.stderr,
@@ -412,9 +441,38 @@ def run_backfill(
         except Exception as trunc_exc:
             print(f"[backfill] ERROR: truncation alert update failed: {trunc_exc}", file=sys.stderr)
     except Exception as exc:
+        errors.append(f"fatal: {exc}")
         print(f"[backfill] Fatal error: {exc}", file=sys.stderr)
 
+    for ch_id, info in page_infos.items():
+        if info.get("reply_errors"):
+            errors.append(f"channel {ch_id}: {info['reply_errors']} thread read error(s)")
+    write_backfill_status(db_path, ok=not errors, errors=errors)
     return result
+
+
+BACKFILL_STATUS_FILENAME = "backfill_last_status.json"
+
+
+def write_backfill_status(db_path: Path, ok: bool, errors: List[str]) -> None:
+    """Record the outcome of the last backfill run (state/backfill_last_status.json).
+    The dispatcher's context bundling reads it: if the last backfill failed, posts
+    missed by the listener may be absent locally, so bundled context is marked
+    incomplete and the worker reads Slack instead. Best-effort, atomic replace."""
+    try:
+        path = Path(db_path).parent / BACKFILL_STATUS_FILENAME
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(
+                {"at": time.time(), "ok": bool(ok), "errors": [str(e)[:300] for e in errors[:10]]},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception as exc:
+        print(f"[backfill] could not write status file (ignored): {exc}", file=sys.stderr)
 
 
 def build_parser() -> argparse.ArgumentParser:
