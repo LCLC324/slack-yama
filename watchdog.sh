@@ -58,6 +58,20 @@ fi
 BOOT_ID_PATH="${YAMA_BOOT_ID_PATH:-/proc/sys/kernel/random/boot_id}"
 UPTIME_SINCE_CMD="${YAMA_UPTIME_SINCE_CMD:-uptime -s}"
 BOOT_STATE_PATH="${YAMA_BOOT_STATE_PATH:-${STATE_DIR}/last_boot_id}"
+OPS_MONITOR_PY="${YAMA_OPS_MONITOR_PY:-${BASE_DIR}/ops_monitor.py}"
+OPS_ALERTS_PATH="${YAMA_OPS_ALERTS_PATH:-${STATE_DIR}/ops_alerts.jsonl}"
+
+emit_ops_alert() {
+    local kind="$1"
+    local detail="${2:-}"
+    [[ -n "${detail}" ]] || detail="{}"
+    if [[ -f "${OPS_MONITOR_PY}" ]]; then
+        "${PYTHON_BIN}" "${OPS_MONITOR_PY}" outbox-append \
+            --path "${OPS_ALERTS_PATH}" \
+            --kind "${kind}" \
+            --detail "${detail}" >/dev/null 2>&1 || true
+    fi
+}
 
 mkdir -p "${STATE_DIR}"
 
@@ -241,6 +255,9 @@ reinstall_and_restart_unit() {
         cur_attempts="$(echo "${gate_status}" | cut -d: -f2)"
         max_attempts="$(echo "${gate_status}" | cut -d: -f3)"
         log_msg "[ERROR] Unit reinstall skipped: max attempts reached (${cur_attempts}/${max_attempts}, state=${REINSTALL_STATE_PATH})"
+        local _wd_detail
+        _wd_detail="$(jq -c -n --arg a "${cur_attempts}" --arg m "${max_attempts}" '{"source": "watchdog.sh", "attempts": $a, "max_attempts": $m}' 2>/dev/null || echo '{"source": "watchdog.sh"}')"
+        emit_ops_alert "watchdog_reinstall_max_reached" "${_wd_detail}"
         return "${initial_rc}"
     fi
 
@@ -315,6 +332,9 @@ reinstall_and_restart_unit() {
     else
         retry_rc=$?
         log_msg "[ERROR] Restart retry after unit reinstall failed (${attempt_num}/${REINSTALL_MAX}, exit=${retry_rc}): ${retry_out}"
+        local _wd_detail
+        _wd_detail="$(jq -c -n --argjson rc "${retry_rc}" --arg o "${retry_out:0:300}" '{"source": "watchdog.sh", "phase": "reinstall_retry", "exit_code": $rc, "output": $o}' 2>/dev/null || echo '{"source": "watchdog.sh"}')"
+        emit_ops_alert "watchdog_restart_failed" "${_wd_detail}"
         return "${retry_rc}"
     fi
 }
@@ -398,6 +418,9 @@ restart_listener() {
             reinstall_and_restart_unit "${rc}"
             return $?
         fi
+        local _wd_detail
+        _wd_detail="$(jq -c -n --argjson rc "${rc}" --arg o "${output:0:300}" --arg r "${reason}" '{"source": "watchdog.sh", "phase": "restart", "exit_code": $rc, "reason": $r, "output": $o}' 2>/dev/null || echo '{"source": "watchdog.sh"}')"
+        emit_ops_alert "watchdog_restart_failed" "${_wd_detail}"
         return "${rc}"
     fi
 }

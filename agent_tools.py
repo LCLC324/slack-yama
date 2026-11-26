@@ -4,13 +4,17 @@ Yama Agent Tools CLI (Layer 3)
 Subcommands for the awakened autonomous agent:
   - pending
   - history --channel X [--thread-ts Y] [--limit N]
+  - event-text --event-id E   (print full stored text of an event)
   - reply --channel X --text-file F [--thread-ts Y] (--event-id E | --no-event-id)
       [--force --reason TEXT]   (exactly one of --event-id / --no-event-id is required;
-      --event-id must exist in the events table unless --force --reason)
+      --event-id must exist in the events table and not be terminal without a recorded
+      reply unless --force --reason; blocked in shadow mode)
   - record-reply --event-id E --channel X --reply-ts T --text-file F [--thread-ts Y]
   - reconcile-replies [--days 7] [--dry-run]
   - prune-replies [--days 90] [--dry-run]
-  - react --channel X --ts T --emoji eyes
+  - triage-log (--json JSON | --file PATH)   (append one validated JSONL line to state/triage_log.jsonl)
+  - prune-state-files [--days 7] [--dry-run]   (delete old DONE reply drafts and decisions-*.json)
+  - react --channel X --ts T --emoji eyes   (blocked in shadow mode)
   - commit --event-id E --status DONE|IGNORED|FAILED [--error MSG] [--force --reason TEXT]
       (terminal guard: DONE/IGNORED same status = no-op, other status / FAILED = already_terminal)
   - commit-batch --file decisions.json   (several commits at once; all-or-nothing validation)
@@ -903,7 +907,7 @@ def get_mode(mode_path: Path = DEFAULT_MODE_PATH) -> str:
     if not mode_path.exists():
         return "shadow"
     content = mode_path.read_text(encoding="utf-8").strip().lower()
-    return content if content else "shadow"
+    return content if content in VALID_MODES else "shadow"
 
 
 def cmd_pending(args: argparse.Namespace) -> int:
@@ -2016,7 +2020,24 @@ def _scan_thread_yama_messages(
         if not next_cursor or has_more is False:
             break
         if page >= THREAD_REPLIES_MAX_PAGES:
-            break
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "warning": "thread_replies_page_limit_reached",
+                        "channel": channel,
+                        "thread_ts": parent_ts,
+                        "max_pages": THREAD_REPLIES_MAX_PAGES,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            raise RuntimeError(
+                "thread_scan_truncated: thread replies exceed "
+                f"{THREAD_REPLIES_MAX_PAGES} pages x {THREAD_REPLIES_PAGE_LIMIT} after the "
+                "scan start; refusing to treat thread as fully scanned"
+            )
         cursor = next_cursor
 
     def _ts_key(m: Dict[str, Any]) -> float:
@@ -2815,10 +2836,10 @@ def _find_answering_message_in_thread(
     (slack-yama-dispatch.json: "a post with body text by someone other than the
     questioner and Yama, bots included"; review fix 2026-11-25 [mid-1]).
     Returns the first message strictly after parent_ts that satisfies ALL of:
-      1. Poster (user) is neither the original questioner nor Yama itself.
-         Bot posts count as answers (bot_ts_set is accepted for compatibility
-         but no longer excludes anything).
-      2. subtype is None, file_share or thread_broadcast (unchanged)
+      1. Poster (user or bot_id) is neither the original questioner nor Yama itself.
+         Bot posts (including subtype="bot_message") count as answers (bot_ts_set
+         is accepted for compatibility but no longer excludes anything).
+      2. subtype is None, file_share, thread_broadcast, or bot_message
       3. Stripped body text length > min_text_length (default 0, i.e. at least
          one non-whitespace character)"""
     del bot_ts_set  # kept in the signature for callers; bots are not excluded
@@ -2827,7 +2848,7 @@ def _find_answering_message_in_thread(
         if not isinstance(msg, dict):
             continue
         if str(msg.get("ts") or "") == str(parent_ts):
-            parent_user = str(msg.get("user") or "").strip()
+            parent_user = str(msg.get("user") or msg.get("bot_id") or "").strip()
             # The poster of the parent is the questioner even when it is a bot.
             if parent_user and parent_user not in yama_user_ids:
                 effective_questioners.add(parent_user)
@@ -2839,9 +2860,9 @@ def _find_answering_message_in_thread(
         if not msg_ts or not _is_ts_after(msg_ts, parent_ts):
             continue
         subtype = msg.get("subtype")
-        if subtype is not None and subtype not in ("file_share", "thread_broadcast"):
+        if subtype is not None and subtype not in ("file_share", "thread_broadcast", "bot_message"):
             continue
-        msg_user = str(msg.get("user") or "").strip()
+        msg_user = str(msg.get("user") or msg.get("bot_id") or "").strip()
         if not msg_user:
             continue
         if msg_user in effective_questioners or msg_user in yama_user_ids:
@@ -2874,7 +2895,7 @@ def _pre_post_check_thread_for_reply(
     for full-thread scan, using pagination with per-page retry)
     to check:
       1. Whether Yama's own identical message (matching metadata event_id, raw_text, or post_text) already exists
-      2. If is_delayed_retry is True, whether a qualifying answer from another human user exists
+      2. If is_delayed_retry is True, whether a qualifying answer from another user (including other bots) exists
     For delayed retries the scan is capped at a single page of ANSWERED_CHECK_PAGE_LIMIT
     replies; if more replies remain beyond that page and no qualifying answer was found,
     RuntimeError is raised so the caller fails closed (pre_post_check_unverifiable).
@@ -2973,7 +2994,12 @@ def _pre_post_check_thread_for_reply(
                 ),
                 file=sys.stderr,
             )
-            break
+            raise RuntimeError(
+                "thread_scan_truncated: thread replies exceed "
+                f"{THREAD_REPLIES_MAX_PAGES} pages x {THREAD_REPLIES_PAGE_LIMIT} after the "
+                "scan start and no own reply was found in the checked range; "
+                "refusing to post (fail-closed)"
+            )
         cursor = next_cursor
 
     if not is_delayed_retry:
@@ -2982,7 +3008,6 @@ def _pre_post_check_thread_for_reply(
     questioner_uids: Set[str] = set()
     if questioner_user_id and str(questioner_user_id).strip():
         questioner_uids.add(str(questioner_user_id).strip())
-    bot_ts_set = _get_channel_bot_ts_set(channel, db_path=db_path)
 
     answered_baseline_ts = (
         str(event_ts)
@@ -2994,7 +3019,6 @@ def _pre_post_check_thread_for_reply(
         parent_ts=answered_baseline_ts,
         questioner_user_ids=questioner_uids,
         yama_user_ids=yama_user_ids,
-        bot_ts_set=bot_ts_set,
         min_text_length=ANSWERED_MIN_TEXT_LENGTH,
     )
     if answered_msg is not None:
@@ -3045,6 +3069,9 @@ def check_reply_event_id_choice(
         err: Dict[str, Any] = {"ok": False, "error": code, "message": message}
         if event_id:
             err["event_id"] = event_id
+        for k, v in extra.items():
+            if v is not None and k not in err:
+                err[k] = v
         return None, err, False
 
     if has_id_flag and no_event_id:
@@ -3075,7 +3102,33 @@ def check_reply_event_id_choice(
             "force_requires_reason",
             "--force requires a non-empty --reason.",
         )
-    if get_event_by_id(event_id, db_path=db_path) is not None:
+    event_row = get_event_by_id(event_id, db_path=db_path)
+    if event_row is not None:
+        cur_status = str(event_row.get("status") or "").upper()
+        if (
+            cur_status in TERMINAL_STATUSES
+            and get_recorded_reply(event_id, db_path=db_path) is None
+        ):
+            if not force:
+                return _refuse(
+                    "event_already_terminal",
+                    f"event_id {event_id} is already in terminal status {cur_status} "
+                    "with no recorded reply. Nothing was posted. "
+                    "To post anyway use --force --reason <text>.",
+                    current_status=cur_status,
+                )
+            _reply_guard_alert(
+                "reply_forced",
+                {
+                    "reason": str(reason).strip()[:300],
+                    "event_id": event_id,
+                    "channel": channel,
+                    "forced_check": "event_already_terminal",
+                    "current_status": cur_status,
+                },
+                db_path,
+            )
+            return event_id, None, True
         return event_id, None, False
     if not force:
         return _refuse(
@@ -3098,8 +3151,32 @@ def check_reply_event_id_choice(
 
 def cmd_reply(args: argparse.Namespace) -> int:
     db_path = Path(getattr(args, "db", DEFAULT_DB_PATH))
-    # A forced unknown event_id is recorded as a reply_forced ops alert (stderr stays
-    # reserved for the single JSON error object callers parse).
+    mode_path = Path(getattr(args, "mode_file", DEFAULT_MODE_PATH))
+    if get_mode(mode_path) == "shadow":
+        _reply_guard_alert(
+            "reply_rejected",
+            {
+                "reason": "shadow_mode_blocked",
+                "event_id": getattr(args, "event_id", None),
+                "channel": getattr(args, "channel", None),
+            },
+            db_path,
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "shadow_mode_blocked",
+                    "message": "Current mode is shadow; posting to Slack is disabled.",
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    # A forced unknown/terminal event_id is recorded as a reply_forced ops alert
+    # (stderr stays reserved for the single JSON error object callers parse).
     event_id, guard_err, _forced_unknown_event = check_reply_event_id_choice(
         event_id_arg=getattr(args, "event_id", None),
         no_event_id=bool(getattr(args, "no_event_id", False)),
@@ -3129,6 +3206,20 @@ def cmd_reply(args: argparse.Namespace) -> int:
         return 1
 
     event_row = get_event_by_id(event_id, db_path=db_path) if event_id else None
+    if event_id and event_row is not None and not args.thread_ts:
+        expected_thread_ts = str(event_row.get("thread_ts") or event_row.get("ts") or "").strip()
+        if expected_thread_ts:
+            print(
+                json.dumps(
+                    {
+                        "warning": "missing_thread_ts_for_event_reply",
+                        "event_id": event_id,
+                        "expected_thread_ts": expected_thread_ts,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
     event_ts: Optional[str] = (
         str(event_row["ts"])
         if (event_row is not None and event_row.get("ts") is not None)
@@ -3788,6 +3879,20 @@ def _find_own_recent_message(
 
 
 def cmd_react(args: argparse.Namespace) -> int:
+    mode_path = Path(getattr(args, "mode_file", DEFAULT_MODE_PATH))
+    if get_mode(mode_path) == "shadow":
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "shadow_mode_blocked",
+                    "message": "Current mode is shadow; reacting on Slack is disabled.",
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     emoji_name = args.emoji.strip(":")
     try:
         client = get_web_client()

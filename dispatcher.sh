@@ -138,10 +138,11 @@ def append_ops_alert(entry):
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+VALID_MODES = ("shadow", "mention", "full")
 mode = "shadow"
 if mode_file.exists():
-    raw_mode = mode_file.read_text(encoding="utf-8").strip()
-    if raw_mode:
+    raw_mode = mode_file.read_text(encoding="utf-8").strip().lower()
+    if raw_mode in VALID_MODES:
         mode = raw_mode
 
 

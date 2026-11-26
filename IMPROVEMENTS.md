@@ -13,7 +13,7 @@
 - 投稿前のスレッド実在確認＋応答ロスト時の到達確認リトライ（最大5回）＋不明時は ambiguous_post_outcome で再投稿しない — 再現テスト2件追加
 - チャンネル投稿への bounded チェック（直近50件・同一文面・時間窓なし）
 - スレッド返信の確認範囲をスレッド全体走査へ拡大（oldest-first ページング、上限20ページ）
-- replies 台帳の90日 prune
+- replies 台帳の90日 prune（2026-11-26、[軽微-3] 修正で `slack-yama-dispatch.sh` 毎時枠に `prune-replies --days 90` を組み込み済み）
 - record-reply サブコマンド＋DONE確定時の error_message クリア — テスト17件目
 - ウォッチドッグのユニット復旧（Unit not found時の再配置・上限3回＋backoff）＋ハッシュ照合（cmp -s、同一ならコピースキップ）— テスト16・18件目
 - 定期照合 reconcile-replies（1時間間隔、台帳未記録の返信を記録）＋DONE残存エラーの網羅クリア — テスト19・22件目
@@ -161,6 +161,7 @@
 - agy レビュー（2026-11-22、`agy_selfreview_2026-11-22_out.md`）：原案の二者択一（(A)1時間待ち vs (B)現行維持）は非推奨。指摘の要点：(1) (A)の1時間待ちは、活発なスレッドでは件数が減らないため永久停滞の恐れがある。(2) そもそも最古側（event_ts−60秒）からの全件走査が設計の歪みで、二重投稿防止が目的なら最新からの走査で直近の自分の返信の有無を確かめれば十分。(3) 発生頻度が極めて低いエッジケースに極端な二者択一を迫るのは不親切。(1)(2)(3)を反映して上記の整理に改訂した。
 - 状態: 対応済み（(A) fail-closed。次行の訂正を参照）。当初の記録: 提案済み（2026-11-22 21:53 JST、ts 1795352010.795839、agyレビューを受けて改訂版で投稿。推奨は(B)維持＋恒久対策の別途検討。テスト14の変更を伴う(A)は選択肢から外した）
 - 状態の訂正（2026-11-25、Neon 点検 [軽微-1] を受けて）: 上の「推奨は(B)現行維持」「現行は fail-open」は現状と食い違っている。実装は (A) fail-closed がすでに入っている（オーナー委任で採用）。`agent_tools.py` の `_lookup_own_recent_message_once` は、20ページ上限で打ち切ると `RuntimeError("thread_scan_truncated: ...")` を出し、cmd_reply はそれを `pre_post_check_unverifiable` として送信しない（段階待ち、24時間で終端）。テスト14も「20ページ上限打ち切りは fail-closed で送信せず」で合格している。したがって状態は「対応済み（(A) fail-closed）」とする。(3) の走査起点の見直しは、未実施の恒久対策として残す。残る不整合が1点ある：`_pre_post_check_thread_for_reply` の `single_page_cap=False` 分岐には、旧来の fail-open の `break` が残っている。cmd_reply からは `is_delayed_retry=True`（single_page_cap あり）でしか呼ばれないため実害はないが、関数単体で見ると整合していない（今回は直していない）。
+- 追記（2026-11-26、第2回 Carbon 点検 [軽微-4] 修正）: `_pre_post_check_thread_for_reply` の `single_page_cap=False` 分岐と `_scan_thread_yama_messages` の20ページ上限到達時の双方を、警告出力＋`RuntimeError("thread_scan_truncated: ...")` の fail-closed に統一した（テスト93/93）。
 - 日付: 2026-11-21
 
 ### 候補15: フック定義のプロンプトとコメントが古い（再起動しきい値 3分→120秒の反映漏れ）
@@ -207,7 +208,7 @@
 - リスク: 低い。状態遷移のガード追加のみ。誤った遷移を防ぐ方向。
 - テスト計画: DONE→FAILED の commit が拒否されること、unverifiable 以外の FAILED で first_unverifiable_at が消えること。既存の commit 関連テストの回帰確認。
 - 調査（2026-11-23、`claude_commit_guard_investigation_2026-11-23.md`）：実装上はすべての終端からの上書きが通る（DONE→PENDING／FAILED、IGNORED→DONE、FAILED→DONE、Reaper 上限の FAILED→PENDING）。前提条件の「遅れた commit」は 11-22 08:43 の Reaper 差し戻しで1回だけ実際に生じたが、上書きの痕跡はなく、実データで DONE から戻った形跡はゼロ。agy レビュー（`agy_commit_guard_out.md`）も「条件付きで入れる」。
-- 状態: 対応済み（2026-11-23、第1段の終端ガードとして実装。実装レポート `claude_commit_guard_impl_2026-11-23.md`、テスト82/82）。commit_event の BEGIN IMMEDIATE 内で現在の状態を確認し、DONE／IGNORED の同一状態は no-op（`"noop": true`）、別状態と FAILED からの commit は `already_terminal` で拒否（行は不変・exit 1・運用アラート1行）、訂正は `--force --reason`（理由を error_message に残し運用アラート）。commit・commit-batch（検証フェーズでも拒否）・cmd_reply の内部 commit のすべてに効く。範囲外として残したもの：(1) 提案の後半「unverifiable 以外の FAILED で first_unverifiable_at を消す」は未実施。(2) 本命の競合（遅れた commit が別バッチの保持中の PROCESSING を上書きする）は状態だけでは防げず、第2段の claim トークンが要る。着手は同じ side_chat で並行ワーカーが実在すると確認できてから。
+- 状態: 対応済み（2026-11-23、第1段の終端ガードとして実装。実装レポート `claude_commit_guard_impl_2026-11-23.md`、テスト82/82）。commit_event の BEGIN IMMEDIATE 内で現在の状態を確認し、DONE／IGNORED の同一状態は no-op（`"noop": true`）、別状態と FAILED からの commit は `already_terminal` で拒否（行は不変・exit 1・運用アラート1行）、訂正は `--force --reason`（理由を error_message に残し運用アラート）。commit・commit-batch（検証フェーズでも拒否）・cmd_reply の内部 commit のすべてに効く。範囲外として残したもの：(1) 提案の後半「unverifiable 以外の FAILED で first_unverifiable_at を消す」は 2026-11-25 修正で対応済み。(2) 本命の競合（遅れた commit が別バッチの保持中の PROCESSING を上書きする）は状態だけでは防げず、第2段の claim トークンが要る（実測335バッチ中1回のため引き続き見送り）。なお 2026-11-26 の第2回 Carbon 点検 [中-2] 修正により、`cmd_reply` 入口でも終端イベント（台帳未記録）への投稿を拒否するようになり、遅れた並走ワーカーによる誤投稿の大半は claim トークンなしでも防げるようになった（テスト93/93）。
 - 日付: 2026-11-21
 
 ### 候補20: save_event の (channel_id, ts) 重複排除が競合しうる
@@ -225,7 +226,7 @@
 - 提案: 不正な値は shadow に落とす。
 - リスク: ごく小さい。不正値の扱いを安全側に倒すのみ。
 - テスト計画: 不正な mode.txt で shadow になること。正常値がそのまま通ること。
-- 状態: 未投稿
+- 状態: 対応済み（2026-11-26、第2回 Carbon 点検 [中-2] 修正、テスト93/93。`agent_tools.py` の `get_mode()` と `dispatcher.sh` の双方で小文字化＋`VALID_MODES` 検証・不正値の `"shadow"` フォールバックを実装し、`cmd_reply`／`cmd_react` も `shadow` モードを拒否するようにした）
 - 日付: 2026-11-21
 
 ### 候補22: 個人・実 ID がソースに直書きされている
@@ -257,7 +258,7 @@
 - 提案: 本文に「=== Message from」があるのに1件も解析できなかった場合は parse_failed として observed に出す。
 - リスク: ごく小さい。失敗の可視化のみ。
 - テスト計画: 形式が変わった出力を模擬し、parse_failed が出ること。正常時は出ないこと。
-- 状態: 未投稿
+- 状態: 対応済み（2026-11-26、第2回 Carbon 点検 [中-4] 修正、テスト93/93。`owner_dm_poll.py` の `read_dm()` で `"=== Message from "` を含むのに 0 件解析だった場合は `None`（`read_failed`）を返すようにし、全滅時 exit 2・部分継続 10 分超で `owner_dm_poll_failed` 運用警告へ接続した）
 - 日付: 2026-11-21
 
 ### 候補25: IMPROVEMENTS.md の記述の食い違い

@@ -5392,24 +5392,16 @@ def test_delayed_retry_not_answered_conservative_cases() -> str:
         text_file = Path(tmp) / "reply_conservative.txt"
         text_file.write_text(reply_body + "\n", encoding="utf-8")
 
-        # Review fix 2026-11-25 [mid-1]: bot posts and short posts now DO count as
-        # answers (hook definition). What stays "not answered": subtype=bot_message
-        # (subtype rule unchanged), whitespace-only bodies, the questioner (even a bot
-        # questioner) and Yama itself.
+        # Review fix 2026-11-26 [minor-2]: bot_message subtype now counts as answered
+        # too. What stays "not answered": non-content subtypes (e.g. channel_join),
+        # whitespace-only bodies, the questioner (even a bot questioner) and Yama itself.
         cases = [
             (
-                "bot_message_subtype_only",
+                "channel_join_subtype_only",
                 "Ev_DELAYED_BOT_ONLY",
                 "1795300100.000100",
                 [
                     {"user": questioner_uid, "text": "親の質問投稿です", "ts": "1795300100.000100"},
-                    {
-                        "user": "U_SUBTYPE_BOT",
-                        "subtype": "bot_message",
-                        "text": "subtype=bot_messageの投稿はsubtype条件で対象外のまま",
-                        "ts": "1795300120.000300",
-                        "thread_ts": "1795300100.000100",
-                    },
                     {
                         "user": "U_JOINER",
                         "subtype": "channel_join",
@@ -10989,9 +10981,9 @@ def test_hook_supplementary_jobs_after_dispatch() -> str:
         assert '"decision":"wake"' in out
         # Idle cycle -> dispatcher first, then backfill, reconcile, auto_join.
         lines, out = cycle(1, backfill_age=10)
-        # prune-state-files (review fix 2026-11-25) shares reconcile's hourly slot
+        # prune-state-files (review fix 2026-11-25) and prune-replies (review fix 2026-11-26) share reconcile's hourly slot
         assert lines == ["watchdog", "dispatcher", "backfill", "reconcile-replies", "prune-state-files",
-                         "auto_join"], lines
+                         "prune-replies", "auto_join"], lines
         assert '"decision":"silent"' in out
         # Locked cycle (batch in flight) -> same as idle.
         lines, out = cycle(2, backfill_age=None)
@@ -12209,13 +12201,14 @@ def test_review_fix_2026_11_25_owner_dm() -> str:
             assert resolve(item, "replied", reply_ts="1795000031.000000")["auto_streak"] == 1
             assert st()["unconfirmed_sends"] == 0 and "1795000031.000000" in st()["proxy_ts"]
 
-            # ts_not_found, then poll sees the landed message (owner-authored, not in proxy_ts):
-            # adopted as the proxy reply, no streak reset, not counted twice
+            # ts_not_found, then poll sees the landed message (owner-authored, not in proxy_ts)
+            # within 60s of the top-level send attempt: adopted as proxy reply, no streak reset
             fresh()
             responses.append(json.dumps({"result": {"content": [{"type": "text", "text": "sent"}]}}))
-            owner_dm_poll.send(uid, "no ts 2")
-            feeds[uid] = [{"author": owner, "ts": "1795000040.000000", "thread_latest": None}]
-            owner_dm_poll.poll()
+            with patch.object(owner_dm_poll, "_now_ts", lambda: 1795000038.0):
+                owner_dm_poll.send(uid, "no ts 2")
+                feeds[uid] = [{"author": owner, "ts": "1795000040.000000", "thread_latest": None}]
+                owner_dm_poll.poll()
             assert st()["auto_streak"] == 1 and st()["unconfirmed_sends"] == 0, st()
             assert "1795000040.000000" in st()["proxy_ts"]
             # a real owner post afterwards still resets
@@ -12702,6 +12695,479 @@ def test_review_fix_2026_11_25_listener_and_watchdog() -> str:
             "boot_id(sha256先頭8字)と起動日時を初回/ブート変化/再起動時に記録(生のboot_idは書かない)、backfillのTypeErrorフォールバック削除、を確認")
 
 
+def test_review_fix_2026_11_26_owner_dm_and_watchdog() -> str:
+    """91. 点検（2026-11-26）の修正・DM代行と監視: [中-1] send_timeout未着地→resolve hold後に本人実発言がproxy_tsに入らずauto_streak=0へリセット・unconfirmed_sends残存時の2通目send()成功でauto_streakが増加し上限3で止まる・窓外/スレッド送信の本人発言を吸い込まない、[中-4] read_dmの0件解析をread_failed扱い・全滅時poll非0終了・部分read_failed10分継続でowner_dm_poll_failed・watchdog再起動失敗/MAX_REACHEDをops_alertsへ"""
+    uid = sorted(owner_dm_poll.CONVS)[0]
+    owner = owner_dm_poll.OWNER_ID
+    runtime = Path("/home/hatch/hooks/runtime/hatch_hook_runtime.sh")
+    owner_hook = Path("/home/hatch/hooks/scripts/slack-owner-dm.sh")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_p = Path(tmp)
+        state_path = tmp_p / "slack-owner-dm.json"
+
+        def fresh() -> None:
+            state_path.write_text(
+                json.dumps({
+                    "convs": {
+                        u: {"top_ts": "1795000000.000000", "threads": {}, "handled": [],
+                            "auto_streak": 0, "proxy_ts": []}
+                        for u in owner_dm_poll.CONVS
+                    },
+                    "pending": [],
+                    "last_wake_at": 0,
+                }),
+                encoding="utf-8",
+            )
+
+        def st() -> Dict[str, Any]:
+            return json.loads(state_path.read_text(encoding="utf-8"))["convs"][uid]
+
+        feeds: Dict[str, List[Dict[str, Any]]] = {u: [] for u in owner_dm_poll.CONVS}
+        responses: List[Any] = []
+
+        def fake_send(user_id: str, message: str, thread_ts: Optional[str] = None) -> Any:
+            return responses.pop(0)
+
+        def ok_ts(ts: str) -> str:
+            return json.dumps({"result": {"content": [{"type": "text", "text": json.dumps({"ok": True, "ts": ts})}]}})
+
+        def resolve(item_id: str, action: str, **kw: Any) -> Dict[str, Any]:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                owner_dm_poll.resolve(item_id, action, **kw)
+            return json.loads(buf.getvalue())
+
+        with patch.object(owner_dm_poll, "STATE_PATH", str(state_path)), \
+                patch.object(owner_dm_poll, "read_dm", lambda u, limit=6: list(feeds.get(u, []))), \
+                patch.object(owner_dm_poll, "send_dm", fake_send):
+            # (A) 1st send -> send_timeout (not landed) -> resolve hold -> real owner post resets auto_streak to 0 & NOT in proxy_ts
+            fresh()
+            feeds[uid] = [{"author": uid, "ts": "1795000010.000000", "thread_latest": None}]
+            item_a = owner_dm_poll.poll()["pending"][0]["id"]
+            responses.append(owner_dm_poll.SEND_TIMEOUT)
+            with patch.object(owner_dm_poll, "_now_ts", lambda: 1795000015.0):
+                r_to = owner_dm_poll.send(uid, "timeout_unlanded")
+            assert r_to["error"] == "send_timeout" and r_to["auto_streak"] == 1, r_to
+            assert st()["unconfirmed_sends"] == 1
+            resolve(item_a, "hold")
+            assert st()["unconfirmed_sends"] == 0, st()
+            # Owner posts top-level shortly after: must NOT be absorbed into proxy_ts and MUST reset auto_streak to 0
+            feeds[uid] = [{"author": owner, "ts": "1795000020.000000", "thread_latest": None}]
+            with patch.object(owner_dm_poll, "_now_ts", lambda: 1795000025.0):
+                owner_dm_poll.poll()
+            assert "1795000020.000000" not in st()["proxy_ts"], st()
+            assert st()["auto_streak"] == 0, st()
+
+            # (B) 1st send leaves unconfirmed_sends=1, 2nd & 3rd new send() succeed -> auto_streak increments to 2, 3; 4th refused
+            fresh()
+            responses.append(owner_dm_poll.SEND_TIMEOUT)
+            assert owner_dm_poll.send(uid, "m1")["auto_streak"] == 1
+            assert st()["unconfirmed_sends"] == 1
+            responses.append(ok_ts("1795000031.000000"))
+            r2 = owner_dm_poll.send(uid, "m2")
+            assert r2["ok"] is True and r2["auto_streak"] == 2, (r2, st())
+            assert st()["unconfirmed_sends"] == 1, "new send() must not consume unconfirmed_sends"
+            responses.append(ok_ts("1795000032.000000"))
+            r3 = owner_dm_poll.send(uid, "m3")
+            assert r3["ok"] is True and r3["auto_streak"] == 3, (r3, st())
+            r4 = owner_dm_poll.send(uid, "m4")
+            assert r4 == {"ok": False, "error": "auto_streak_limit"}, r4
+
+            # (C) Thread send_timeout must NOT absorb a top-level owner post; >60s old attempt must NOT absorb either
+            fresh()
+            responses.append(owner_dm_poll.SEND_TIMEOUT)
+            with patch.object(owner_dm_poll, "_now_ts", lambda: 1795000050.0):
+                owner_dm_poll.send(uid, "th_timeout", thread_ts="1795000001.000000")
+            feeds[uid] = [{"author": owner, "ts": "1795000055.000000", "thread_latest": None}]
+            with patch.object(owner_dm_poll, "_now_ts", lambda: 1795000060.0):
+                owner_dm_poll.poll()
+            assert "1795000055.000000" not in st()["proxy_ts"] and st()["auto_streak"] == 0, st()
+
+            fresh()
+            responses.append(owner_dm_poll.SEND_TIMEOUT)
+            with patch.object(owner_dm_poll, "_now_ts", lambda: 1795000100.0):
+                owner_dm_poll.send(uid, "top_timeout")
+            feeds[uid] = [{"author": owner, "ts": "1795000250.000000", "thread_latest": None}]
+            with patch.object(owner_dm_poll, "_now_ts", lambda: 1795000260.0):
+                owner_dm_poll.poll()
+            assert "1795000250.000000" not in st()["proxy_ts"] and st()["auto_streak"] == 0, st()
+
+        # (D) candidate 24: "=== Message from " with 0 parsed messages -> read_dm returns None
+        import types
+        bad_raw = json.dumps({
+            "result": {"content": [{"text": json.dumps({"messages": "=== Message from BrokenFormat\nNo TS here"})}]}
+        })
+        fake_proc = types.SimpleNamespace(returncode=0, stdout=bad_raw, stderr="")
+        with patch.object(owner_dm_poll.subprocess, "run", lambda *a, **kw: fake_proc):
+            assert owner_dm_poll.read_dm(uid) is None, "unparseable messages must return None (read_failed)"
+
+        # Partial read_failed sustained >= 10 minutes in slack-owner-dm.sh -> owner_dm_poll_failed & recovered
+        dm_proj = tmp_p / "dmproj"
+        (dm_proj / "state").mkdir(parents=True)
+        (dm_proj / "venv").symlink_to(BASE_DIR / "venv")
+        (dm_proj / "ops_monitor.py").symlink_to(BASE_DIR / "ops_monitor.py")
+        (dm_proj / "owner_dm_poll.py").write_text(
+            "import os, sys\n"
+            "mode = os.environ.get('STUB_RF_MODE', 'ok')\n"
+            "if mode == 'partial':\n"
+            "    print('{\"wake\": false, \"pending\": [], \"observed\": {\"A\": \"read_failed\", \"B\": \"1 msgs\"}}')\n"
+            "elif mode == 'all':\n"
+            "    print('{\"wake\": false, \"pending\": [], \"observed\": {\"A\": \"read_failed\"}}')\n"
+            "    sys.stderr.write('all DM reads failed\\n'); sys.exit(2)\n"
+            "else:\n"
+            "    print('{\"wake\": false, \"pending\": [], \"observed\": {\"A\": \"1 msgs\", \"B\": \"1 msgs\"}}')\n",
+            encoding="utf-8",
+        )
+        dm_alerts = dm_proj / "state" / "ops_alerts.jsonl"
+        dm_stamp = tmp_p / "dm_err_stamp"
+        rf_stamp = tmp_p / "dm_rf_stamp"
+        dm_state = tmp_p / "dm_hook_state"
+        dm_state.mkdir()
+        dm_env = {k: v for k, v in os.environ.items() if not k.startswith(("YAMA_", "HATCH_HOOK"))}
+        dm_env.update({
+            "HATCH_HOOK_RUNTIME": str(runtime), "HATCH_HOOK_STATE_DIR": str(dm_state),
+            "HATCH_HOOK_ID": "test-dm-rf", "YAMA_PROJECT_DIR": str(dm_proj),
+            "YAMA_DISPATCH_SCRIPT": str(HOOK_SCRIPT_PATH), "YAMA_OPS_ALERTS_PATH": str(dm_alerts),
+            "OWNER_DM_POLL_ERR_STAMP": str(dm_stamp), "OWNER_DM_READ_FAIL_STAMP": str(rf_stamp),
+        })
+
+        def run_dm_mode(m: str) -> None:
+            r = subprocess.run(["bash", str(owner_hook)], env=dict(dm_env, STUB_RF_MODE=m),
+                               capture_output=True, text=True, timeout=60)
+            assert r.returncode == 0, r.stderr
+
+        def dm_kinds() -> List[str]:
+            if not dm_alerts.exists():
+                return []
+            return [json.loads(x)["kind"] for x in dm_alerts.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+        run_dm_mode("partial")
+        assert dm_kinds() == [], "first partial read_failed waits 10 min"
+        assert rf_stamp.exists()
+        rf_stamp.write_text(f"{int(time.time()) - 601} 0\n", encoding="utf-8")
+        run_dm_mode("partial")
+        assert dm_kinds() == ["owner_dm_poll_failed"], dm_kinds()
+        run_dm_mode("ok")
+        assert dm_kinds() == ["owner_dm_poll_failed", "owner_dm_poll_failed_recovered"], dm_kinds()
+        assert not rf_stamp.exists()
+        # Total read_failed (exit 2) alerts immediately
+        run_dm_mode("all")
+        assert dm_kinds()[-1] == "owner_dm_poll_failed", dm_kinds()
+
+        # (E) watchdog.sh restart failure & MAX_REACHED -> ops_alerts.jsonl
+        wd_dir = tmp_p / "wd"
+        (wd_dir / "state").mkdir(parents=True)
+        hb = wd_dir / "state" / "heartbeat.json"
+        hb.write_text(json.dumps({"timestamp": time.time() - 300}), encoding="utf-8")
+        wd_alerts = wd_dir / "state" / "ops_alerts.jsonl"
+        restart_fail_sh = wd_dir / "restart_fail.sh"
+        restart_fail_sh.write_text("#!/usr/bin/env bash\necho restart_boom >&2\nexit 5\n", encoding="utf-8")
+        restart_fail_sh.chmod(0o755)
+        restart_nf_sh = wd_dir / "restart_nf.sh"
+        restart_nf_sh.write_text("#!/usr/bin/env bash\necho 'Unit yama-listener.service not found' >&2\nexit 5\n", encoding="utf-8")
+        restart_nf_sh.chmod(0o755)
+        uptime_sh = wd_dir / "uptime_stub.sh"
+        uptime_sh.write_text("#!/usr/bin/env bash\necho '2026-11-26 00:00:00'\n", encoding="utf-8")
+        uptime_sh.chmod(0o755)
+        wd_env = {k: v for k, v in os.environ.items() if not k.startswith("YAMA_")}
+        wd_env.update({
+            "YAMA_STATE_DIR": str(wd_dir / "state"),
+            "YAMA_HEARTBEAT_PATH": str(hb),
+            "YAMA_WATCHDOG_LOG": str(wd_dir / "state" / "watchdog.log"),
+            "YAMA_WATCHDOG_THRESHOLD_SEC": "120",
+            "YAMA_WATCHDOG_RECHECK_SEC": "0",
+            "YAMA_RESTART_CMD": str(restart_fail_sh),
+            "YAMA_OPS_MONITOR_PY": str(BASE_DIR / "ops_monitor.py"),
+            "YAMA_OPS_ALERTS_PATH": str(wd_alerts),
+            "YAMA_BOOT_ID_PATH": str(wd_dir / "boot_id"),
+            "YAMA_UPTIME_SINCE_CMD": str(uptime_sh),
+        })
+        (wd_dir / "boot_id").write_text("boot-test-1\n", encoding="utf-8")
+        r_wd1 = subprocess.run(["bash", str(BASE_DIR / "watchdog.sh")], env=wd_env, capture_output=True, text=True)
+        assert r_wd1.returncode == 5, (r_wd1.returncode, r_wd1.stderr)
+        wd_entries = [json.loads(x) for x in wd_alerts.read_text(encoding="utf-8").splitlines() if x.strip()]
+        assert any(e["kind"] == "watchdog_restart_failed" for e in wd_entries), wd_entries
+
+        # MAX_REACHED
+        reinstall_state = wd_dir / "state" / "unit_reinstall_state.json"
+        reinstall_state.write_text(json.dumps({"attempts": 3, "next_allowed_ts": 0}), encoding="utf-8")
+        wd_env["YAMA_RESTART_CMD"] = str(restart_nf_sh)
+        wd_env["YAMA_UNIT_REINSTALL_MAX"] = "3"
+        r_wd2 = subprocess.run(["bash", str(BASE_DIR / "watchdog.sh")], env=wd_env, capture_output=True, text=True)
+        assert r_wd2.returncode == 5, (r_wd2.returncode, r_wd2.stderr)
+        wd_entries2 = [json.loads(x) for x in wd_alerts.read_text(encoding="utf-8").splitlines() if x.strip()]
+        assert any(e["kind"] == "watchdog_reinstall_max_reached" for e in wd_entries2), wd_entries2
+
+    return ("send_timeout未着地→resolve hold後の本人発言はproxy_tsに入らずauto_streak=0・unconfirmed_sends残存中の新規send()成功でauto_streak増加し上限3で停止・"
+            "スレッド送信/60秒超の誤吸収なし・read_dm 0件解析をread_failed扱い・全滅非0/部分10分継続でowner_dm_poll_failed・"
+            "watchdog再起動失敗/MAX_REACHEDをops_alerts出力、を確認")
+
+
+def test_review_fix_2026_11_26_reply_guards_and_thread_ts() -> str:
+    """92. 点検（2026-11-26）の修正・reply終端/shadow検査とthread-ts: [中-2] 終端イベント(DONE/IGNORED/FAILED・台帳未記録)へのreply拒否(event_already_terminal→reply_rejected)・--force --reason通過・台帳記録済みDONEは冪等dedup・shadowモードでreply/react拒否・dispatcher.shのモード小文字化/VALID_MODES検証、[軽微-1] トップレベル投稿への返信でreplies.thread_tsにイベント自身のtsが保存されること"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_p = Path(tmp)
+        db_path = tmp_p / "slack_events.db"
+        init_db(db_path)
+        mode_full = tmp_p / "mode_full.txt"
+        mode_full.write_text("full\n", encoding="utf-8")
+        mode_shadow = tmp_p / "mode_shadow.txt"
+        mode_shadow.write_text("shadow\n", encoding="utf-8")
+        text_file = tmp_p / "reply.txt"
+        text_file.write_text("テスト返信です。\n", encoding="utf-8")
+
+        with get_db_connection(db_path) as conn:
+            for eid, st, ts, th in (
+                ("Ev_RF26_DONE", "DONE", "1795800001.000100", None),
+                ("Ev_RF26_IGN", "IGNORED", "1795800002.000100", None),
+                ("Ev_RF26_FAIL", "FAILED", "1795800003.000100", None),
+                ("Ev_RF26_DONE_REC", "DONE", "1795800004.000100", None),
+                ("Ev_RF26_TOP", "PROCESSING", "1795800010.538179", None),
+            ):
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, thread_ts, status) "
+                    "VALUES (?, 'C_TEST_CH', 'U_TEST_USER', 'hello', ?, ?, ?)",
+                    (eid, ts, th, st),
+                )
+            conn.commit()
+
+        # Record a reply for Ev_RF26_DONE_REC so it should still deduplicate idempotently
+        agent_tools.record_reply(
+            event_id="Ev_RF26_DONE_REC",
+            channel_id="C_TEST_CH",
+            thread_ts="1795800004.000100",
+            reply_ts="1795800005.000200",
+            text="既存返信",
+            db_path=db_path,
+        )
+
+        post_calls: List[Dict[str, Any]] = []
+
+        class FakeClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": "U_YAMA_TEST"}
+
+            def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+                return {"ok": True, "messages": [], "has_more": False}
+
+            def conversations_history(self, **kw: Any) -> Dict[str, Any]:
+                return {"ok": True, "messages": [], "has_more": False}
+
+            def chat_postMessage(self, **kw: Any) -> Dict[str, Any]:
+                post_calls.append(kw)
+                return {"ok": True, "ts": f"179580009{len(post_calls)}.000100"}
+
+            def reactions_add(self, **kw: Any) -> Dict[str, Any]:
+                post_calls.append({"react": kw})
+                return {"ok": True}
+
+        with patch.object(agent_tools, "get_web_client", lambda *a, **kw: FakeClient()):
+            # Terminal events without recorded reply -> rejected with event_already_terminal
+            for eid, expected_st in (("Ev_RF26_DONE", "DONE"), ("Ev_RF26_IGN", "IGNORED"), ("Ev_RF26_FAIL", "FAILED")):
+                err_buf = io.StringIO()
+                with redirect_stderr(err_buf):
+                    rc = agent_tools.main([
+                        "--db", str(db_path), "--mode-file", str(mode_full),
+                        "reply", "--channel", "C_TEST_CH", "--text-file", str(text_file),
+                        "--event-id", eid, "--thread-ts", "1795800001.000100",
+                    ])
+                assert rc == 1, (eid, rc)
+                err = json.loads(err_buf.getvalue())
+                assert err["error"] == "event_already_terminal" and err["current_status"] == expected_st, err
+            assert len(post_calls) == 0, post_calls
+
+            # Verify reply_rejected alerts written
+            alerts_path = db_path.parent / "ops_alerts.jsonl"
+            alerts = [json.loads(x) for x in alerts_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+            assert sum(1 for a in alerts if a["kind"] == "reply_rejected" and a["reason"] == "event_already_terminal") == 3, alerts
+
+            # Terminal event WITH --force --reason -> allowed and writes reply_forced
+            out_buf = io.StringIO()
+            with redirect_stdout(out_buf):
+                rc = agent_tools.main([
+                    "--db", str(db_path), "--mode-file", str(mode_full),
+                    "reply", "--channel", "C_TEST_CH", "--text-file", str(text_file),
+                    "--event-id", "Ev_RF26_IGN", "--thread-ts", "1795800002.000100",
+                    "--force", "--reason", "manual correction",
+                ])
+            assert rc == 0 and len(post_calls) == 1, (rc, out_buf.getvalue())
+            alerts2 = [json.loads(x) for x in alerts_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+            assert any(a["kind"] == "reply_forced" and a.get("forced_check") == "event_already_terminal" for a in alerts2), alerts2
+
+            # Terminal DONE event WITH recorded reply -> idempotent dedup (no new post)
+            out_buf = io.StringIO()
+            with redirect_stdout(out_buf):
+                rc = agent_tools.main([
+                    "--db", str(db_path), "--mode-file", str(mode_full),
+                    "reply", "--channel", "C_TEST_CH", "--text-file", str(text_file),
+                    "--event-id", "Ev_RF26_DONE_REC", "--thread-ts", "1795800004.000100",
+                ])
+            assert rc == 0 and json.loads(out_buf.getvalue())["deduplicated"] is True and len(post_calls) == 1
+
+            # shadow mode -> cmd_reply and cmd_react both rejected
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc = agent_tools.main([
+                    "--db", str(db_path), "--mode-file", str(mode_shadow),
+                    "reply", "--channel", "C_TEST_CH", "--text-file", str(text_file),
+                    "--event-id", "Ev_RF26_TOP", "--thread-ts", "1795800010.538179",
+                ])
+            assert rc == 1 and json.loads(err_buf.getvalue())["error"] == "shadow_mode_blocked"
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc = agent_tools.main([
+                    "--db", str(db_path), "--mode-file", str(mode_shadow),
+                    "react", "--channel", "C_TEST_CH", "--ts", "1795800010.538179", "--emoji", "eyes",
+                ])
+            assert rc == 1 and json.loads(err_buf.getvalue())["error"] == "shadow_mode_blocked"
+            assert len(post_calls) == 1
+
+            # [minor-1] Top-level post reply (thread_ts=NULL on event) with --thread-ts <event.ts> saves replies.thread_ts == event.ts
+            out_buf = io.StringIO()
+            with redirect_stdout(out_buf):
+                rc = agent_tools.main([
+                    "--db", str(db_path), "--mode-file", str(mode_full),
+                    "reply", "--channel", "C_TEST_CH", "--text-file", str(text_file),
+                    "--event-id", "Ev_RF26_TOP", "--thread-ts", "1795800010.538179",
+                ])
+            assert rc == 0, rc
+            rec = agent_tools.get_recorded_reply("Ev_RF26_TOP", db_path=db_path)
+            assert rec is not None and rec["thread_ts"] == "1795800010.538179", rec
+
+        # dispatcher.sh mode lowercase + VALID_MODES check
+        for raw_m, exp_m in (("FULL\n", "full"), ("bogus_mode\n", "shadow")):
+            d_dir = tmp_p / f"disp_{exp_m}"
+            d_dir.mkdir()
+            d_db = d_dir / "events.db"
+            init_db(d_db)
+            with get_db_connection(d_db) as conn:
+                conn.execute(
+                    "INSERT INTO events (event_id, channel_id, user_id, text, ts, status) "
+                    "VALUES ('Ev_M1', 'C_TEST_CH', 'U_TEST_USER', 'hi', '1795800100.000100', 'PENDING')"
+                )
+                conn.commit()
+            m_file = d_dir / "mode.txt"
+            m_file.write_text(raw_m, encoding="utf-8")
+            p_file = d_dir / "payload.json"
+            d_env = {k: v for k, v in os.environ.items() if not k.startswith("YAMA_")}
+            d_env.update({
+                "YAMA_STATE_DIR": str(d_dir),
+                "YAMA_DB_PATH": str(d_db),
+                "YAMA_PAYLOAD_PATH": str(p_file),
+                "YAMA_LOCK_PATH": str(d_dir / "dispatcher.lock"),
+                "YAMA_MODE_FILE": str(m_file),
+                "YAMA_CONTEXT_BUNDLE": "0",
+            })
+            r_disp = subprocess.run(["bash", str(BASE_DIR / "dispatcher.sh")], env=d_env, capture_output=True, text=True)
+            assert r_disp.returncode == 0, r_disp.stderr
+            assert json.loads(p_file.read_text(encoding="utf-8"))["mode"] == exp_m
+
+    return ("終端イベント(DONE/IGNORED/FAILED・台帳未記録)へのreply拒否(event_already_terminal→reply_rejected)・--force --reason通過・"
+            "台帳記録済みDONEは冪等dedup・shadowモードでreply/react拒否・dispatcher.shのモード小文字化/VALID_MODES検証・"
+            "トップレベル投稿への返信でreplies.thread_tsにイベントts保存、を確認")
+
+
+def test_review_fix_2026_11_26_bot_message_reconcile_and_hook_order() -> str:
+    """93. 点検（2026-11-26）の修正・bot_message境界・20ページ上限・フック順序: [軽微-2] subtype=bot_message(userあり/bot_idのみ)が答え済み判定に該当・listenerのbot_id→user補完でライブ受信保存、[軽微-4] _scan_thread_yama_messagesと_pre_post_check_thread_for_reply(single_page_cap=False)の20ページ上限到達で警告＋RuntimeError(reconcileはwithout_replyクリアせずerror_details計上)、[中-3][軽微-3] dispatchフックでプロキシ同期がユニット自己修復より前かつ毎時枠にprune-replies --days 90あり"""
+    # [minor-2](a) _find_answering_message_in_thread with subtype="bot_message"
+    parent = {"user": "U_Q", "text": "質問です", "ts": "1795900000.000100"}
+    bot_with_user = {"user": "U_OTHER_BOT", "subtype": "bot_message", "text": "回答A", "ts": "1795900010.000100"}
+    bot_id_only = {"bot_id": "B_WEBHOOK", "subtype": "bot_message", "text": "回答B", "ts": "1795900011.000100"}
+    assert agent_tools._find_answering_message_in_thread(
+        [parent, bot_with_user], parent["ts"], {"U_Q"}, {"U_YAMA_SELF"}
+    ) == bot_with_user
+    assert agent_tools._find_answering_message_in_thread(
+        [parent, bot_id_only], parent["ts"], {"U_Q"}, {"U_YAMA_SELF"}
+    ) == bot_id_only
+    # Same bot_id as parent questioner must NOT count as answered
+    bot_parent = {"bot_id": "B_WEBHOOK", "subtype": "bot_message", "text": "Bot質問", "ts": "1795900000.000100"}
+    assert agent_tools._find_answering_message_in_thread(
+        [bot_parent, bot_id_only], bot_parent["ts"], set(), {"U_YAMA_SELF"}
+    ) is None
+
+    # [minor-2](b) listener.py live bot_message with bot_id only (no user) is accepted & saved
+    import listener
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "events.db"
+        init_db(db_path)
+        ev = {
+            "type": "message",
+            "subtype": "bot_message",
+            "bot_id": "B_WEBHOOK_LIVE",
+            "text": "Webhook通知です",
+            "channel": "C_TEST_CH",
+            "ts": "1795900020.000100",
+        }
+        ignore, reason = listener.should_ignore_event(ev, bot_user_id="U_YAMA_SELF")
+        assert not ignore and reason == "ok", (ignore, reason)
+        saved, s_reason = listener.handle_event_payload(
+            {"event_id": "Ev_RF26_BOT_LIVE", "event": ev},
+            bot_user_id="U_YAMA_SELF",
+            db_path=db_path,
+        )
+        assert saved is True and s_reason == "saved", (saved, s_reason)
+        with get_db_connection(db_path) as conn:
+            row = conn.execute("SELECT user_id, is_bot FROM events WHERE event_id = 'Ev_RF26_BOT_LIVE'").fetchone()
+        assert row["user_id"] == "B_WEBHOOK_LIVE" and row["is_bot"] == 1, dict(row)
+
+        # [minor-4] _scan_thread_yama_messages & _pre_post_check_thread_for_reply(single_page_cap=False) raise at 20-page cap
+        class InfiniteThreadClient:
+            def auth_test(self) -> Dict[str, Any]:
+                return {"ok": True, "user_id": "U_YAMA_SELF"}
+
+            def conversations_replies(self, **kw: Any) -> Dict[str, Any]:
+                return {
+                    "ok": True,
+                    "messages": [{"user": "U_OTHER", "text": "msg", "ts": "1795900050.000100"}],
+                    "has_more": True,
+                    "response_metadata": {"next_cursor": "next_cur"},
+                }
+
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            try:
+                agent_tools._scan_thread_yama_messages(
+                    channel="C_TEST_CH",
+                    parent_ts="1795900000.000100",
+                    client=InfiniteThreadClient(),
+                    bot_user_ids={"U_YAMA_SELF"},
+                )
+                raise AssertionError("expected RuntimeError at 20-page cap")
+            except RuntimeError as exc:
+                assert "thread_scan_truncated" in str(exc), exc
+        assert "thread_replies_page_limit_reached" in err_buf.getvalue()
+
+        err_buf2 = io.StringIO()
+        with redirect_stderr(err_buf2):
+            try:
+                agent_tools._pre_post_check_thread_for_reply(
+                    channel="C_TEST_CH",
+                    raw_text="reply",
+                    post_text="reply",
+                    thread_ts="1795900000.000100",
+                    client=InfiniteThreadClient(),
+                    bot_user_id="U_YAMA_SELF",
+                    is_delayed_retry=False,
+                    db_path=db_path,
+                )
+                raise AssertionError("expected RuntimeError at 20-page cap (single_page_cap=False)")
+            except RuntimeError as exc:
+                assert "thread_scan_truncated" in str(exc), exc
+        assert "thread_replies_page_limit_reached" in err_buf2.getvalue()
+
+    # [mid-3] & [minor-3] dispatch hook order and prune-replies
+    hook_txt = HOOK_SCRIPT_PATH.read_text(encoding="utf-8")
+    idx_env = hook_txt.index('ENV_FILE="${YAMA_ENV_FILE:-')
+    idx_unit = hook_txt.index('UNIT_SOURCE="${YAMA_UNIT_SOURCE:-')
+    assert idx_env < idx_unit, "proxy .env sync must come before unit self-heal"
+    assert "prune-replies --days 90" in hook_txt
+
+    return ("subtype=bot_message(userあり/bot_idのみ)が答え済み該当・listenerでbot_id→user補完しライブ保存・"
+            "20ページ上限到達で_scan_thread_yama_messages/_pre_post_check_thread_for_replyとも警告＋RuntimeError・"
+            "dispatchフックでプロキシ同期がユニット自己修復より前かつprune-replies --days 90組込、を確認")
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -12794,6 +13260,9 @@ def main() -> int:
         ("88. 点検（2026-11-25）の修正・DM代行 (auto_streakの加算を一か所に・二重加算なし・ts_not_found/タイムアウトを数える・自分のスレッド返信でpendingなし・--owner-activeでリセット)", test_review_fix_2026_11_25_owner_dm),
         ("89. 点検（2026-11-25）の修正・通知と掃除 (dispatcher exit>=3・owner-dm poll失敗・auto_join状態破損をops_alertsへ・triage-log・prune-state-files)", test_review_fix_2026_11_25_alerts_and_housekeeping),
         ("90. 点検（2026-11-25）の修正・リスナーとウォッチドッグ (初回pong前の凍結検知・打ち止め・ハンドラ詰まり検知・heartbeat壁時計維持・watchdog正常時無記録・boot_id記録・backfill TypeErrorフォールバック削除)", test_review_fix_2026_11_25_listener_and_watchdog),
+        ("91. 点検（2026-11-26）の修正・DM代行と監視 (unconfirmed_sends誤作動修正・read_failed警告接続・watchdog失敗/MAX_REACHED通知)", test_review_fix_2026_11_26_owner_dm_and_watchdog),
+        ("92. 点検（2026-11-26）の修正・reply終端/shadow検査とthread-ts (終端イベント拒否・--force通過・shadow拒否・dispatcherモード検証・トップレベル返信thread_ts保存)", test_review_fix_2026_11_26_reply_guards_and_thread_ts),
+        ("93. 点検（2026-11-26）の修正・bot_message境界・20ページ上限・フック順序 (bot_message答え済み＆ライブ補完・20ページ上限fail-closed・プロキシ同期先行＆prune-replies)", test_review_fix_2026_11_26_bot_message_reconcile_and_hook_order),
     ]
 
     print("=" * 72)

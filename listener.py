@@ -408,7 +408,7 @@ def should_ignore_event(
     if subtype is not None and subtype not in ALLOWED_SUBTYPES:
         return True, f"ignored_subtype:{subtype}"
 
-    user_id = event.get("user")
+    user_id = event.get("user") or event.get("bot_id")
     if not user_id:
         return True, "missing_user"
 
@@ -444,7 +444,7 @@ def save_event(
     Returns True if a new row was inserted, False if duplicate.
     """
     channel_id = event["channel"]
-    user_id = event["user"]
+    user_id = event.get("user") or event["bot_id"]
     text = event.get("text", "")
     ts = event["ts"]
     thread_ts = event.get("thread_ts")
@@ -499,6 +499,10 @@ def handle_event_payload(
     else:
         event = payload
         envelope_event_id = payload.get("event_id")
+
+    if isinstance(event, dict) and not event.get("user") and event.get("bot_id"):
+        event = dict(event)
+        event["user"] = event["bot_id"]
 
     ignore, reason = should_ignore_event(
         event, bot_user_id=bot_user_id, ignored_user_ids=ignored_user_ids
@@ -833,7 +837,7 @@ def main() -> None:
             disconnected_since, should_exit = check_connection_watchdog(
                 connected,
                 disconnected_since,
-                now=now,
+                now=mono,
                 max_disconnect_sec=MAX_DISCONNECT_SEC,
             )
 

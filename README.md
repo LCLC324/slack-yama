@@ -14,7 +14,7 @@ Slackワークスペース「muse取締役会」において、新着メッセ�
 ┌─────────────────────────────────────────────────────────────┐
 │ [Layer 1] 常駐リスナー (listener.py)                         │
 │  - Socket Mode で常時接続し、イベント受信直後に即時 ACK 返却  │
-│  - 除外フィルタ (自ボット / 他Bot / 編集・削除 / 参加通知等)  │
+│  - 除外フィルタ (自ボット / 編集・削除 / 参加通知等。他Botは除外しない) │
 │  - SQLite (state/slack_events.db, WAL) に PENDING で保存     │
 │  - 30秒ごとに state/heartbeat.json 更新 / 60秒切断で exit(1) │
 └─────────────────────────────────────────────────────────────┘
@@ -37,12 +37,17 @@ Slackワークスペース「muse取締役会」において、新着メッセ�
        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ [Layer 3] エージェント用 CLI ツール (agent_tools.py)         │
-│  - pending : PROCESSING 中のイベント一覧を JSON 出力         │
-│  - history : チャンネル / スレッドの会話履歴を取得 (最大5回) │
-│  - react   : メッセージに絵文字リアクション (👀 / ✅ 等)     │
-│  - reply   : ファイル経由で安全に返信 (回復確認最大5回)      │
-│  - commit  : DONE / IGNORED / FAILED (3回未満はPENDING戻し)  │
-│  - mode    : 現在の動作モード (shadow / mention / full) 取得 │
+│  - pending     : PROCESSING 中のイベント一覧を JSON 出力     │
+│  - history     : チャンネル / スレッドの会話履歴を取得 (最大5回) │
+│  - event-text  : 切り詰められたイベントの全文を取得           │
+│  - react       : メッセージに絵文字リアクション (👀 / ✅ 等) │
+│  - reply       : ファイル経由で安全に返信 (回復確認最大5回)  │
+│  - commit / commit-batch : DONE / IGNORED / FAILED 確定      │
+│  - requeue     : FAILED イベントの手動再投入 (台帳ガード付)  │
+│  - triage-log  : 判定ログを検証＋排他で JSONL 追記           │
+│  - prune-state-files / prune-replies : 下書き・台帳の掃除    │
+│  - seed-mirror : ローカルスレッドミラーの初期補完            │
+│  - mode        : 現在の動作モード (shadow / mention / full)  │
 └─────────────────────────────────────────────────────────────┘
        │
        ▼
@@ -62,7 +67,11 @@ Slackワークスペース「muse取締役会」において、新着メッセ�
 | :--- | :--- |
 | `listener.py` | Socket Mode 常駐リスナー（ACK返却・フィルタリング・SQLite保存・Heartbeat出力） |
 | `dispatcher.sh` | フック用ディスパッチャ（`flock` 排他制御・PENDING→PROCESSING遷移・`state/payload.json` 生成） |
-| `agent_tools.py` | エージェント用CLIツール（`pending`, `history`, `reply`（送信前チェック・応答ロスト回復確認最大5回）, `record-reply`, `reconcile-replies`, `prune-replies`, `react`, `commit`, `mode`） |
+| `agent_tools.py` | エージェント用CLIツール（`pending`, `history`, `event-text`, `reply`（送信前チェック・応答ロスト回復確認最大5回）, `record-reply`, `reconcile-replies`, `prune-replies`, `triage-log`, `prune-state-files`, `react`, `commit`, `commit-batch`, `requeue`, `seed-mirror`, `mode`） |
+| `backfill.py` | リスナー停止中等の取りこぼし補完（Slack 履歴とローカル DB を突き合わせて未保存投稿を PENDING 登録） |
+| `ops_monitor.py` | 運用警告ツール（人間 PENDING 滞留検知・`ops_alerts.jsonl` outbox の追記・取り出し・復元・永久アーカイブ） |
+| `auto_join.py` | 公開チャンネル自動参加（オーナー参加済みチャンネルへ参加し直近投稿を初期取り込み、opt-out 管理） |
+| `context_bundle.py` | ディスパッチ時のローカル文脈同梱（DB からスレッド文脈を構築し `payload.json` / `payload_context.json` へ出力） |
 | `watchdog.sh` | 死活監視スクリプト（30秒ごとのイベントフック `~/hooks/scripts/slack-yama-dispatch.sh` 内で毎回実行。`state/heartbeat.json` が120秒以上未更新なら（再起動前に5秒おいて再確認し、再起動成功後は同一heartbeatへの再起動を60秒抑止） `systemctl restart yama-listener` を実行し `state/watchdog.log` に記録） |
 | `yama-listener.service` | systemd ユニット定義ファイル（インストール・有効化はセットアップ手順参照） |
 | `config/.env.example` | Slack トークン設定ファイルのテンプレート |
@@ -142,7 +151,7 @@ cat ~/workspace/slack-yama/state/heartbeat.json
 ```
 
 Watchdog（`watchdog.sh`）の駆動方式：
-- 現行運用では cron ではなく、30秒ごとに走るプラットフォームのイベントフック（`~/hooks/scripts/slack-yama-dispatch.sh`）内で毎回自動実行されます（同フック内でユニット自己修復・backfill・1時間ごとの `reconcile-replies`・プロキシ環境変数同期・`dispatcher.sh` 呼び出しも一括実行されます）。
+- 現行運用では cron ではなく、30秒ごとに走るプラットフォームのイベントフック（`~/hooks/scripts/slack-yama-dispatch.sh`）内で毎回自動実行されます（同フック内でユニット自己修復・プロキシ環境変数同期・`dispatcher.sh` 呼び出しを行い、backfill・1時間ごとの `reconcile-replies`・5分ごとの auto_join は 2026-11-22 以降 dispatcher の後ろで、バッチを起こさない周期にだけ実行されます。backfill は連続バッチ中も最低5分に1回）。
 
 ---
 
@@ -202,7 +211,11 @@ echo "full" > ~/workspace/slack-yama/config/mode.txt
 cat << 'EOF' > /tmp/yama_reply.txt
 お疲れ様です、Yamaです。確認いたしました。
 EOF
-./venv/bin/python agent_tools.py reply --channel C01234567 --thread-ts "1700000001.000100" --text-file /tmp/yama_reply.txt
+# reply は --event-id <ID> と --no-event-id のどちらか一方が必須（どちらも無いと非0終了）
+# イベントへの返信: --event-id（events テーブルに無い ID は拒否。--force --reason <理由> のときだけ通す）
+./venv/bin/python agent_tools.py reply --channel C01234567 --thread-ts "1700000001.000100" --text-file /tmp/yama_reply.txt --event-id Ev01234567
+# イベントに紐づかない共有・報告の投稿: --no-event-id（replies 台帳には記録されない）
+./venv/bin/python agent_tools.py reply --channel C01234567 --text-file /tmp/yama_share.txt --no-event-id
 
 # 6. 処理結果のコミット
 # 返信完了時

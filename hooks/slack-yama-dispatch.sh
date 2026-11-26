@@ -40,6 +40,27 @@ PYEOF
   exit 0
 fi
 
+# Keep the listener's proxy credentials fresh: the egress proxy credentials
+# rotate, and the systemd service can only read config/.env. This hook runs
+# with the current environment, so sync the proxy lines into .env whenever
+# they differ. The listener picks them up on its next (re)start.
+ENV_FILE="${YAMA_ENV_FILE:-$PROJECT_DIR/config/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  tmp_env=$(mktemp "${ENV_FILE}.tmp.XXXXXX")
+  chmod 600 "$tmp_env"
+  grep -v -E '^(http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|all_proxy|ALL_PROXY|no_proxy|NO_PROXY)=' "$ENV_FILE" > "$tmp_env" || true
+  for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; do
+    if [[ -n "${!v:-}" ]]; then
+      echo "$v=${!v}" >> "$tmp_env"
+    fi
+  done
+  if ! cmp -s "$tmp_env" "$ENV_FILE"; then
+    chmod 600 "$tmp_env"
+    mv -f "$tmp_env" "$ENV_FILE"
+  fi
+  rm -f "$tmp_env"
+fi
+
 # Self-heal: if the listener's systemd unit file has vanished (e.g. the VM
 # was replaced; /etc does not persist) or differs from the project copy
 # (hash mismatch), reinstall it from the project copy.
@@ -84,27 +105,6 @@ fi
 # Supplementary jobs (backfill / reconcile / auto_join) run AFTER the dispatcher;
 # see "supplementary jobs" below. Alerts they raise are collected here.
 OPS_EXTRA_ALERTS='[]'
-
-# Keep the listener's proxy credentials fresh: the egress proxy credentials
-# rotate, and the systemd service can only read config/.env. This hook runs
-# with the current environment, so sync the proxy lines into .env whenever
-# they differ. The listener picks them up on its next (re)start.
-ENV_FILE="${YAMA_ENV_FILE:-$PROJECT_DIR/config/.env}"
-if [[ -f "$ENV_FILE" ]]; then
-  tmp_env=$(mktemp "${ENV_FILE}.tmp.XXXXXX")
-  chmod 600 "$tmp_env"
-  grep -v -E '^(http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|all_proxy|ALL_PROXY|no_proxy|NO_PROXY)=' "$ENV_FILE" > "$tmp_env" || true
-  for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; do
-    if [[ -n "${!v:-}" ]]; then
-      echo "$v=${!v}" >> "$tmp_env"
-    fi
-  done
-  if ! cmp -s "$tmp_env" "$ENV_FILE"; then
-    chmod 600 "$tmp_env"
-    mv -f "$tmp_env" "$ENV_FILE"
-  fi
-  rm -f "$tmp_env"
-fi
 
 # Best-effort listener watchdog: restarts the listener only when its
 # heartbeat has been stale for 120 seconds or more (= watchdog.sh
@@ -248,6 +248,7 @@ if [[ "${code:-1}" != "0" ]]; then
       # reply-<event_id>.txt of events DONE >= 7 days ago and decisions-*.json older
       # than 7 days. FAILED / PENDING / PROCESSING drafts are never deleted.
       echo "[$(date -Iseconds)] prune-state-files: $("$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" prune-state-files --days 7 2>&1 | head -c 500)" >> "$PROJECT_DIR/state/reconcile_history.log"
+      echo "[$(date -Iseconds)] prune-replies: $("$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/agent_tools.py" prune-replies --days 90 2>&1 | head -c 500)" >> "$PROJECT_DIR/state/reconcile_history.log"
     } || true
   fi
 
@@ -487,7 +488,7 @@ if [[ "${code:-1}" != "0" ]]; then
     if _ops_payload="$(jq -n -c \
         --argjson alerts "$_ops_all" \
         '{"ops_alert": true,
-          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正／reply_rejected=reply の event-id ガードで投稿を拒否（--event-id と --no-event-id のどちらも無い・両方ある・events に無い --event-id 等、何も投稿していない）／reply_forced=events に無い --event-id を --force --reason で投稿／archive_write_failed=永続ログ（ops_alerts_archive.jsonl）への記録失敗、配送は継続／failed_with_landed_reply=返信の着地が台帳にあるのに FAILED のイベントを reconcile が検知（状態は変えていない。requeue しないこと）／requeue_blocked=台帳に返信の着地があるため requeue を拒否（行は不変）／requeue_forced=台帳に着地があるイベントを --force --reason で requeue（台帳は残るので reply は重複排除される）／dispatcher_error=dispatcher.sh が exit 3 以上で失敗（その周期の配信なし。続く間は10分ごとに再通知）／auto_join_state_error=auto_join の状態ファイルが本体・.bak とも読めず自動参加を停止中／owner_dm_poll_failed=DM 代行の poll が失敗（その周期の DM 確認なし）。*_recovered は復旧）。",
+          "note": "これは Slack イベントではなく運用警告です。Slack には投稿せず、内容を短く報告してください（pending_stale=人間の未処理投稿が規定時間以上滞留／reaper=処理滞留の差し戻し・差し戻し上限でのFAILED化／backfill_truncated=履歴取得がページ上限で打ち切り／ops_monitor_failed=監視処理自体の失敗／alert_write_failed=警告の書き込み失敗／commit_rejected=確定済みイベントへの commit を拒否（already_terminal、行は不変）／commit_forced=確定済みイベントを --force で訂正／reply_rejected=reply の event-id ガードで投稿を拒否（--event-id と --no-event-id のどちらも無い・両方ある・events に無い --event-id 等、何も投稿していない）／reply_forced=events に無い --event-id を --force --reason で投稿／archive_write_failed=永続ログ（ops_alerts_archive.jsonl）への記録失敗、配送は継続／failed_with_landed_reply=返信の着地が台帳にあるのに FAILED のイベントを reconcile が検知（状態は変えていない。requeue しないこと）／requeue_blocked=台帳に返信の着地があるため requeue を拒否（行は不変）／requeue_forced=台帳に着地があるイベントを --force --reason で requeue（台帳は残るので reply は重複排除される）／dispatcher_error=dispatcher.sh が exit 3 以上で失敗（その周期の配信なし。続く間は10分ごとに再通知）／auto_join_state_error=auto_join の状態ファイルが本体・.bak とも読めず自動参加を停止中／owner_dm_poll_failed=DM 代行の poll が失敗（その周期の DM 確認なし）／watchdog_restart_failed=watchdog によるリスナー再起動が失敗／watchdog_reinstall_max_reached=watchdog のユニット再配置が上限回数に到達。*_recovered は復旧）。",
           "kinds": ($alerts | map(.kind // "unknown") | unique),
           "alerts": $alerts[0:50],
           "omitted_alerts": ([($alerts | length) - 50, 0] | max)}' 2>/dev/null)" \
