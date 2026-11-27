@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Yama Listener Watchdog (Layer 4)
-# NOTE: this file is executed every 30s by the dispatch hook, and bash reads
-# it incrementally. Edit it only via tmp-file + bash -n + mv in this directory.
+# NOTE: this file is executed by both the 30s dispatch hook and the 60s
+# yama-watchdog.timer (systemd), and bash reads it incrementally. Edit it only
+# via tmp-file + bash -n + mv in this directory.
+# - Uses flock (state/watchdog.lock) to prevent concurrent execution when the
+#   dispatch hook and systemd timer overlap (exits 0 silently if already locked).
 # - Checks if state/heartbeat.json has not been updated for >= 120 seconds
 #   (restart threshold). This script has no separate "heartbeat stale" warning;
 #   operator alerts come from elsewhere: ops_monitor.py pending-check (human
@@ -24,6 +27,11 @@
 #   attempts bounded unit file recovery (with pre-checks, content/hash comparison, max attempts, and exponential backoff):
 #   compares source and destination (skips copy if identical, otherwise installs yama-listener.service) ->
 #   systemctl daemon-reload -> retries systemctl restart yama-listener.
+# - On every run, checks existence of /etc/systemd/system/yama-watchdog.service and
+#   yama-watchdog.timer; if either is missing (e.g. after VM rebuild), restores the
+#   missing file(s) from the project copy (without overwriting existing ones), runs
+#   daemon-reload + enable --now yama-watchdog.timer, and logs 1 line (bounded; failures
+#   never block the main heartbeat check).
 
 set -uo pipefail
 
@@ -31,6 +39,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${YAMA_STATE_DIR:-${BASE_DIR}/state}"
 HEARTBEAT_PATH="${YAMA_HEARTBEAT_PATH:-${STATE_DIR}/heartbeat.json}"
 LOG_PATH="${YAMA_WATCHDOG_LOG:-${STATE_DIR}/watchdog.log}"
+LOCK_PATH="${YAMA_WATCHDOG_LOCK_PATH:-${STATE_DIR}/watchdog.lock}"
 THRESHOLD_SEC="${YAMA_WATCHDOG_THRESHOLD_SEC:-120}"
 RECHECK_SEC="${YAMA_WATCHDOG_RECHECK_SEC:-5}"
 RESTART_COOLDOWN_SEC="${YAMA_WATCHDOG_RESTART_COOLDOWN_SEC:-60}"
@@ -50,6 +59,16 @@ REINSTALL_MAX="${YAMA_UNIT_REINSTALL_MAX:-3}"
 # Default 60s (> 30s hook poll interval) so the 1st backoff window is not already
 # elapsed when the next 30-second hook invocation runs.
 REINSTALL_BACKOFF_BASE_SEC="${YAMA_UNIT_REINSTALL_BACKOFF_SEC:-60}"
+
+WATCHDOG_SERVICE_SOURCE="${YAMA_WATCHDOG_SERVICE_SOURCE:-${BASE_DIR}/yama-watchdog.service}"
+WATCHDOG_SERVICE_DEST="${YAMA_WATCHDOG_SERVICE_DEST:-/etc/systemd/system/yama-watchdog.service}"
+WATCHDOG_TIMER_SOURCE="${YAMA_WATCHDOG_TIMER_SOURCE:-${BASE_DIR}/yama-watchdog.timer}"
+WATCHDOG_TIMER_DEST="${YAMA_WATCHDOG_TIMER_DEST:-/etc/systemd/system/yama-watchdog.timer}"
+WATCHDOG_TIMER_ENABLE_CMD="${YAMA_WATCHDOG_TIMER_ENABLE_CMD:-systemctl enable --now yama-watchdog.timer}"
+WATCHDOG_TIMER_INSTALL_CMD="${YAMA_WATCHDOG_TIMER_INSTALL_CMD:-}"
+TIMER_REINSTALL_STATE_PATH="${YAMA_TIMER_REINSTALL_STATE:-${STATE_DIR}/watchdog_timer_reinstall_state.json}"
+TIMER_REINSTALL_MAX="${YAMA_TIMER_REINSTALL_MAX:-3}"
+TIMER_REINSTALL_BACKOFF_BASE_SEC="${YAMA_TIMER_REINSTALL_BACKOFF_SEC:-60}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN="python3"
@@ -74,6 +93,13 @@ emit_ops_alert() {
 }
 
 mkdir -p "${STATE_DIR}"
+
+# Acquire non-blocking exclusive lock on FD 9 so concurrent runs
+# (e.g. 30s dispatch hook + 60s systemd timer) cannot overlap.
+exec 9>"${LOCK_PATH}"
+if ! flock -n 9; then
+    exit 0
+fi
 
 log_msg() {
     local ts
@@ -118,10 +144,11 @@ check_boot_change() {
 }
 
 reset_reinstall_state() {
-    if [[ ! -f "${REINSTALL_STATE_PATH}" ]]; then
+    local state_path="${1:-${REINSTALL_STATE_PATH}}"
+    if [[ ! -f "${state_path}" ]]; then
         return 0
     fi
-    "${PYTHON_BIN}" - "${REINSTALL_STATE_PATH}" <<'PYEOF'
+    "${PYTHON_BIN}" - "${state_path}" <<'PYEOF'
 import json
 import sys
 import time
@@ -144,7 +171,9 @@ PYEOF
 }
 
 check_reinstall_gate() {
-    "${PYTHON_BIN}" - "${REINSTALL_STATE_PATH}" "${REINSTALL_MAX}" <<'PYEOF'
+    local state_path="${1:-${REINSTALL_STATE_PATH}}"
+    local max_attempts="${2:-${REINSTALL_MAX}}"
+    "${PYTHON_BIN}" - "${state_path}" "${max_attempts}" <<'PYEOF'
 import json
 import math
 import sys
@@ -185,7 +214,9 @@ PYEOF
 }
 
 record_reinstall_attempt() {
-    "${PYTHON_BIN}" - "${REINSTALL_STATE_PATH}" "${REINSTALL_BACKOFF_BASE_SEC}" <<'PYEOF'
+    local state_path="${1:-${REINSTALL_STATE_PATH}}"
+    local base_backoff="${2:-${REINSTALL_BACKOFF_BASE_SEC}}"
+    "${PYTHON_BIN}" - "${state_path}" "${base_backoff}" <<'PYEOF'
 import json
 import sys
 import time
@@ -339,6 +370,118 @@ reinstall_and_restart_unit() {
     fi
 }
 
+run_watchdog_unit_install() {
+    local src="$1"
+    local dest="$2"
+    local dest_dir
+    dest_dir="$(dirname "${dest}")"
+    if [[ -n "${WATCHDOG_TIMER_INSTALL_CMD}" ]]; then
+        ${WATCHDOG_TIMER_INSTALL_CMD} "${src}" "${dest}" 2>&1
+        return $?
+    fi
+    if [[ -w "${dest_dir}" ]]; then
+        install -m 0644 "${src}" "${dest}" 2>&1
+        return $?
+    else
+        sudo -n install -m 0644 "${src}" "${dest}" 2>&1
+        return $?
+    fi
+}
+
+ensure_watchdog_timer_units() {
+    # Existence-only check: if both unit files already exist, do nothing
+    # (never overwrite existing files).
+    if [[ -f "${WATCHDOG_SERVICE_DEST}" && -f "${WATCHDOG_TIMER_DEST}" ]]; then
+        return 0
+    fi
+
+    local gate_status
+    gate_status="$(check_reinstall_gate "${TIMER_REINSTALL_STATE_PATH}" "${TIMER_REINSTALL_MAX}")"
+    if [[ "${gate_status}" == MAX_REACHED:* ]]; then
+        local cur_attempts max_attempts
+        cur_attempts="$(echo "${gate_status}" | cut -d: -f2)"
+        max_attempts="$(echo "${gate_status}" | cut -d: -f3)"
+        log_msg "[ERROR] Watchdog timer unit restore skipped: max attempts reached (${cur_attempts}/${max_attempts}, state=${TIMER_REINSTALL_STATE_PATH})"
+        return 1
+    fi
+    if [[ "${gate_status}" == BACKOFF:* ]]; then
+        local cur_attempts max_attempts rem_sec
+        cur_attempts="$(echo "${gate_status}" | cut -d: -f2)"
+        max_attempts="$(echo "${gate_status}" | cut -d: -f3)"
+        rem_sec="$(echo "${gate_status}" | cut -d: -f4)"
+        log_msg "[WARN] Watchdog timer unit restore skipped: backoff active (${rem_sec}s remaining, attempts=${cur_attempts}/${max_attempts})"
+        return 1
+    fi
+
+    local missing_kinds=()
+    local missing_srcs=()
+    local missing_dests=()
+    if [[ ! -f "${WATCHDOG_SERVICE_DEST}" ]]; then
+        missing_kinds+=("service")
+        missing_srcs+=("${WATCHDOG_SERVICE_SOURCE}")
+        missing_dests+=("${WATCHDOG_SERVICE_DEST}")
+    fi
+    if [[ ! -f "${WATCHDOG_TIMER_DEST}" ]]; then
+        missing_kinds+=("timer")
+        missing_srcs+=("${WATCHDOG_TIMER_SOURCE}")
+        missing_dests+=("${WATCHDOG_TIMER_DEST}")
+    fi
+
+    local i kind src dest dest_dir
+    for ((i = 0; i < ${#missing_dests[@]}; i++)); do
+        kind="${missing_kinds[$i]}"
+        src="${missing_srcs[$i]}"
+        dest="${missing_dests[$i]}"
+        if [[ ! -f "${src}" || ! -r "${src}" ]]; then
+            log_msg "[ERROR] Watchdog timer unit restore aborted: source ${kind} unit missing or unreadable (${src})"
+            return 1
+        fi
+        dest_dir="$(dirname "${dest}")"
+        if [[ ! -d "${dest_dir}" ]]; then
+            log_msg "[ERROR] Watchdog timer unit restore aborted: destination directory does not exist (${dest_dir})"
+            return 1
+        fi
+    done
+
+    local attempt_info attempt_num
+    attempt_info="$(record_reinstall_attempt "${TIMER_REINSTALL_STATE_PATH}" "${TIMER_REINSTALL_BACKOFF_BASE_SEC}")"
+    attempt_num="$(echo "${attempt_info}" | cut -d: -f1)"
+
+    local installed_names=()
+    local install_out install_rc
+    for ((i = 0; i < ${#missing_dests[@]}; i++)); do
+        src="${missing_srcs[$i]}"
+        dest="${missing_dests[$i]}"
+        if install_out="$(run_watchdog_unit_install "${src}" "${dest}")"; then
+            installed_names+=("$(basename "${dest}")")
+        else
+            install_rc=$?
+            log_msg "[ERROR] Watchdog timer unit restore failed (${attempt_num}/${TIMER_REINSTALL_MAX}, ${src} -> ${dest}, exit=${install_rc}): ${install_out}"
+            return "${install_rc}"
+        fi
+    done
+
+    local reload_out reload_rc
+    if ! reload_out="$(${DAEMON_RELOAD_CMD} 2>&1)"; then
+        reload_rc=$?
+        log_msg "[ERROR] Watchdog timer unit restore failed at daemon-reload (${attempt_num}/${TIMER_REINSTALL_MAX}, exit=${reload_rc}): ${reload_out}"
+        return "${reload_rc}"
+    fi
+
+    local enable_out enable_rc
+    if ! enable_out="$(${WATCHDOG_TIMER_ENABLE_CMD} 2>&1)"; then
+        enable_rc=$?
+        log_msg "[ERROR] Watchdog timer unit restore failed at enable --now (${attempt_num}/${TIMER_REINSTALL_MAX}, exit=${enable_rc}): ${enable_out}"
+        return "${enable_rc}"
+    fi
+
+    reset_reinstall_state "${TIMER_REINSTALL_STATE_PATH}"
+    local joined
+    joined="$(IFS=,; echo "${installed_names[*]}")"
+    log_msg "[INFO] Watchdog timer unit(s) restored (${joined}; ${attempt_num}/${TIMER_REINSTALL_MAX}): daemon-reload and enable --now succeeded"
+    return 0
+}
+
 record_restart_marker() {
     # Remember (restart time, heartbeat ts) so the next 30s-cycle check does not
     # restart-loop a listener that is still starting up. Only direct restart
@@ -459,6 +602,7 @@ PYEOF
 }
 
 check_boot_change
+ensure_watchdog_timer_units || true
 
 if [[ ! -f "${HEARTBEAT_PATH}" ]]; then
     restart_listener "missing heartbeat file: ${HEARTBEAT_PATH}"

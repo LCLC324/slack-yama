@@ -13168,6 +13168,240 @@ def test_review_fix_2026_11_26_bot_message_reconcile_and_hook_order() -> str:
             "dispatchフックでプロキシ同期がユニット自己修復より前かつprune-replies --days 90組込、を確認")
 
 
+def test_watchdog_flock_exclusivity() -> str:
+    """94. 候補34 Watchdog flock 排他制御 (ロック保持中は無言exit 0・同時実行でも再起動は1回だけ)"""
+    import fcntl
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        hb_path = state_dir / "heartbeat.json"
+        log_path = state_dir / "watchdog.log"
+        lock_path = state_dir / "watchdog.lock"
+        trace_file = tmp_path / "restart_calls.log"
+        mock_restart = tmp_path / "mock_restart.sh"
+        mock_restart.write_text(
+            f"#!/usr/bin/env bash\necho RESTART >> \"{trace_file}\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        mock_restart.chmod(0o755)
+
+        hb_path.write_text(
+            json.dumps({"timestamp": time.time() - 200, "connected": False, "bot_user_id": "U_YAMA_BOT"}),
+            encoding="utf-8",
+        )
+
+        base_env = os.environ.copy()
+        base_env.update(
+            {
+                "YAMA_STATE_DIR": str(state_dir),
+                "YAMA_HEARTBEAT_PATH": str(hb_path),
+                "YAMA_WATCHDOG_LOG": str(log_path),
+                "YAMA_WATCHDOG_LOCK_PATH": str(lock_path),
+                "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+                "YAMA_RESTART_CMD": str(mock_restart),
+                "YAMA_WATCHDOG_RECHECK_SEC": "0",
+            }
+        )
+
+        # Case 1: Lock already held -> watchdog exits 0 silently without restarting
+        with open(lock_path, "w", encoding="utf-8") as lock_fp:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            res_locked = subprocess.run(
+                ["bash", str(WATCHDOG_SH)], env=base_env, capture_output=True, text=True
+            )
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+
+        assert res_locked.returncode == 0, f"expected exit 0 when locked, got {res_locked.returncode}: {res_locked.stderr}"
+        assert res_locked.stdout == "" and res_locked.stderr == "", (
+            f"expected silent exit when locked, got stdout={res_locked.stdout!r}, stderr={res_locked.stderr!r}"
+        )
+        assert not trace_file.exists(), "restart command must not run while lock is held"
+        assert not log_path.exists(), "watchdog.log must not be written while lock is held"
+
+        # Case 2: Two concurrent watchdog invocations on stale heartbeat with RECHECK_SEC=2
+        # -> only one acquires the lock and runs restart; the second exits 0 immediately.
+        env_race = base_env.copy()
+        env_race["YAMA_WATCHDOG_RECHECK_SEC"] = "2"
+        p1 = subprocess.Popen(
+            ["bash", str(WATCHDOG_SH)], env=env_race, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        time.sleep(0.3)
+        p2 = subprocess.Popen(
+            ["bash", str(WATCHDOG_SH)], env=env_race, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        out2, err2 = p2.communicate(timeout=10)
+        out1, err1 = p1.communicate(timeout=15)
+
+        assert p1.returncode == 0, f"p1 failed: rc={p1.returncode}, err={err1}"
+        assert p2.returncode == 0, f"p2 failed: rc={p2.returncode}, err={err2}"
+        assert out2 == "" and err2 == "", f"p2 should exit silently, got out={out2!r} err={err2!r}"
+        assert trace_file.exists(), "primary watchdog should have executed restart"
+        restart_count = trace_file.read_text(encoding="utf-8").count("RESTART")
+        assert restart_count == 1, f"expected exactly 1 restart under concurrent overlap, got {restart_count}"
+
+    return "ロック保持中のwatchdog起動は無言exit 0＆再起動なし、RECHECK中の同時起動2本でも再起動実行は1回のみを確認"
+
+
+def test_watchdog_timer_unit_recovery() -> str:
+    """95. 候補34追補 Watchdog タイマーユニット自己復旧 (存在時無処理・欠落時復元＆enable・失敗時有界かつ本体監視継続)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        etc_dir = tmp_path / "etc_systemd"
+        etc_dir.mkdir(parents=True, exist_ok=True)
+        src_dir = tmp_path / "src_units"
+        src_dir.mkdir(parents=True, exist_ok=True)
+
+        hb_path = state_dir / "heartbeat.json"
+        log_path = state_dir / "watchdog.log"
+        lock_path = state_dir / "watchdog.lock"
+        boot_state = state_dir / "last_boot_id"
+        timer_reinstall_state = state_dir / "watchdog_timer_reinstall_state.json"
+
+        src_svc = src_dir / "yama-watchdog.service"
+        src_tmr = src_dir / "yama-watchdog.timer"
+        src_svc.write_text("[Service]\nType=oneshot\nTimeoutStartSec=120s\n", encoding="utf-8")
+        src_tmr.write_text("[Timer]\nOnUnitInactiveSec=1min\n", encoding="utf-8")
+
+        dest_svc = etc_dir / "yama-watchdog.service"
+        dest_tmr = etc_dir / "yama-watchdog.timer"
+
+        trace_file = tmp_path / "calls.log"
+        mock_reload = tmp_path / "mock_reload.sh"
+        mock_reload.write_text(
+            f"#!/usr/bin/env bash\necho RELOAD >> \"{trace_file}\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        mock_reload.chmod(0o755)
+
+        mock_enable = tmp_path / "mock_enable.sh"
+        mock_enable.write_text(
+            f"#!/usr/bin/env bash\necho ENABLE >> \"{trace_file}\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        mock_enable.chmod(0o755)
+
+        mock_enable_fail = tmp_path / "mock_enable_fail.sh"
+        mock_enable_fail.write_text(
+            f"#!/usr/bin/env bash\necho ENABLE_FAIL >> \"{trace_file}\"\necho 'enable error' >&2\nexit 1\n",
+            encoding="utf-8",
+        )
+        mock_enable_fail.chmod(0o755)
+
+        mock_restart = tmp_path / "mock_restart.sh"
+        mock_restart.write_text(
+            f"#!/usr/bin/env bash\necho RESTART >> \"{trace_file}\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        mock_restart.chmod(0o755)
+
+        # Pre-seed boot_id so check_boot_change stays silent on healthy runs
+        boot_id_file = tmp_path / "boot_id"
+        boot_id_file.write_text("test-boot-id-95\n", encoding="utf-8")
+        import hashlib
+        bid_hash = hashlib.sha256(b"test-boot-id-95").hexdigest()[:8]
+        boot_state.write_text(bid_hash + "\n", encoding="utf-8")
+
+        hb_path.write_text(
+            json.dumps({"timestamp": time.time(), "connected": True, "bot_user_id": "U_YAMA_BOT"}),
+            encoding="utf-8",
+        )
+
+        base_env = os.environ.copy()
+        base_env.update(
+            {
+                "YAMA_STATE_DIR": str(state_dir),
+                "YAMA_HEARTBEAT_PATH": str(hb_path),
+                "YAMA_WATCHDOG_LOG": str(log_path),
+                "YAMA_WATCHDOG_LOCK_PATH": str(lock_path),
+                "YAMA_BOOT_ID_PATH": str(boot_id_file),
+                "YAMA_BOOT_STATE_PATH": str(boot_state),
+                "YAMA_PYTHON_BIN": str(PYTHON_BIN),
+                "YAMA_RESTART_CMD": str(mock_restart),
+                "YAMA_DAEMON_RELOAD_CMD": str(mock_reload),
+                "YAMA_WATCHDOG_TIMER_ENABLE_CMD": str(mock_enable),
+                "YAMA_WATCHDOG_SERVICE_SOURCE": str(src_svc),
+                "YAMA_WATCHDOG_SERVICE_DEST": str(dest_svc),
+                "YAMA_WATCHDOG_TIMER_SOURCE": str(src_tmr),
+                "YAMA_WATCHDOG_TIMER_DEST": str(dest_tmr),
+                "YAMA_TIMER_REINSTALL_STATE": str(timer_reinstall_state),
+                "YAMA_TIMER_REINSTALL_MAX": "2",
+                "YAMA_TIMER_REINSTALL_BACKOFF_SEC": "0",
+                "YAMA_WATCHDOG_RECHECK_SEC": "0",
+            }
+        )
+
+        # Case 1: Both exist -> no overwrite, no reload/enable, no log
+        dest_svc.write_text("CUSTOM_EXISTING_SERVICE\n", encoding="utf-8")
+        dest_tmr.write_text("CUSTOM_EXISTING_TIMER\n", encoding="utf-8")
+        r1 = subprocess.run(["bash", str(WATCHDOG_SH)], env=base_env, capture_output=True, text=True)
+        assert r1.returncode == 0, f"case 1 failed: {r1.stderr}"
+        assert dest_svc.read_text(encoding="utf-8") == "CUSTOM_EXISTING_SERVICE\n", "existing service must not be overwritten"
+        assert dest_tmr.read_text(encoding="utf-8") == "CUSTOM_EXISTING_TIMER\n", "existing timer must not be overwritten"
+        assert not trace_file.exists(), "reload/enable must not run when both units exist"
+        assert not log_path.exists(), "watchdog.log must stay silent when both units exist and heartbeat is healthy"
+
+        # Case 2: Only timer is missing -> restores only timer, preserves existing service, logs 1 line
+        dest_tmr.unlink()
+        r2 = subprocess.run(["bash", str(WATCHDOG_SH)], env=base_env, capture_output=True, text=True)
+        assert r2.returncode == 0, f"case 2 failed: {r2.stderr}"
+        assert dest_svc.read_text(encoding="utf-8") == "CUSTOM_EXISTING_SERVICE\n", "existing service must stay untouched"
+        assert dest_tmr.exists() and dest_tmr.read_text(encoding="utf-8") == src_tmr.read_text(encoding="utf-8"), (
+            "missing timer must be restored from source"
+        )
+        calls2 = trace_file.read_text(encoding="utf-8").splitlines()
+        assert calls2 == ["RELOAD", "ENABLE"], f"expected RELOAD then ENABLE, got {calls2}"
+        log_lines2 = [ln for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(log_lines2) == 1 and "Watchdog timer unit(s) restored (yama-watchdog.timer" in log_lines2[0], (
+            f"expected 1 restore log line for timer, got {log_lines2}"
+        )
+
+        # Case 3: Both missing -> restores both, calls reload+enable, logs 1 line
+        trace_file.unlink()
+        log_path.unlink()
+        dest_svc.unlink()
+        dest_tmr.unlink()
+        r3 = subprocess.run(["bash", str(WATCHDOG_SH)], env=base_env, capture_output=True, text=True)
+        assert r3.returncode == 0, f"case 3 failed: {r3.stderr}"
+        assert dest_svc.read_text(encoding="utf-8") == src_svc.read_text(encoding="utf-8")
+        assert dest_tmr.read_text(encoding="utf-8") == src_tmr.read_text(encoding="utf-8")
+        calls3 = trace_file.read_text(encoding="utf-8").splitlines()
+        assert calls3 == ["RELOAD", "ENABLE"], f"expected RELOAD then ENABLE, got {calls3}"
+        log_lines3 = [ln for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(log_lines3) == 1 and "yama-watchdog.service,yama-watchdog.timer" in log_lines3[0], (
+            f"expected 1 restore log line for both units, got {log_lines3}"
+        )
+
+        # Case 4: Restore fails -> bounded by max attempts, and stale heartbeat still triggers listener restart
+        trace_file.unlink()
+        log_path.unlink()
+        dest_tmr.unlink()
+        hb_path.write_text(
+            json.dumps({"timestamp": time.time() - 300, "connected": False, "bot_user_id": "U_YAMA_BOT"}),
+            encoding="utf-8",
+        )
+        env_fail = base_env.copy()
+        env_fail["YAMA_WATCHDOG_TIMER_ENABLE_CMD"] = str(mock_enable_fail)
+        env_fail["YAMA_WATCHDOG_RESTART_COOLDOWN_SEC"] = "0"
+
+        for _ in range(3):
+            if dest_tmr.exists():
+                dest_tmr.unlink()
+            rf = subprocess.run(["bash", str(WATCHDOG_SH)], env=env_fail, capture_output=True, text=True)
+            assert rf.returncode == 0, f"case 4 watchdog should still succeed on listener restart: rc={rf.returncode}, err={rf.stderr}"
+
+        calls4 = trace_file.read_text(encoding="utf-8").splitlines()
+        assert calls4.count("ENABLE_FAIL") == 2, f"expected bounded 2 restore attempts (max=2), got {calls4}"
+        assert calls4.count("RESTART") == 3, f"expected main heartbeat restart on all 3 runs despite restore failure, got {calls4}"
+        log_text4 = log_path.read_text(encoding="utf-8")
+        assert "max attempts reached (2/2" in log_text4, f"expected max attempts log in {log_text4}"
+
+    return "既存2ファイル無上書き・片欠落/全欠落の復旧＋daemon-reload＋enable＋1行ログ・失敗時の上限2回有界＆本体監視継続を確認"
+
+
 def main() -> int:
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("1. 重複排除 (同一 event_id 2回投入で1件維持)", test_deduplication),
@@ -13263,6 +13497,8 @@ def main() -> int:
         ("91. 点検（2026-11-26）の修正・DM代行と監視 (unconfirmed_sends誤作動修正・read_failed警告接続・watchdog失敗/MAX_REACHED通知)", test_review_fix_2026_11_26_owner_dm_and_watchdog),
         ("92. 点検（2026-11-26）の修正・reply終端/shadow検査とthread-ts (終端イベント拒否・--force通過・shadow拒否・dispatcherモード検証・トップレベル返信thread_ts保存)", test_review_fix_2026_11_26_reply_guards_and_thread_ts),
         ("93. 点検（2026-11-26）の修正・bot_message境界・20ページ上限・フック順序 (bot_message答え済み＆ライブ補完・20ページ上限fail-closed・プロキシ同期先行＆prune-replies)", test_review_fix_2026_11_26_bot_message_reconcile_and_hook_order),
+        ("94. 候補34 Watchdog flock 排他制御 (ロック保持中は無言exit 0・同時実行でも再起動は1回だけ)", test_watchdog_flock_exclusivity),
+        ("95. 候補34追補 Watchdog タイマーユニット自己復旧 (存在時無処理・欠落時復元＆enable・失敗時有界かつ本体監視継続)", test_watchdog_timer_unit_recovery),
     ]
 
     print("=" * 72)

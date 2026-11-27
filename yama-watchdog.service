@@ -1,0 +1,10 @@
+[Unit]
+Description=Yama Slack Listener Watchdog
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120s
+WorkingDirectory=/home/hatch/workspace/slack-yama
+ExecStart=/home/hatch/workspace/slack-yama/watchdog.sh
+StandardOutput=null
+StandardError=journal
